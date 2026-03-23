@@ -1,0 +1,48 @@
+id: brief-016c
+title: 'J-002: Health History Intake Form Prototype'
+description: Build a comprehensive health history intake form for patient onboarding
+  as a single-file HTML prototype with embedded CSS. The form must include collapsible
+  sections for current conditions, medications, allergies, family history, surgical
+  history, and lifestyle factors. This is critical for Dr. K's patient onboarding
+  process and must be completed before first patient visits.
+acceptance_criteria:
+- Single HTML file named j002_health_history.html with embedded CSS
+- 'First line of code block must be: # filename: j002_health_history.html'
+- Current conditions section with checkboxes for common medical conditions
+- Current medications section with add/remove functionality for dynamic list
+- Allergies section with add/remove functionality for dynamic list
+- Family history section with checkboxes for hereditary conditions
+- Surgical history section with add/remove functionality for procedures
+- Lifestyle section including exercise frequency, diet preference, alcohol consumption,
+  smoking status, and sleep hours
+- All sections must be collapsible for better user experience
+- Form must be functional and ready for patient use
+- Professional medical form styling and layout
+- Responsive design that works on desktop and mobile devices
+context: This is core onboarding data collection for Dr. K's practice. The form is
+  essential for gathering comprehensive patient health information before the first
+  visit. The prototype needs to be production-ready and user-friendly for patients
+  to complete independently.
+approach: Create a single HTML file with embedded CSS and JavaScript. Use semantic
+  HTML form elements with proper accessibility features. Implement collapsible sections
+  using CSS and vanilla JavaScript. Design a clean, professional medical form interface
+  with clear section organization and intuitive add/remove functionality for dynamic
+  lists.
+priority: medium
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+output_path: output/brief-016c/
+agent_assignments:
+- toni
+dependencies:
+- brief-019a
+estimated_hours: 6
+tags:
+- healthcare
+- forms
+- patient-onboarding
+- html-prototype
+- medical-intake
+- frontend
+expected_filename: j002_health_history.html
+expected_filename: j002_health_history.html

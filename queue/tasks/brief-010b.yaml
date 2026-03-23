@@ -1,0 +1,43 @@
+id: brief-010b
+title: 'B1-step2: MedplumClient configured for Akute FHIR endpoint'
+description: Write a TypeScript module that configures MedplumClient to use Akute
+  Health as its FHIR backend instead of the default Medplum server. The module should
+  export a configured MedplumClient instance and include a test function to verify
+  connectivity by fetching a specific test patient.
+acceptance_criteria:
+- Single TypeScript file named medplum_akute_config.ts
+- 'First line of code block must be: # filename: medplum_akute_config.ts'
+- Configure MedplumClient to use Akute Health FHIR base URL (https://api.akutehealth.com/v1)
+- Use X-API-Key header authentication (NOT Bearer token)
+- Export a configured MedplumClient instance
+- Export a test function that fetches test patient Margaret Chen (ID e47d9309-8a66-453c-ad45-2f45c309e651)
+- Test function should log the fetched patient result
+- Include proper TypeScript types for the configuration
+- Code should be production-ready and well-documented
+context: This task builds upon brief-010a and is part of integrating MedplumClient
+  with Akute Health as the FHIR backend. The configuration needs to handle the specific
+  authentication method used by Akute (X-API-Key header) rather than standard Bearer
+  tokens. The test patient Margaret Chen with ID e47d9309-8a66-453c-ad45-2f45c309e651
+  should be used for validation.
+approach: Create a single TypeScript module that imports MedplumClient, configures
+  it with Akute-specific settings including base URL and authentication headers, exports
+  the configured instance, and provides a test function to validate the connection
+  by fetching the specified test patient.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies:
+- brief-010a
+estimated_hours: 4
+tags:
+- typescript
+- medplum
+- fhir
+- akute-health
+- configuration
+- healthcare-api
+output_path: output/brief-010b/
+expected_filename: medplum_akute_config.ts
+expected_filename: medplum_akute_config.ts

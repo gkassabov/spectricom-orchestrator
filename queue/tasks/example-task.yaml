@@ -1,0 +1,26 @@
+id: task-001
+title: "Build Akute FHIR patient fetch function"
+status: complete
+priority: 1
+context: |
+  We are building Spectricom — an AI-native concierge medicine platform.
+  EHR is Akute Health. API auth uses X-API-Key header (NOT Bearer).
+  Base URL: https://api.akutehealth.com/v1
+  Test patient ID: e47d9309-8a66-453c-ad45-2f45c309e651 (Margaret Chen)
+  All PHI stays in Akute. No custom PHI storage per D-015.
+acceptance_criteria:
+  - Function get_patient_context(patient_id) returns demographics, conditions, meds, labs
+  - Proper error handling for 401, 404, 500
+  - Typed with TypedDict return type
+  - Docstring with example usage
+  - Unit test with mock responses
+output_path: "output/akute_client.py"
+decision_rules:
+  - "If Akute API returns unexpected field names, log them and use .get() with defaults"
+  - "If pagination is needed, implement it — don't truncate results"
+  - "If unsure about FHIR R4 resource structure, default to the simpler /patients/{id} REST endpoint"
+do_not:
+  - "Do not store any patient data to disk"
+  - "Do not hardcode the API key"
+  - "Do not use requests — use httpx for async compatibility"
+max_iterations: 8

@@ -1,0 +1,43 @@
+id: brief-011b
+title: Apple HealthKit to FHIR R4 Bridge Unit Tests
+description: 'Create comprehensive unit tests for the Apple HealthKit to FHIR R4 bridge
+  implementation. Write pytest test cases to validate XML parsing, FHIR transformation,
+  and LOINC code mapping functionality. First line must be: # filename: test_apple_bridge.py'
+acceptance_criteria:
+- Single pytest test file named test_apple_bridge.py
+- 'First line of code block must be: # filename: test_apple_bridge.py'
+- Import from apple_health_to_fhir module (from brief-011a)
+- test_parse_apple_health_xml: Verify AppleHealthParser extracts HR, HRV, SpO2, steps
+    from sample XML
+- test_fhir_observation_structure: Verify FHIRTransformer produces valid FHIR R4 Observation
+    with correct LOINC codes
+- test_loinc_code_mapping: Verify each health metric maps to appropriate LOINC codes
+- All tests must pass and provide meaningful assertions
+- Tests should validate FHIR transformation correctness before data goes to Akute
+- Code should follow pytest best practices and conventions
+context: 'This task validates the Apple HealthKit to FHIR bridge implementation from
+  brief-011a. The tests ensure data transformation accuracy before integration with
+  Akute platform. Business impact: Validates the FHIR transformation is correct before
+  pushing to Akute.'
+approach: 'Create a single pytest test file that imports the apple_health_to_fhir
+  module and tests its core functionality: XML parsing capabilities, FHIR R4 Observation
+  structure generation, and LOINC code mapping accuracy. Use sample health data for
+  realistic test scenarios.'
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies:
+- brief-011a
+estimated_hours: 4
+tags:
+- testing
+- healthcare
+- fhir
+- apple-healthkit
+- unit-tests
+- pytest
+output_path: output/brief-011b/
+expected_filename: test_apple_bridge.py
+expected_filename: test_apple_bridge.py

@@ -1,0 +1,50 @@
+id: brief-010c
+title: 'B1-step3: PatientSummary page with Akute data'
+description: Create a Next.js page component that renders PatientSummary from Medplum
+  React library using real Akute FHIR data. This is the first Medplum React component
+  implementation that will fetch and display actual patient data from the Akute FHIR
+  server. The component should include proper loading states, error handling, and
+  additional functionality with a QuestionnaireForm.
+acceptance_criteria:
+- Single Next.js page component file named patient_page.tsx
+- 'First line of code block must be: # filename: patient_page.tsx'
+- Import MedplumClient configuration from medplum_akute_config module
+- 'Fetch specific patient with ID: e47d9309-8a66-453c-ad45-2f45c309e651 from Akute
+  FHIR server'
+- Render PatientSummary component from Medplum React library with fetched patient
+  resource
+- Include QuestionnaireForm component below PatientSummary using simple intake questionnaire
+- Implement proper loading state while fetching patient data
+- Include error boundary for handling fetch failures and rendering errors
+- Component must be functional and ready for integration
+- Code should follow Next.js best practices and TypeScript conventions
+context: This task depends on brief-010b completion and represents the first implementation
+  of a Medplum React component with real Akute FHIR data. This is a critical milestone
+  for demonstrating the integration between Medplum React components and the Akute
+  FHIR backend. The component will serve as a foundation for future patient-related
+  UI components.
+approach: Develop a single Next.js page component that leverages the Medplum React
+  library for FHIR data visualization. Use the existing medplum_akute_config for client
+  configuration, implement async data fetching with proper state management, and combine
+  PatientSummary with QuestionnaireForm components for a complete patient interaction
+  interface.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies:
+- brief-010b
+estimated_hours: 6
+tags:
+- medplum
+- react
+- nextjs
+- fhir
+- akute
+- patient-data
+- ui-component
+- frontend
+output_path: output/brief-010c/
+expected_filename: patient_page.tsx
+expected_filename: patient_page.tsx

@@ -1,0 +1,49 @@
+id: brief-016e
+title: 'J-004 and J-005: Goals and first visit scheduling prototype'
+output_path: output/brief-016e/
+description: 'Build a combined goals setting and first visit scheduling interface
+  as a single HTML file prototype. The interface should use tabs to separate the two
+  main functions: Tab 1 for patient goal setting with checkboxes for common goals
+  and custom goal input, and Tab 2 for scheduling the first visit with calendar integration
+  and appointment selection.'
+acceptance_criteria:
+- Single HTML file with embedded CSS and JavaScript
+- 'First line of code block must be: # filename: j004_j005_goals_scheduling.html'
+- Tab 1 (Goals) includes checkboxes for: longevity, weight management, stress reduction,
+    better sleep, fitness optimization, preventive screening, chronic condition management
+- Tab 1 includes free text input for custom goals
+- Tab 1 includes priority ranking system (drag and drop or number input)
+- Tab 2 (Schedule First Visit) includes calendar interface for appointment selection
+- Smooth tab navigation between the two screens
+- Responsive design that works on desktop and mobile
+- Professional healthcare UI styling
+- Form validation for required fields
+- Clear call-to-action buttons for completing onboarding
+context: This prototype completes the patient onboarding flow by allowing patients
+  to set their health goals and schedule their first visit. It depends on brief-019a
+  and represents the final step in the onboarding process. The interface should feel
+  cohesive with other onboarding screens while providing comprehensive goal-setting
+  and scheduling functionality.
+approach: Create a single HTML file with embedded CSS and JavaScript using a tabbed
+  interface. Implement the goals section with interactive checkboxes, custom input
+  fields, and priority ranking. Build the scheduling section with a calendar widget
+  and appointment time selection. Use modern web standards for responsive design and
+  smooth user interactions.
+priority: medium
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies:
+- brief-019a
+estimated_hours: 12
+tags:
+- prototype
+- html
+- onboarding
+- goals
+- scheduling
+- healthcare
+- ui
+expected_filename: j004_j005_goals_scheduling.html
+expected_filename: j004_j005_goals_scheduling.html

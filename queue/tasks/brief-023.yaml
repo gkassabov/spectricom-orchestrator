@@ -1,0 +1,56 @@
+id: brief-023
+title: Universal code block extractor for all file types
+description: 'Extend the Toni output extraction functionality in loop/executor.py
+  to handle all file types, not just Python and Bash. Currently, files like Markdown,
+  YAML, HTML, JSON, and CSS are being lost during extraction. The task involves modifying
+  the _extract_python_code_blocks function to support universal code block extraction
+  with proper file extension mapping and adding a fallback mechanism for plain text
+  output.
+
+  '
+acceptance_criteria:
+- Regex pattern matches ANY fenced code block language tag, not just python/py/bash/sh
+- Regex pattern matches code blocks with no language tag specified
+- Output filename derivation works correctly for all supported languages
+- "File extension mapping: python/py \u2192 .py, bash/sh \u2192 .sh, markdown/md \u2192\
+  \ .md, yaml/yml \u2192 .yaml, html \u2192 .html, json \u2192 .json, css \u2192 .css,\
+  \ default \u2192 .txt"
+- Fallback mechanism writes plain text output when no code blocks found but response
+  contains COMPLETE and output_path is set
+- Plain text fallback extracts everything after the COMPLETE summary line
+- Code compiles successfully with python3 -m py_compile loop/executor.py
+- Modified executor.py is saved to output/brief-023/executor.py
+context: 'The current implementation in loop/executor.py has a function _extract_python_code_blocks
+  that only handles Python and Bash code blocks. This limitation causes other file
+  types to be lost during output extraction, impacting the platform''s ability to
+  handle diverse file formats. The business impact is significant as users lose work
+  in multiple file formats.
+
+  '
+approach: '1. Modify the regex pattern in _extract_python_code_blocks to match any
+  language tag or no tag
+
+  2. Implement filename derivation logic based on language tags with proper extension
+  mapping
+
+  3. Add fallback mechanism for plain text output when no code blocks are found
+
+  4. Ensure backward compatibility with existing Python and Bash extraction
+
+  5. Validate changes with compilation test
+
+  '
+priority: high
+status: complete
+created_at: '2026-03-22T00:00:00Z'
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 4
+tags:
+- code-extraction
+- file-handling
+- regex
+- python
+- executor
+- output-processing

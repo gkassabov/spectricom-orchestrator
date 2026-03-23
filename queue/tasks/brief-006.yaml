@@ -1,0 +1,53 @@
+id: brief-006
+title: Fix spectricom-activate.sh to cd into project directory
+description: "The spectricom-activate.sh script currently only activates the virtual\
+  \ environment \nbut fails to change directory to the project root. This causes users\
+  \ to remain in \ntheir current directory after activation, requiring manual navigation\
+  \ to the project.\nAdditionally, there appears to be a related Gemma-lite API error\
+  \ that may be connected\nto path resolution issues when tools expect to be run from\
+  \ the project root.\n"
+acceptance_criteria:
+- spectricom-activate.sh script changes directory to project root after venv activation
+- Script maintains existing venv activation functionality
+- No breaking changes to current activation workflow
+- Gemma-lite API error "too many values to unpack (expected 2)" is resolved
+- Script works consistently across different starting directories
+- Changes are tested on common shell environments (bash, zsh)
+context: 'The activate.sh script is a convenience tool for developers to quickly set
+  up their
+
+  development environment. Currently it only handles virtual environment activation,
+
+  leaving users to manually navigate to the project directory. This creates friction
+
+  in the development workflow and may be contributing to API errors when tools expect
+
+  to be run from the project root.
+
+  '
+approach: '1. Analyze current spectricom-activate.sh script structure
+
+  2. Identify project root directory detection logic
+
+  3. Add cd command after venv activation
+
+  4. Investigate and fix the Gemma-lite API unpacking error
+
+  5. Test script behavior from various starting directories
+
+  6. Ensure backward compatibility with existing usage patterns
+
+  '
+priority: medium
+status: complete
+created_at: 2026-03-22 00:00:00+00:00
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 1.5
+tags:
+- devtools
+- shell-scripts
+- developer-experience
+- bug-fix
+- activation

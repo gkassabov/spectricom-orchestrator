@@ -1,0 +1,73 @@
+id: brief-004
+title: Connect LangGraph gather_context to real Akute FHIR API
+status: complete
+priority: high
+context: 'Connect the LangGraph gather_context node to real Akute FHIR API instead
+  of synthetic JSON files.
+
+  This unblocks B1 sprint completion and enables real patient data flow through the
+  clinical AI pipeline.
+
+
+  Current situation:
+
+  - gather_context node at /home/gkassa/spectricom-orchestrator/nodes/gather_context.py
+  reads synthetic JSON
+
+  - akute_client.py already exists from task-001 (output/task-001/akute_client.py)
+
+  - Test patient available: Margaret Chen, ID: e47d9309-8a66-453c-ad45-2f45c309e651
+
+  - AKUTE_API_KEY loaded from environment variable
+
+
+  Required changes:
+
+  1. Copy akute_client.py to nodes/akute_client.py for gather_context to import
+
+  2. Check for AKUTE_API_KEY env var in gather_context node
+
+  3. If AKUTE_API_KEY present: fetch real data via AkuteClient.get_patient_context(state[''patient_id''])
+
+  4. If no API key: fall back to existing synthetic JSON logic
+
+  5. Map AkuteClient PatientContext fields to PatientState fields correctly
+
+  6. Add structured logging for fetch success/failure with observability pattern
+
+  7. Handle AkuteNotFoundError gracefully - log warning, use synthetic fallback
+
+
+  This is POC validation code, not production-ready. Add POC context comment.
+
+  '
+acceptance_criteria:
+- gather_context.py modified to conditionally use AkuteClient when AKUTE_API_KEY available
+- akute_client.py copied to nodes/ directory for import
+- Synthetic JSON fallback preserved when no API key present
+- PatientContext fields properly mapped to PatientState structure
+- Structured logging implemented following observability pattern from context
+- AkuteNotFoundError handled with graceful fallback to synthetic data
+- POC context comment added to both files
+- Files written to output/brief-004/ as proposals for George's review
+output_path: output/brief-004/
+decision_rules:
+- Use existing AkuteClient from task-001 output - do not rewrite the client
+- Preserve backward compatibility - synthetic JSON must still work without API key
+- Follow observability pattern: log service, operation, duration_ms, status for external
+    calls
+- Use httpx client pattern from akute_client.py, never requests
+- Map patient_id from PatientState to AkuteClient.get_patient_context() parameter
+- Handle all AkuteClient exceptions: AkuteAuthenticationError, AkuteNotFoundError,
+    AkuteServerError
+- Use environment variable AKUTE_API_KEY exactly as specified
+- Test with Margaret Chen patient ID: e47d9309-8a66-453c-ad45-2f45c309e651
+- Add structured logging with logger.info and logger.error as shown in context
+do_not:
+- Do not modify the AkuteClient implementation
+- Do not remove synthetic JSON fallback logic
+- Do not hardcode API keys or patient IDs
+- Do not auto-apply changes to the actual orchestrator directory
+- Do not rewrite gather_context from scratch - targeted edits only
+- Do not use requests library - akute_client uses httpx
+max_iterations: 8

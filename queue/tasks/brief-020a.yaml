@@ -1,0 +1,42 @@
+id: brief-020a
+title: Akute Health API endpoint explorer script
+description: Build a comprehensive Python script that systematically tests all available
+  Akute Health API endpoints and generates a detailed results table. The script should
+  explore patient data, conditions, medication requests, and other available endpoints
+  to map the complete API surface area for integration planning.
+acceptance_criteria:
+- Single Python file named akute_api_explorer.py with proper filename comment as first
+  line
+- Uses httpx library for HTTP requests with X-API-Key authentication
+- Tests all specified endpoint categories (GET requests only)
+- Uses test patient ID e47d9309-8a66-453c-ad45-2f45c309e651
+- Connects to base URL https://api.akutehealth.com/v1
+- Outputs comprehensive results table showing endpoint status and responses
+- Handles authentication and error cases gracefully
+- Provides clear documentation of available API endpoints
+- Does not create or modify any data (read-only operations)
+context: This API exploration is critical for driving the integration roadmap with
+  Akute Health. The script will map all available endpoints to understand the full
+  scope of data and functionality available through their API. Authentication uses
+  X-API-Key header, and all testing should be performed against the v1 API using the
+  provided test patient ID.
+approach: 'Develop a systematic Python script using httpx that: 1) Sets up authentication
+  headers, 2) Defines all endpoint categories to test, 3) Iterates through each endpoint
+  with proper error handling, 4) Collects response data and status information, 5)
+  Formats results into a readable table format'
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 8
+tags:
+- api-exploration
+- integration
+- healthcare
+- python
+- akute-health
+output_path: output/brief-020a/
+expected_filename: akute_api_explorer.py
+expected_filename: akute_api_explorer.py

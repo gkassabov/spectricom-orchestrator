@@ -1,0 +1,42 @@
+id: brief-018b
+title: Batch creation of 9 additional synthetic patients
+description: Build a batch script that creates 9 additional synthetic patients using
+  the utility from brief-018a. The script should import the create_patient function
+  and define 9 patient specifications as a list of PatientSpec dictionaries, covering
+  diverse demographics and medical conditions for realistic POC testing.
+acceptance_criteria:
+- Single Python file named create_all_patients.py
+- 'First line must be: # filename: create_all_patients.py'
+- Import create_patient from create_synthetic_patient module
+- Define exactly 9 patient specifications as PatientSpec dictionaries
+- Include specified patients: SYNTH-002 Jason Miller (41M executive, hypertension/prediabetes),
+    SYNTH-003 Patricia Wong (67F retired, osteoarthritis/hypothyroidism), SYNTH-004
+    David Rodriguez (35M tech founder), and 6 additional diverse patients
+- Each patient spec must include ID, name, age, gender, occupation, and medical conditions
+- Script successfully creates all 9 patients when executed
+- Code is well-structured and documented
+context: This task depends on the synthetic patient utility created in brief-018a.
+  The goal is to establish a diverse patient panel for realistic proof-of-concept
+  testing, ensuring representation across different demographics, ages, occupations,
+  and medical conditions.
+approach: Create a single Python script that imports the create_patient utility function
+  and defines a comprehensive list of patient specifications. Use a loop or batch
+  processing approach to create all patients efficiently. Ensure diverse representation
+  in the patient cohort.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies:
+- brief-018a
+estimated_hours: 3
+tags:
+- synthetic-data
+- patient-creation
+- batch-processing
+- healthcare
+- poc-testing
+output_path: output/brief-018b/
+expected_filename: create_all_patients.py
+expected_filename: create_all_patients.py

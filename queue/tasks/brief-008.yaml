@@ -1,0 +1,45 @@
+id: brief-008
+title: Apply brief-002 pipeline completion detection fix to live pipeline
+status: complete
+priority: high
+context: "You need to fix a critical bug in the live development pipeline where it\
+  \ falsely reports completion when Toni never actually executed tasks.\n\nBACKGROUND:\n\
+  The current pipeline runner exits with status 0 even when no tasks are executed,\
+  \ causing false positive completion reports.\nBrief-002 already solved this with\
+  \ improved completion detection logic.\n\nWHAT YOU NEED TO DO:\n1. Read the fixed\
+  \ version: ~/spectricom-orchestrator/output/brief-002/pipeline_runner.py\n2. Compare\
+  \ with current live version: ~/spectricom-dev-pipeline/pipeline_runner.py  \n3.\
+  \ Apply the completion detection fix from brief-002 to the live version\n\nTHE FIX\
+  \ LOGIC (from brief-002):\n- After orchestrator exits, read the latest session report\n\
+  - Verify total_tokens > 0 AND tasks_complete > 0 before marking brief complete\n\
+  - If tokens == 0: mark status as \"blocked\" with reason \"Orchestrator exited 0\
+  \ but no tasks executed\"\n- Preserve all other existing functionality in the live\
+  \ pipeline\n\nFILES TO WORK WITH:\n- Source (fixed): ~/spectricom-orchestrator/output/brief-002/pipeline_runner.py\n\
+  - Target (live): ~/spectricom-dev-pipeline/pipeline_runner.py\n\nThis is a targeted\
+  \ patch - do not rewrite the entire file, only apply the specific completion detection\
+  \ improvements.\n"
+acceptance_criteria:
+- Live pipeline_runner.py includes completion detection logic from brief-002
+- Pipeline verifies total_tokens > 0 and tasks_complete > 0 before marking complete
+- Pipeline marks brief as "blocked" when orchestrator exits 0 but no tasks executed
+- All existing functionality preserved
+- No full rewrite - targeted patch only
+- Code follows Spectricom standards (error handling, logging, typing)
+output_path: output/brief-008/pipeline_runner.py
+decision_rules:
+- Apply ONLY the completion detection fix - do not change other functionality
+- Preserve the existing structure and patterns of the live pipeline
+- Use the same error handling and logging patterns as the current live version
+- Keep all existing imports and dependencies
+- Match the coding style of the live pipeline, not the brief-002 version
+- If there are conflicts between versions, prioritize preserving live functionality
+  while adding the completion check
+- The fix should integrate seamlessly without breaking existing behavior
+do_not:
+- Do not rewrite the entire pipeline_runner.py file
+- Do not change functionality unrelated to completion detection
+- Do not modify import statements unless absolutely necessary for the fix
+- Do not change existing error handling patterns
+- Do not modify the orchestrator execution logic itself
+- Do not add new dependencies without justification
+max_iterations: 8

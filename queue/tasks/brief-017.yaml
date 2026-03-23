@@ -1,0 +1,46 @@
+id: brief-017
+title: Add CLAUDE.md to observability and dev pipeline projects
+description: Create comprehensive CLAUDE.md documentation files for both the observability
+  and dev pipeline projects to provide essential context for AI assistants working
+  on these codebases. Each file should include project purpose, key files overview,
+  engineering principles reference, and critical areas to avoid modifying.
+acceptance_criteria:
+- Create observability-CLAUDE.md with project-specific context and guidelines
+- Create pipeline-CLAUDE.md with project-specific context and guidelines
+- Include project purpose and scope in each file
+- Document key files and their roles in each project
+- Reference relevant engineering principles for each project
+- Clearly specify what files or areas should NOT be modified
+- Files must be saved to output/brief-017/ directory
+- Documentation should be clear and actionable for AI assistants
+context: Currently only the orchestrator project has a CLAUDE.md file, leaving Toni
+  without proper context when working on other projects. This creates inefficiencies
+  and potential issues when AI assistants need to understand project structure and
+  constraints.
+approach: '1. Analyze the observability project structure and identify key components
+
+  2. Analyze the dev pipeline project structure and identify key components
+
+  3. Create project-specific CLAUDE.md files following the established format
+
+  4. Include project purpose, architecture overview, key files, and no-touch zones
+
+  5. Reference applicable engineering principles for each project
+
+  6. Save files to the specified output directory
+
+  '
+priority: medium
+status: pending
+created_at: '2026-03-22T00:00:00Z'
+output_path: output/brief-017/
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 4
+tags:
+- documentation
+- ai-context
+- observability
+- pipeline
+- developer-experience

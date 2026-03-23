@@ -1,0 +1,44 @@
+id: brief-010a
+title: 'B1-step1: Next.js portal setup instructions'
+description: Create comprehensive setup instructions document for the Spectricom patient
+  portal. Document must provide step-by-step commands that George can follow to scaffold
+  the Next.js project with TypeScript, Tailwind CSS, and required medical platform
+  dependencies including Medplum and Mantine components.
+acceptance_criteria:
+- Document saved as setup_instructions.md with proper filename header
+- 'First line must be: # filename: setup_instructions.md'
+- Step 1 includes exact npx create-next-app command with all specified flags
+- Step 2 includes directory navigation command
+- Step 3 includes npm install command for all required dependencies (@medplum/react,
+  @medplum/core, @medplum/react-hooks, @mantine/core, @mantine/hooks)
+- Step 4 includes build verification command
+- Additional setup steps provided beyond the initial 4 steps
+- All commands are copy-paste ready and executable
+- Instructions are clear and sequential for portal foundation setup
+context: This is the foundational step for the Spectricom patient portal project.
+  George needs exact commands to scaffold the project properly. The portal will use
+  Next.js with TypeScript, Tailwind CSS for styling, and integrate with Medplum for
+  healthcare data management and Mantine for UI components. This document serves as
+  the starting point for the entire portal development process.
+approach: Generate a markdown document with numbered steps containing exact terminal
+  commands. Include verification steps and brief explanations for each major component
+  being installed. Ensure all dependencies and configurations are specified for a
+  complete development environment setup.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 2
+tags:
+- setup
+- documentation
+- nextjs
+- portal
+- foundation
+- medplum
+- mantine
+output_path: output/brief-010a/
+expected_filename: setup_instructions.md
+expected_filename: setup_instructions.md

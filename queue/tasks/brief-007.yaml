@@ -1,0 +1,46 @@
+id: brief-007
+title: Add filename convention to Toni code block outputs
+description: 'Update the CLAUDE.md file to include mandatory output file rules that
+  instruct Toni to start every code block with a filename comment. This will prevent
+  files from being saved as generic output_001.py names and ensure proper file naming
+  for automated extraction.
+
+  '
+acceptance_criteria:
+- Read the current ~/spectricom-orchestrator/CLAUDE.md file
+- Append the specified OUTPUT FILE RULES section exactly as provided in the notes
+- Write the updated file back to the original location
+- Create a copy of the updated file at output/brief-007/CLAUDE.md
+- No other modifications to the existing CLAUDE.md content
+- The new section must include the mandatory filename comment format and examples
+context: 'Toni currently outputs code blocks without proper filename specifications,
+  causing the automated extractor to save files as generic output_001.py names. This
+  requires manual renaming and creates workflow inefficiencies. The solution is to
+  update the CLAUDE.md instruction file to mandate filename comments at the start
+  of every code block.
+
+  '
+approach: '1. Read the existing ~/spectricom-orchestrator/CLAUDE.md file
+
+  2. Append the provided OUTPUT FILE RULES section to the end of the file
+
+  3. Preserve all existing content without modifications
+
+  4. Write the updated content back to the original file
+
+  5. Create a backup copy in the output/brief-007/ directory
+
+  '
+priority: high
+status: pending
+created_at: '2026-03-22T00:00:00Z'
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 1
+tags:
+- documentation
+- file-naming
+- automation
+- workflow-improvement
+- claude-instructions

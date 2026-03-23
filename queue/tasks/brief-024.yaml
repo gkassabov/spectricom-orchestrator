@@ -1,0 +1,59 @@
+id: brief-024
+title: Add brief type and manual promotion gate to pipeline
+description: 'Implement a brief type system to categorize briefs (infrastructure,
+  content, design, research) and add manual promotion gates for infrastructure briefs.
+  The pipeline currently runs infrastructure briefs in batches and produces proposals
+  that never get promoted, requiring intervention from George. This task adds type-based
+  workflow control to pause the pipeline after infrastructure briefs complete and
+  wait for manual review and promotion.
+
+  '
+acceptance_criteria:
+- BriefManager supports a 'type' field with valid values: infrastructure, content,
+    design, research
+- Default type is 'content' when not specified
+- Pipeline pauses after infrastructure brief completion with prominent warning banner
+- Warning banner displays brief ID, type, output path, and instructions for manual
+  promotion
+- User can press Enter to continue or type SKIP to skip promotion
+- Add 'requires_manual_promotion' boolean field that defaults to False
+- Infrastructure briefs automatically set requires_manual_promotion to True
+- Pipeline always pauses when requires_manual_promotion is True regardless of batch
+  mode
+- Dry-run output shows type and requires_manual_promotion for each brief
+- Updated files are output to output/brief-024/pipeline.py and output/brief-024/brief_manager.py
+context: 'The current pipeline processes infrastructure briefs in batches without
+  stopping for manual review. Infrastructure briefs produce proposals that require
+  George''s manual promotion to the live pipeline, but the automated batch processing
+  doesn''t accommodate this workflow. The business impact is that infrastructure briefs
+  keep running and producing outputs that accumulate without being properly integrated.
+
+  '
+approach: '1. Extend BriefManager class to support type field with validation
+
+  2. Add requires_manual_promotion field with automatic setting for infrastructure
+  type
+
+  3. Modify pipeline.py process_brief() method to check brief type after completion
+
+  4. Implement pause mechanism with user input prompt for infrastructure briefs
+
+  5. Update dry-run functionality to display new fields
+
+  6. Ensure backward compatibility with existing briefs that don''t have type specified
+
+  '
+priority: high
+status: pending
+created_at: '2026-03-22T22:19:06Z'
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 3
+tags:
+- pipeline
+- infrastructure
+- workflow
+- brief-management
+- manual-promotion
+output_path: output/brief-024/

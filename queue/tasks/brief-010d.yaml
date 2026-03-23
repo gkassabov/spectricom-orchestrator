@@ -1,0 +1,44 @@
+id: brief-010d
+title: 'B1-step4: Mantine plus Tailwind coexistence test component'
+description: Create a comprehensive React component that tests the coexistence of
+  Mantine UI library and Tailwind CSS utility classes. The component should demonstrate
+  that both styling systems can work together without conflicts, include Auth0 integration
+  testing, and document any issues or fixes required.
+acceptance_criteria:
+- Single React component file named coexistence_test.tsx
+- 'First line must be: # filename: coexistence_test.tsx'
+- Import and use at least 3 Mantine components (Button, TextInput, Card)
+- Apply Tailwind utility classes alongside Mantine styling
+- Include Auth0 login status section (mock hook if needed)
+- Document CSS conflicts between Mantine and Tailwind in comments
+- Document any build errors encountered and their fixes
+- Include inline test results as comments
+- Component renders without errors
+- Styling from both libraries displays correctly
+context: This task is part of the B1 project phase focusing on frontend technology
+  integration. It depends on brief-010b completion and serves to validate that Mantine
+  and Tailwind can coexist in the same React application without styling conflicts
+  or build issues.
+approach: Create a single comprehensive test component that imports multiple Mantine
+  components, applies Tailwind classes to the same elements or container elements,
+  integrates Auth0 status display, and includes detailed documentation of the integration
+  experience through code comments.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies:
+- brief-010b
+estimated_hours: 4
+tags:
+- react
+- mantine
+- tailwind
+- css
+- auth0
+- integration-testing
+- frontend
+output_path: output/brief-010d/
+expected_filename: coexistence_test.tsx
+expected_filename: coexistence_test.tsx

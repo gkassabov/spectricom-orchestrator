@@ -1,0 +1,43 @@
+id: brief-020
+title: Akute Health API full exploration and integration map
+description: Build a comprehensive API exploration script to systematically test all
+  Akute Health API endpoint categories and generate an integration roadmap. The script
+  will test Patient, Clinical (Condition, MedicationRequest, Observation, Encounter,
+  DocumentReference), Communication, Scheduling, Video, Billing, and Webhooks endpoints.
+  For each endpoint, capture status codes, response shapes, and functionality status
+  (works/partial/missing). Generate a detailed integration map document identifying
+  feature mappings and prioritizing the top 5 integrations to build next.
+acceptance_criteria:
+- Create akute_api_explorer.py script that tests all specified endpoint categories
+- Implement X-API-Key authentication for all requests
+- Use test patient ID e47d9309-8a66-453c-ad45-2f45c309e651 for patient-related endpoints
+- For each endpoint, capture and report status code, response structure, and functionality
+  assessment
+- Generate akute_integration_map.md with comprehensive feature mapping analysis
+- Identify and document top 5 integration opportunities with justification
+- Include error handling and detailed logging in the exploration script
+- Provide clear documentation of API capabilities and limitations
+- Output files saved to output/brief-020/ directory
+context: This exploration is critical for the entire platform integration roadmap
+  with Akute Health. The systematic testing will reveal actual API capabilities versus
+  documentation, identify integration opportunities, and inform development priorities.
+  The test patient ID is provided for safe testing of patient-related endpoints.
+approach: Develop a systematic API exploration script that iterates through all endpoint
+  categories, makes authenticated requests, captures responses, and analyzes functionality.
+  Structure the script with clear categorization, error handling, and detailed reporting.
+  Generate a comprehensive integration map document that translates technical findings
+  into business integration opportunities.
+priority: high
+status: pending
+created_at: '2026-03-22T00:00:00Z'
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 8
+tags:
+- api-exploration
+- integration
+- healthcare
+- akute
+- documentation
+output_path: output/brief-020/

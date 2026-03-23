@@ -1,0 +1,55 @@
+id: brief-019
+title: Unified design system spec patient and provider portal
+description: Create a comprehensive design system specification and CSS tokens file
+  to establish a unified design language for both patient and provider portals. The
+  design system will standardize visual elements, spacing, typography, and component
+  specifications to ensure consistency across both platforms.
+acceptance_criteria:
+- design_system_spec.md file created with complete design specifications
+- design_tokens.css file created with all CSS variables and tokens
+- Base font size set to 14px with patient-configurable sizing via CSS variables
+- 4px spacing unit system implemented throughout
+- Card padding standardized to 16px (compact design, not 24-32px)
+- Dark font preferences specified and implemented
+- Chart.js components limited to 200px maximum height
+- Sticky message input component specifications included
+- System fonts only policy documented and implemented
+- Provider portal design used as primary style guide reference
+- All design tokens properly documented with usage examples
+- Cross-platform compatibility ensured for both portals
+output_path: output/brief-019/
+context: This task supports business impact D-033 by creating one shared design system
+  for both patient and provider portals. The provider portal design serves as the
+  authoritative style guide. Key constraints include compact spacing preferences,
+  accessibility considerations for patient-configurable font sizes, and system font
+  requirements for performance and consistency.
+approach: '1. Analyze existing provider portal design patterns and extract core design
+  principles
+
+  2. Document comprehensive design system specification covering typography, spacing,
+  colors, and components
+
+  3. Create CSS tokens file with all design variables and custom properties
+
+  4. Implement patient-configurable font sizing system using CSS variables
+
+  5. Define component specifications including charts, cards, and messaging interfaces
+
+  6. Ensure compact design principles with specified spacing and padding rules
+
+  '
+priority: high
+status: pending
+created_at: '2026-03-22T00:00:00Z'
+agent_assignments:
+- toni
+- george
+dependencies: []
+estimated_hours: 16
+tags:
+- design-system
+- css
+- ui-ux
+- documentation
+- tokens
+- portal-unification

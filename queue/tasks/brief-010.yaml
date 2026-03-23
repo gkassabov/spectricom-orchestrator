@@ -1,0 +1,46 @@
+id: brief-010
+title: 'B1: Medplum React components connected to Akute FHIR API'
+description: Create a Next.js application scaffolded with Medplum React components,
+  configured to connect to the Akute FHIR R4 endpoint using X-API-Key authentication.
+  This is the final unvalidated POC sprint to establish the portal foundation with
+  real FHIR data integration.
+acceptance_criteria:
+- Next.js application successfully scaffolded with Medplum React components
+- MedplumClient configured to point to Akute FHIR R4 endpoint (not Medplum server)
+- X-API-Key authentication properly implemented
+- PatientSummary component renders successfully with test patient data (e47d9309-8a66-453c-ad45-2f45c309e651)
+- QuestionnaireForm component successfully submits data
+- Mantine and Tailwind CSS coexist without conflicts
+- Auth0 properly bootstraps MedplumClient
+- All components display real data from Akute FHIR API
+- Application runs without critical errors
+context: This is the last unvalidated POC sprint focused on establishing the portal
+  foundation. The task involves integrating Medplum React components with the Akute
+  FHIR R4 API rather than the standard Medplum server. Authentication uses X-API-Key
+  instead of OAuth. Test patient ID e47d9309-8a66-453c-ad45-2f45c309e651 should be
+  used for validation.
+approach: Scaffold a new Next.js application and integrate Medplum React components.
+  Configure MedplumClient with custom endpoint and authentication. Implement Auth0
+  integration for user authentication while ensuring it properly initializes MedplumClient.
+  Set up Mantine and Tailwind CSS with proper configuration to avoid conflicts. Test
+  core components (PatientSummary, QuestionnaireForm, ObservationDisplay) with real
+  Akute FHIR data.
+priority: highest
+status: pending
+created_at: '2026-03-22T00:00:00Z'
+agent_assignments:
+- toni
+- george
+dependencies: []
+estimated_hours: 16
+tags:
+- poc
+- medplum
+- fhir
+- nextjs
+- react
+- auth0
+- mantine
+- tailwind
+- akute-api
+output_path: output/brief-010/

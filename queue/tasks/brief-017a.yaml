@@ -1,0 +1,43 @@
+id: brief-017a
+title: Create CLAUDE.md documentation for spectricom-observability project
+description: Write a comprehensive CLAUDE.md file for the spectricom-observability
+  project to provide essential project context and guidance for engineers. The file
+  should serve as the primary reference document explaining the project's purpose,
+  architecture, key files, and engineering workflows.
+acceptance_criteria:
+- Single markdown file named observability-CLAUDE.md is created
+- 'First line of code block must be: # filename: observability-CLAUDE.md'
+- Content is written directly in markdown format (no Python script generation)
+- Includes Project Purpose section explaining file-based metrics collection, HTML
+  dashboard on port 8765, and session report reading from orchestrator
+- Includes Key Files section listing main files and their functions (metrics collector,
+  dashboard server, templates)
+- Includes Engineer section with relevant workflow information
+- File provides sufficient context for Toni to work effectively on the observability
+  project
+- Content stays within token limits while being comprehensive
+- Documentation follows standard CLAUDE.md format and conventions
+context: Toni currently lacks project context when working on the observability project,
+  which impacts productivity and code quality. The spectricom-observability project
+  involves file-based metrics collection with an HTML dashboard served on port 8765
+  that reads session reports from the orchestrator. This documentation will serve
+  as the primary reference for understanding project structure and workflows.
+approach: Create a structured markdown document that covers all essential aspects
+  of the spectricom-observability project, focusing on practical information that
+  engineers need for daily work. Include clear sections for project purpose, file
+  organization, and engineering processes while maintaining readability and completeness.
+priority: medium
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 3
+tags:
+- documentation
+- observability
+- claude-md
+- project-context
+output_path: output/brief-017a/
+expected_filename: observability-CLAUDE.md
+expected_filename: observability-CLAUDE.md

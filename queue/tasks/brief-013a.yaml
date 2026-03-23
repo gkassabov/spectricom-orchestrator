@@ -1,0 +1,45 @@
+id: brief-013a
+title: Multi-provider data isolation design document
+description: Create a comprehensive design document for multi-provider data isolation
+  in the healthcare platform. The document must ensure that every provider can only
+  access their own patients' data through proper RBAC implementation, API scoping,
+  and database-level isolation. This is a critical security design that must be completed
+  before Phase 1 implementation.
+acceptance_criteria:
+- Document contains detailed RBAC model with 4 roles (platform_admin, provider, delegate,
+  patient)
+- Each role is mapped to specific allowed FHIR operations
+- Akute API scoping section explains provider_id enforcement on every API call
+- Middleware patterns for request filtering are documented
+- Database isolation strategies are clearly defined
+- Security considerations and potential vulnerabilities are addressed
+- Implementation guidelines for development team are provided
+- Document is formatted as markdown with proper section headers
+- Each major section contains 20-40 lines of detailed content
+- 'First line must be: # filename: multi_provider_isolation_design.md'
+context: This design document is foundational for Phase 1 development and must establish
+  the security architecture for multi-tenant healthcare data access. The platform
+  will serve multiple healthcare providers who must have strict data isolation to
+  comply with privacy regulations and business requirements.
+approach: Write a single comprehensive markdown document covering RBAC model design,
+  API scoping mechanisms, database isolation strategies, and implementation guidelines.
+  Focus on practical, implementable solutions that can be directly used by the development
+  team.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+output_path: output/brief-013a/
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 6
+tags:
+- security
+- rbac
+- data-isolation
+- design-document
+- multi-tenant
+- fhir
+- api-design
+expected_filename: multi_provider_isolation_design.md
+expected_filename: multi_provider_isolation_design.md

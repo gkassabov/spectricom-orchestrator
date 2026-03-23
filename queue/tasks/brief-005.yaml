@@ -1,0 +1,52 @@
+id: brief-005
+title: Venv bootstrap script for all Spectricom projects
+status: complete
+priority: medium
+context: "Create two bash utility scripts to eliminate repeated manual venv setup\
+  \ across all Spectricom projects:\n\n1. spectricom-bootstrap.sh - automated setup\
+  \ script\n2. spectricom-activate.sh - quick project activation script\n\nCurrent\
+  \ manual process wastes 5-10 minutes per project setup with repeated steps:\n- Check\
+  \ if venv exists, create if not\n- Install requirements\n- Check if .env exists,\
+  \ copy from .env.example if not\n- Activate and verify\n\nSPECTRICOM_PROJECTS array\
+  \ to process:\n- /home/gkassa/spectricom-orchestrator\n- /home/gkassa/spectricom-observability\
+  \  \n- /home/gkassa/spectricom-dev-pipeline\n\nBootstrap script behavior:\n1. For\
+  \ each project directory (if exists):\n   - Check venv/ presence\n   - If missing:\
+  \ python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt\
+  \ -q\n   - If present: echo \"[OK] {project} venv exists\"\n   - Check .env presence\n\
+  \   - If missing: cp .env.example .env && echo \"[ACTION NEEDED] Edit .env in {project}\"\
+  \n   - If present: echo \"[OK] {project} .env exists\"\n2. Print summary table:\
+  \ project | venv | .env | status\n3. Print next steps if any action needed\n\nActivation\
+  \ script behavior:\n- Takes project short name as argument (orchestrator, observability,\
+  \ dev-pipeline)\n- Maps to full path and activates venv\n- Usage: source ~/spectricom-activate.sh\
+  \ orchestrator\n- Effect: cd ~/spectricom-orchestrator && source venv/bin/activate\n\
+  \nBoth scripts are proposals for George's review before copying to home directory.\n"
+acceptance_criteria:
+- spectricom-bootstrap.sh processes all three Spectricom project directories
+- Creates missing venvs with requirements.txt installation
+- Creates missing .env files from .env.example templates
+- Outputs clear status summary table
+- Handles cases where project directories don't exist gracefully
+- spectricom-activate.sh takes project short names and activates correct venv
+- Both scripts include proper error handling and status feedback
+- Scripts are executable and follow bash best practices
+- Usage instructions included as comments in both scripts
+output_path: output/brief-005/
+decision_rules:
+- Build location in output directory as proposals (not directly in home directory)
+- Use array iteration for project processing
+- Include status feedback for every operation
+- Handle missing project directories gracefully (skip with message)
+- Use quiet pip install (-q flag) to reduce output noise
+- Summary table uses consistent formatting
+- Activation script supports short names: orchestrator, observability, dev-pipeline
+- Include shebang and basic error handling in both scripts
+- Scripts should be executable (chmod +x equivalent)
+do_not:
+- Do not write scripts directly to home directory
+- Do not assume all project directories exist
+- Do not create projects that don't exist
+- Do not modify existing .env files if they already exist
+- Do not use hardcoded absolute paths except for the three known projects
+- Do not install requirements if requirements.txt doesn't exist
+- Do not activate venvs in the bootstrap script itself
+max_iterations: 8

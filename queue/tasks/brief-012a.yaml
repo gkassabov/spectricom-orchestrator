@@ -1,0 +1,41 @@
+id: brief-012a
+title: Akute Health Messaging API Test Script
+description: Build a comprehensive test script to evaluate Akute Health's built-in
+  messaging and video capabilities to determine if the $49/month Spruce service is
+  needed as an alternative communication solution.
+acceptance_criteria:
+- Single Python file named akute_messaging_eval.py with proper filename comment header
+- Uses httpx library for HTTP requests with X-API-Key authentication
+- Tests Communication endpoints (POST/GET Communication resources)
+- Sends test message to Margaret Chen using patient ID e47d9309-8a66-453c-ad45-2f45c309e651
+- Checks for video encounter endpoints (Encounter with class=VR or similar)
+- Implements webhook functionality testing
+- Prints clear results for each capability tested
+- Provides business recommendation on Spruce necessity
+- Code is well-documented and error-handled
+context: This evaluation will inform a business decision about whether to invest $49/month
+  in Spruce messaging services or rely on Akute Health's native capabilities. The
+  test patient Margaret Chen (ID e47d9309-8a66-453c-ad45-2f45c309e651) should be used
+  for realistic testing scenarios.
+approach: 'Create a single Python script using httpx for API calls. Structure the
+  script to test each messaging capability systematically: 1) Authentication setup,
+  2) Communication resource testing, 3) Message sending functionality, 4) Video encounter
+  detection, 5) Webhook configuration. Include comprehensive error handling and clear
+  output formatting.'
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- toni
+dependencies:
+- brief-020a
+estimated_hours: 6
+tags:
+- api-testing
+- healthcare
+- messaging
+- evaluation
+- python
+output_path: output/brief-012a/
+expected_filename: akute_messaging_eval.py
+expected_filename: akute_messaging_eval.py

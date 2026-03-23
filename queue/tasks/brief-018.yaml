@@ -1,0 +1,44 @@
+id: brief-018
+title: Add synthetic patients to Akute Health
+description: Create a comprehensive set of 10 synthetic patients in the Akute Health
+  system to support realistic POC testing. Currently only Margaret Chen exists as
+  a patient, which limits testing scenarios. This task involves building a Python
+  script that uses the Akute FHIR API to create diverse patient profiles with complete
+  medical records including demographics, conditions, medications, lab panels, and
+  encounters.
+acceptance_criteria:
+- Create akute_synthetic_patients.py script that generates exactly 10 synthetic patients
+- Include existing SYNTH-001 Margaret Chen and 9 new patients with specified demographics
+- Each patient must have complete profile with demographics, medical conditions, medications,
+  lab panel results, and at least one encounter
+- Script must be idempotent (can be run multiple times without creating duplicates)
+- Generate synthetic_patient_ids.json file containing all created patient IDs
+- All patients must be successfully created in Akute Health system via FHIR API
+- Patient data must be realistic and medically coherent
+- Script must include proper error handling and logging
+context: The Akute Health platform currently has limited patient data for testing,
+  with only Margaret Chen available. To conduct realistic POC demonstrations and testing,
+  we need a diverse panel of synthetic patients representing different demographics,
+  age groups, medical conditions, and professional backgrounds. The patients should
+  cover various medical scenarios including different conditions, medication regimens,
+  and lab results to enable comprehensive system testing.
+approach: Develop a Python script using the Akute FHIR API to programmatically create
+  synthetic patients. The script will define patient templates with realistic medical
+  data, use FHIR resource structures for proper data formatting, implement idempotent
+  creation logic to prevent duplicates, and generate a JSON file tracking all created
+  patient IDs. Each patient will be created with full FHIR Patient, Condition, Medication,
+  Observation, and Encounter resources.
+priority: high
+status: pending
+created_at: '2026-03-22T00:00:00Z'
+output_path: output/brief-018/
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 8
+tags:
+- synthetic-data
+- fhir-api
+- patient-management
+- testing
+- poc-support

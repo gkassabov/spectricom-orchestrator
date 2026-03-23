@@ -1,0 +1,45 @@
+id: brief-003
+title: Fix Gemma-lite task ID enforcement
+status: complete
+priority: high
+context: "Problem: Gemma-lite is generating random task IDs (task-001, T-040) instead\
+  \ of using the brief ID, causing the orchestrator to skip tasks silently. Every\
+  \ pipeline run requires manual ID fixing.\n\nCurrent state: \n- gemma_lite.py has\
+  \ force-replace logic in generate_task_spec() function but it's not working reliably\n\
+  - Gemma-lite occasionally uses wrong IDs despite existing enforcement\n\nRoot cause:\
+  \ The force-replace logic may not be comprehensive enough or may have edge cases\
+  \ where it fails\n\nLocation: /home/gkassa/spectricom-dev-pipeline/src/gemma_lite.py\
+  \ in the generate_task_spec() function\n\nCurrent system prompt needs strengthening\
+  \ to make ID enforcement the absolute first priority\n\nThis is critical for pipeline\
+  \ reliability - every task that gets skipped due to ID mismatch wastes tokens and\
+  \ breaks automation\n\nThe fix needs to be bulletproof - no edge cases where wrong\
+  \ IDs can slip through\n"
+acceptance_criteria:
+- After Claude API returns YAML, parse it with yaml.safe_load()
+- Force-set parsed['id'] = brief['id'] unconditionally (no exceptions or conditions)
+- Force-set parsed['status'] = 'pending' unconditionally
+- Re-serialize to YAML string and return the corrected version
+- If YAML is unparseable: retry once, then mark task as blocked
+- Add assertion before returning: assert task_yaml['id'] == brief['id']
+- Update GEMMA_LITE_SYSTEM_PROMPT to include as first instruction: 'CRITICAL: The
+    task id field MUST be exactly: {brief_id}. Use this exact string. No variations.'
+- All changes preserve existing functionality while strengthening ID enforcement
+- Code includes proper error handling and logging for debugging
+output_path: output/brief-003/gemma_lite.py
+decision_rules:
+- This is a PROPOSAL for George to review - do not auto-apply to live pipeline
+- Focus only on the generate_task_spec() function and system prompt constant
+- Preserve all existing imports, functions, and logic not related to ID enforcement
+- Use yaml.safe_load() and yaml.dump() for parsing/serialization
+- Log both original and corrected task IDs for debugging
+- The assertion must happen after YAML serialization to catch any edge cases
+- If the brief_id is None or empty, that should be logged as an error but not crash
+- Maintain backward compatibility with existing brief format
+do_not:
+- Do not modify other functions in gemma_lite.py beyond generate_task_spec()
+- Do not change the API interface or function signatures
+- Do not auto-apply changes to the live pipeline
+- Do not add new dependencies beyond standard library yaml module
+- Do not remove existing logging or error handling
+- Do not modify the orchestrator's task processing logic
+max_iterations: 8

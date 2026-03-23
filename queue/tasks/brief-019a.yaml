@@ -1,0 +1,42 @@
+id: brief-019a
+title: Design tokens CSS file for unified portal design
+description: Create a comprehensive design tokens CSS file that serves as the single
+  source of truth for styling across both patient and provider portals. This file
+  will define all core design variables including typography, colors, spacing, and
+  component-specific tokens that will be referenced by all UI components and layouts.
+acceptance_criteria:
+- Single CSS file named design_tokens.css with proper filename comment header
+- Root variables section covering complete typography system with system fonts
+- Color palette definitions for both patient and provider portal themes
+- Spacing and layout tokens for consistent measurements
+- Component-specific design tokens for buttons, forms, cards, and navigation
+- Responsive design tokens for different screen sizes
+- Accessibility-compliant color contrast ratios
+- Well-organized sections with clear commenting
+- CSS custom properties format using -- prefix
+- No CSS generation scripts - direct CSS code only
+context: This design tokens file will be the foundation for all portal styling and
+  must be referenced by every UI brief. It needs to support both patient and provider
+  portals while maintaining consistency and scalability. The file should use modern
+  CSS custom properties and follow design system best practices.
+approach: Write comprehensive CSS custom properties organized into logical sections
+  (typography, colors, spacing, components). Use system fonts for optimal performance
+  and accessibility. Structure the file with clear sections and documentation comments.
+  Ensure all tokens are properly scoped and follow naming conventions.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+output_path: output/brief-019a/
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 8
+tags:
+- design-system
+- css
+- tokens
+- portal
+- ui-foundation
+- styling
+expected_filename: design_tokens.css
+expected_filename: design_tokens.css

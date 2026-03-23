@@ -1,0 +1,46 @@
+id: brief-011
+title: Apple HealthKit to FHIR R4 to Akute wearable bridge
+description: Build a Python bridge to parse Apple Health data (XML export or synthetic
+  payload), transform it to FHIR R4 Observations with proper LOINC codes, and push
+  to Akute FHIR API. This POC replaces the deferred Terra API integration and establishes
+  a device-agnostic foundation for future wearable integrations.
+acceptance_criteria:
+- Create apple_health_to_fhir.py that parses Apple Health XML export format
+- Transform health metrics to FHIR R4 Observation resources with correct LOINC codes
+- Map Heart Rate to LOINC code 8867-4
+- Map Heart Rate Variability to LOINC code 80404-7
+- Map SpO2 to LOINC code 59408-5
+- Map Steps to LOINC code 55423-8
+- Successfully authenticate and push data to Akute FHIR API using X-API-Key
+- Use patient ID e47d9309-8a66-453c-ad45-2f45c309e651 for all observations
+- Create comprehensive test suite in test_apple_bridge.py
+- Design modular architecture to support future device integrations
+- Handle both real Apple Health XML and synthetic test payloads
+- Include proper error handling and logging
+context: This is a POC to establish Apple Watch data flow through HealthKit to FHIR
+  R4 format for Akute integration. Terra API was deferred due to $499/month cost.
+  The solution needs to be device-agnostic to support future wearable integrations
+  beyond Apple devices.
+approach:
+- Parse Apple Health XML export using Python XML libraries
+- Create FHIR R4 Observation resources with proper structure and LOINC codes
+- Implement Akute FHIR API client with authentication
+- Build modular transformation layer for device-agnostic design
+- Create comprehensive test suite with synthetic data
+- Include configuration management for API endpoints and credentials
+priority: high
+status: pending
+created_at: '2026-03-22T00:00:00Z'
+agent_assignments:
+- george
+- toni
+dependencies: []
+estimated_hours: 16
+tags:
+- healthcare
+- fhir
+- apple-health
+- wearables
+- api-integration
+- poc
+output_path: output/brief-011/

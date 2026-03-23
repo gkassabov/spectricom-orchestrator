@@ -1,0 +1,56 @@
+id: brief-001
+title: Fix orchestrator output file extraction
+status: complete
+priority: high
+context: 'The current orchestrator in /home/gkassa/spectricom-orchestrator/ writes
+  all Toni responses to response.txt files, but doesn''t extract the actual Python
+  code blocks. This means all future Toni builds produce unusable response files instead
+  of proper Python modules.
+
+
+  The issue is in executor.py - after Toni responds with COMPLETE status, the system
+  needs to parse the response for ```python...``` code blocks and extract them to
+  the output_path specified in the task YAML.
+
+
+  Current behavior: Full response → response.txt
+
+  Required behavior: Extract Python code blocks → task''s output_path as .py files
+
+
+  The orchestrator uses the Python orchestrator for dev automation per the confirmed
+  stack. All task specs include an output_path field that should receive the extracted
+  code.
+
+
+  File location: /home/gkassa/spectricom-orchestrator/executor.py
+
+  Language: Python
+
+  Standards: Production-grade code with error handling and logging
+
+  '
+acceptance_criteria:
+- executor.py parses Toni responses for ```python code blocks
+- Extracted Python code is written to the output_path from task YAML
+- Multiple code blocks are handled (numbered files if needed)
+- Original response.txt is still preserved for debugging
+- Error handling for malformed responses or missing code blocks
+- Logging shows successful extraction with file paths
+- No regression in existing orchestrator functionality
+output_path: /home/gkassa/spectricom-orchestrator/executor.py
+decision_rules:
+- Use regex or string parsing to find ```python...``` blocks
+- If output_path ends with .py, write single file; if directory, create numbered files
+- Preserve existing response.txt writing for backward compatibility
+- Log all extraction attempts with success/failure status
+- Handle edge cases: no code blocks, empty blocks, invalid paths
+- Follow existing orchestrator error handling patterns
+- Maintain same imports and dependencies as current executor.py
+do_not:
+- Change the orchestrator's core task execution flow
+- Remove or modify existing response.txt functionality
+- Add new external dependencies without justification
+- Modify task YAML schema or structure
+- Change logging format or levels used elsewhere in orchestrator
+max_iterations: 8

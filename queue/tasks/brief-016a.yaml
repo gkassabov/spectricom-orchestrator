@@ -1,0 +1,56 @@
+id: brief-016a
+title: Patient Portal Redesign Per Dr. K Feedback
+description: Redesign the patient portal prototype incorporating specific feedback
+  from Dr. K. Create a single HTML file with embedded CSS and JavaScript that addresses
+  all feedback items including header sizing, font preferences, accessibility features,
+  and compact card layouts. The prototype must use Chart.js from CDN and follow the
+  specified filename format.
+acceptance_criteria:
+- Single HTML file named patient_portal_v2.html with embedded CSS and JS
+- 'First line of code block must be: # filename: patient_portal_v2.html'
+- Chart.js integrated from CDN for data visualizations
+- F-P-001 implemented - reduced header font size and margins/padding throughout
+- F-P-002 implemented - dark font colors and font size toggle (small/medium/large)
+- F-P-003 implemented - compact provider portal style for vitals and wearable cards
+- All accessibility features functional and properly implemented
+- Design maintains professional medical portal appearance
+- Code is clean, well-commented, and follows best practices
+- File size optimized for web delivery
+acceptance_tests:
+- Font size toggle switches between three distinct sizes
+- Header and spacing reductions are visually apparent
+- Vitals and wearable data cards display in compact format
+- Chart.js charts render correctly from CDN
+- Dark fonts provide adequate contrast for readability
+context:
+  business_impact: Dr. K feedback drives portal design and must be incorporated before
+    patient-facing launch
+  tech_feasibility: Single HTML file redesign with embedded resources
+  token_constraints: 10000 estimated tokens, 12000 token cap
+  launch_dependency: Critical for patient-facing portal launch
+approach:
+- Start with existing patient portal prototype structure
+- Systematically apply each feedback item (F-P-001, F-P-002, F-P-003)
+- Implement responsive font sizing with JavaScript toggle
+- Redesign vitals and wearable cards with compact layout
+- Integrate Chart.js via CDN for data visualization components
+- Optimize CSS for reduced margins, padding, and header sizing
+- Test accessibility features and cross-browser compatibility
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+output_path: output/brief-016a/
+agent_assignments:
+- toni
+dependencies:
+- brief-019a
+estimated_hours: 8
+tags:
+- patient-portal
+- ui-redesign
+- accessibility
+- html-prototype
+- medical-interface
+- feedback-implementation
+expected_filename: patient_portal_v2.html
+expected_filename: patient_portal_v2.html

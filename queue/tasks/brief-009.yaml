@@ -1,0 +1,39 @@
+id: brief-009
+title: Apply brief-003 Gemma-lite task ID fix to live pipeline
+status: complete
+priority: medium
+context: "Bug in production: Gemma-lite generates wrong task IDs, causing orchestrator\
+  \ to silently skip tasks.\n\nCURRENT BROKEN BEHAVIOR:\n- Gemma-lite generates new\
+  \ task IDs instead of using brief ID\n- Orchestrator expects task ID to match brief\
+  \ ID exactly\n- Mismatch causes silent skips - tasks never execute\n\nSOLUTION IMPLEMENTED\
+  \ IN BRIEF-003:\nFixed gemma_lite.py with task ID enforcement:\n- Force-set id =\
+  \ brief_id unconditionally  \n- Force-set status = pending\n- Assert task_yaml['id']\
+  \ == brief['id'] before returning\n- Preserve all other functionality\n\nTASK: Apply\
+  \ the fix from brief-003 output to live pipeline\n\nSOURCE FILE: ~/spectricom-orchestrator/output/brief-003/gemma_lite.py\n\
+  TARGET FILE: ~/spectricom-dev-pipeline/gemma_lite.py\n\nAPPROACH:\n1. Read the fixed\
+  \ version from brief-003 output\n2. Compare with current live version\n3. Apply\
+  \ the task ID enforcement fixes\n4. Preserve all existing functionality\n5. Test\
+  \ that task ID now matches brief ID\n"
+acceptance_criteria:
+- Live gemma_lite.py enforces task ID = brief ID unconditionally
+- Live gemma_lite.py forces status = pending on all tasks
+- Assertion added: task_yaml['id'] == brief['id'] before return
+- All other functionality preserved from current live version
+- No regressions in YAML generation or prompt handling
+- Code follows existing style and error handling patterns
+output_path: output/brief-009/gemma_lite.py
+decision_rules:
+- Use brief-003 output as the authoritative fix implementation
+- Preserve any live pipeline improvements not in brief-003 version
+- Maintain existing error handling and logging patterns
+- Keep existing prompt templates and response processing
+- Apply minimal targeted changes - no full rewrite
+- Test assertion must prevent task ID mismatches completely
+do_not:
+- Rewrite the entire file unless necessary
+- Change prompt templates or response parsing logic
+- Remove existing error handling or logging
+- Modify YAML generation logic beyond task ID enforcement
+- Add new dependencies or change imports
+- Break compatibility with existing orchestrator interface
+max_iterations: 8

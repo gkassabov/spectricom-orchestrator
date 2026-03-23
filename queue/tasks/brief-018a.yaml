@@ -1,0 +1,44 @@
+id: brief-018a
+title: Synthetic patient creation utility for Akute Health
+description: Build a reusable Python utility to create synthetic patients in Akute
+  Health via FHIR API. The utility should provide a single main function that accepts
+  a patient specification dictionary and creates comprehensive patient records including
+  demographics, conditions, medications, and lab observations.
+acceptance_criteria:
+- Single Python file named create_synthetic_patient.py
+- 'First line must be: # filename: create_synthetic_patient.py'
+- Main function create_patient(spec) that accepts patient specification dictionary
+- Creates Patient resource with name, gender, birthDate, address, phone, email
+- Creates Condition resources with SNOMED codes from specification
+- Creates MedicationRequest resources for prescribed medications
+- Creates Observation resources for lab panel (CBC, CMP, lipids)
+- All FHIR resources properly formatted and validated
+- Handles API authentication and error responses
+- Returns created patient ID and resource references
+- Code is well-documented with usage examples
+- Includes input validation for patient specification
+context: Akute Health requires the ability to generate synthetic patient data for
+  testing and development purposes. The utility must integrate with their existing
+  FHIR API infrastructure and create realistic, medically coherent patient records
+  that can be used across different testing scenarios.
+approach: Develop a single Python module with FHIR client integration, implement the
+  create_patient function with proper error handling, use standard medical coding
+  systems (SNOMED, LOINC), and ensure the patient specification format is flexible
+  yet comprehensive for various use cases.
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+output_path: output/brief-018a/
+agent_assignments:
+- toni
+dependencies: []
+estimated_hours: 12
+tags:
+- healthcare
+- fhir
+- synthetic-data
+- api-integration
+- python
+- utility
+expected_filename: create_synthetic_patient.py
+expected_filename: create_synthetic_patient.py

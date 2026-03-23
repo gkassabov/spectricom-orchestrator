@@ -1,0 +1,42 @@
+id: brief-002
+title: Fix pipeline completion detection
+status: complete
+priority: high
+context: "The pipeline currently marks briefs complete based only on orchestrator\
+  \ exit code 0, \neven when Toni never actually runs. This creates false confidence\
+  \ in pipeline results.\n\nCurrent behavior: pipeline_runner.py run_brief() function\
+  \ marks any brief complete \nif orchestrator process exits with code 0, regardless\
+  \ of whether tasks executed.\n\nRequired fix: After orchestrator exits, read the\
+  \ latest session report from \n../spectricom-orchestrator/reports/ and parse for\
+  \ execution metrics.\n\nSession report format (markdown):\n- Contains \"Total tokens:\
+  \ X\" line\n- Contains \"Tasks complete: X\" line  \n- Contains \"Tasks failed:\
+  \ X\" line\n\nNew logic:\n- If total_tokens == 0 OR tasks_complete == 0: return\
+  \ status=blocked, reason=\"Orchestrator exited 0 but no tasks executed\"\n- If tasks_failed\
+  \ > 0: return status=blocked, reason=\"Orchestrator task failed\"  \n- If tasks_complete\
+  \ > 0: return status=complete\n\nThe fix must be implemented in the run_brief()\
+  \ function in pipeline_runner.py.\n"
+acceptance_criteria:
+- Modified run_brief() function reads latest session report after orchestrator execution
+- Function parses total tokens, tasks complete, and tasks failed from report markdown
+- Returns status=blocked if tokens=0 or tasks_complete=0 even with exit code 0
+- Returns status=blocked if tasks_failed > 0
+- Returns status=complete only if tasks_complete > 0 and tasks_failed = 0
+- Includes proper error handling for missing or malformed session reports
+- Maintains existing behavior for non-zero exit codes
+output_path: output/brief-002/pipeline_runner.py
+decision_rules:
+- This is a targeted fix to run_brief() function only - do not rewrite entire file
+- Parse session report using string operations or regex, not complex markdown parsers
+- Handle case where no session report exists (orchestrator failed to start)
+- Handle case where session report exists but is malformed
+- Preserve all existing function signatures and interfaces
+- Use existing logging patterns from the codebase
+- Follow error handling standards: specific exceptions, structured logging
+- Output is a PROPOSAL for George's review - not auto-applied to production
+do_not:
+- Do not rewrite the entire pipeline_runner.py file
+- Do not change function signatures or break existing interfaces
+- Do not add new dependencies without justification
+- Do not handle PHI data - this is orchestrator metadata only
+- Do not make architectural changes beyond the specific bug fix
+max_iterations: 8

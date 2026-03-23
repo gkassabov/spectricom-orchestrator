@@ -1,0 +1,44 @@
+id: brief-016d
+title: 'J-003: Wearable Device Connection Prototype'
+description: Build a single-file HTML prototype for the wearable device connection
+  screen used during patient onboarding. The interface should allow patients to select
+  and connect their wearable devices to the platform, with device-specific instructions
+  and a skip option for patients without wearables.
+acceptance_criteria:
+- Single HTML file with embedded CSS and JavaScript
+- 'First line must be: # filename: j003_wearable_setup.html'
+- Display supported devices with visual icons (Apple Watch, Oura Ring, WHOOP, Garmin)
+- Device selection interface with clear visual feedback
+- Device-specific connection instructions that appear based on selection
+- Skip option for patients without wearable devices
+- Success state showing connected device with last sync time
+- Responsive design that works on mobile and desktop
+- Clean, professional healthcare UI design
+- All functionality contained within single file
+context: This is part of the patient onboarding flow where patients connect their
+  wearable devices to enable continuous health monitoring. The prototype needs to
+  be self-contained and demonstrate the complete user experience from device selection
+  through successful connection.
+approach: Create a single HTML file with embedded CSS for styling and JavaScript for
+  interactivity. Use SVG icons or emoji for device representation. Implement device
+  selection logic with conditional display of connection instructions. Include mock
+  success states to demonstrate the complete flow.
+priority: medium
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+output_path: output/brief-016d/
+agent_assignments:
+- toni
+dependencies:
+- brief-019a
+estimated_hours: 6
+tags:
+- frontend
+- prototype
+- healthcare
+- wearables
+- patient-onboarding
+- html
+- single-file
+expected_filename: j003_wearable_setup.html
+expected_filename: j003_wearable_setup.html

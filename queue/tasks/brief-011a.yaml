@@ -1,0 +1,44 @@
+id: brief-011a
+title: 'C1: Apple HealthKit to FHIR R4 parser and transformer'
+description: Build a comprehensive Apple HealthKit to FHIR R4 bridge module that parses
+  Apple Health export XML data and transforms it into FHIR R4 format. The module should
+  extract key health metrics (heart rate, HRV, SpO2, steps) from Apple Watch data
+  and convert them to standardized FHIR Observation resources for healthcare interoperability.
+acceptance_criteria:
+- Single Python file named apple_health_to_fhir.py with first line comment '# filename: apple_health_to_fhir.py'
+- AppleHealthParser class that uses xml.etree.ElementTree to parse Apple Health export
+  XML
+- Parser extracts heart rate, HRV, SpO2, and steps data from Record elements with
+  type attributes
+- FHIRTransformer class that converts parsed metrics to FHIR R4 Observation resources
+- AkutePusher class for sending FHIR data to Akute platform
+- Proper error handling for XML parsing and data transformation
+- Code follows Python best practices and includes appropriate documentation
+- No references to Terra platform anywhere in the code
+- Output file size within token cap of 12000 tokens
+context: This task focuses specifically on Apple HealthKit data processing, not Terra
+  platform integration. The Apple Health export XML has a specific structure with
+  Record elements containing type attributes that identify different health metrics.
+  The FHIR R4 standard requires specific formatting for Observation resources including
+  proper coding systems and value representations.
+approach: 'Implement three distinct classes in a single Python module: 1) XML parser
+  using ElementTree to handle Apple Health export structure, 2) FHIR transformer to
+  convert health metrics to R4 Observation format, 3) Akute integration for data transmission.
+  Focus on clean separation of concerns while maintaining single-file architecture.'
+priority: high
+status: pending
+created_at: '2026-03-23T00:00:00Z'
+agent_assignments:
+- george
+dependencies: []
+estimated_hours: 8
+tags:
+- apple-healthkit
+- fhir-r4
+- health-data
+- xml-parsing
+- data-transformation
+- akute-integration
+output_path: output/brief-011a/
+expected_filename: apple_health_to_fhir.py
+expected_filename: apple_health_to_fhir.py

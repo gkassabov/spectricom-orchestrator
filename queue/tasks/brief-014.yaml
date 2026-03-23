@@ -1,0 +1,85 @@
+id: brief-014
+title: Dr. K portal MVP — patient-facing HTML prototype
+status: complete
+priority: high
+context: 'Build a single-file HTML prototype of the patient portal for Dr. K''s approval.
+
+  This is the Phase 1 exit criterion - nothing gets built until Dr. K approves this
+  design.
+
+
+  Requirements:
+
+  - Single HTML file with embedded CSS/JS (no React, no build step, no backend)
+
+  - Use synthetic Margaret Chen patient data hardcoded in JavaScript
+
+  - Mobile-first design (375px primary width)
+
+  - Clean, premium aesthetic appropriate for $24K/yr concierge medicine
+
+  - Dark mode support
+
+  - No Spectricom branding (name still TBD per T-029)
+
+  - Use system fonts only
+
+
+  Screens to include (all in one scrollable page with navigation):
+
+  1. Home/Health Status - green/yellow/red health indicator + AI narrative summary
+
+  2. Morning Briefing - today''s AI-generated health summary card
+
+  3. Lab Results - lab values with plain English AI translation side by side
+
+  4. Wearable Dashboard - HR, HRV, sleep, activity charts for last 7 days (use Chart.js
+  from CDN)
+
+  5. Messages - secure messaging thread interface with Dr. K
+
+  6. Upcoming Visit - pre-visit prep card with agenda items
+
+
+  Synthetic Margaret Chen data should include:
+
+  - Demographics: Margaret Chen, 34F, tech executive
+
+  - Recent lab results with some values slightly out of range
+
+  - Wearable data showing stress patterns
+
+  - Message thread about upcoming visit prep
+
+  - Overall health status: yellow (some concerns but stable)
+
+  '
+acceptance_criteria:
+- Single HTML file that opens directly in browser
+- All 6 screens accessible via navigation
+- Responsive design works on mobile (375px) and desktop
+- Dark mode toggle functions correctly
+- Chart.js charts render with synthetic wearable data
+- Premium, clean visual design appropriate for high-end concierge medicine
+- All data is synthetic/hardcoded (no API calls)
+- File size under 500KB including all assets
+output_path: output/brief-014/patient_portal_prototype.html
+decision_rules:
+- Use Chart.js via CDN for wearable data visualization
+- Implement dark/light mode with CSS custom properties
+- Navigation can be tabs, sidebar, or bottom nav - choose what works best for mobile
+- Health status indicator should be prominent on home screen
+- Message interface should look secure and professional
+- Lab results should show both numerical values and AI plain-English explanations
+- Pre-visit card should show clear agenda items and preparation steps
+- Use CSS Grid/Flexbox for responsive layout
+- Synthetic data should be realistic but clearly fake (no real patient info)
+do_not:
+- Do not use React, Vue, or any JavaScript framework
+- Do not create separate CSS/JS files - everything embedded in HTML
+- Do not use real patient data or PHI
+- Do not include Spectricom branding or logo
+- Do not make API calls or require backend services
+- Do not use custom fonts (system fonts only)
+- Do not exceed 500KB file size
+max_iterations: 8
