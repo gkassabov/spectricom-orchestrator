@@ -60,16 +60,123 @@ except ImportError:
     HAS_SLACK = False
 
 # ═══════════════════════════════════════════════════════
-# CONFIGURATION
+# CONFIGURATION (OI-026 v3.4 — multi-repo via config/repos.yaml)
 # ═══════════════════════════════════════════════════════
-PROJECT_ROOT = Path.home() / "spectricom-dev-pipeline"
-YORSIE_DIR = PROJECT_ROOT / "yorsie"
-BRIEFS_DIR = YORSIE_DIR / "briefs"
+import yaml as _yaml
+
 ORCH_DIR = Path.home() / "spectricom-orchestrator"
 LOG_DIR = ORCH_DIR / "logs"
 STATE_FILE = ORCH_DIR / "state.json"
 RUNNING_FILE = ORCH_DIR / "running.json"
-WORKTREE_BASE = Path.home() / "yorsie-toni"
+REPOS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "repos.yaml"
+
+# Per-repo state — populated by set_active_repo() at module load (defaults to yorsie).
+# A3 will re-call set_active_repo() after CLI / brief-header parsing to switch repos pre-fire.
+ACTIVE_REPO_NAME: str = ""
+ACTIVE_REPO_CONFIG: dict = {}
+PROJECT_ROOT: Path = Path()        # set by set_active_repo(); legacy var name preserved
+YORSIE_DIR: Path = Path()           # yorsie-only convenience: project_root / "yorsie" when active=yorsie, else project_root
+BRIEFS_DIR: Path = Path()           # project_root / briefs_subdir
+WORKTREE_BASE: Path = Path()        # parallel mode: yorsie-toni base; single-stream: project_root (unused)
+BRANCH_PREFIX: str = ""
+MERGE_TARGET: str = "main"
+REMOTE: str = "origin"
+LOG_SUBDIR: str = ""
+WORKTREE_MODE: str = "single-stream"
+TEST_CMD: str = ""
+FIRE_TEMPLATE: str = ""
+IS_META_FIRE: bool = False
+
+
+def load_repo_config() -> dict:
+    """Load ~/spectricom-orchestrator/config/repos.yaml and return parsed dict.
+
+    Validates: file exists, has `repos:` key with at least one entry, exactly one
+    entry has `default: true`. Raises RuntimeError on any violation.
+    """
+    if not REPOS_CONFIG_PATH.exists():
+        raise RuntimeError(f"Repo config not found: {REPOS_CONFIG_PATH}")
+    cfg = _yaml.safe_load(REPOS_CONFIG_PATH.read_text())
+    if not isinstance(cfg, dict) or "repos" not in cfg or not cfg["repos"]:
+        raise RuntimeError(f"Malformed repo config: {REPOS_CONFIG_PATH} (expected 'repos:' map)")
+    defaults = [n for n, r in cfg["repos"].items() if r.get("default")]
+    if len(defaults) != 1:
+        raise RuntimeError(
+            f"Repo config must declare exactly one default repo; found {len(defaults)}: {defaults}"
+        )
+    return cfg
+
+
+def set_active_repo(name: str = "") -> str:
+    """Switch active repo and populate module-level state from repos.yaml.
+
+    Args:
+        name: Repo name (e.g. 'yorsie', 'ai-foundation', 'clinical-mp', 'orchestrator').
+              Empty string → use the default repo from config (yorsie for v3.4.0).
+
+    Returns:
+        The active repo name (resolved).
+
+    Raises:
+        RuntimeError if name is provided but not declared in repos.yaml.
+    """
+    global ACTIVE_REPO_NAME, ACTIVE_REPO_CONFIG
+    global PROJECT_ROOT, YORSIE_DIR, BRIEFS_DIR, WORKTREE_BASE
+    global BRANCH_PREFIX, MERGE_TARGET, REMOTE, LOG_SUBDIR
+    global WORKTREE_MODE, TEST_CMD, FIRE_TEMPLATE, IS_META_FIRE
+
+    cfg = load_repo_config()
+    repos = cfg["repos"]
+
+    if not name:
+        name = next(n for n, r in repos.items() if r.get("default"))
+
+    if name not in repos:
+        valid = ", ".join(sorted(repos.keys()))
+        raise RuntimeError(f"Unknown repo: {name}. Valid: {valid}")
+
+    r = repos[name]
+    ACTIVE_REPO_NAME = name
+    ACTIVE_REPO_CONFIG = r
+    PROJECT_ROOT = Path(r["project_dir"]).expanduser()
+    BRIEFS_DIR = PROJECT_ROOT / r.get("briefs_subdir", "briefs")
+    # YORSIE_DIR is preserved as a legacy convenience: when yorsie is active it points at the yorsie subdir
+    # of the monorepo (matches v3.3 behavior); for any other repo it equals project_root (used only by
+    # yorsie-specific callsites such as the supabase migrations helper).
+    YORSIE_DIR = PROJECT_ROOT / "yorsie" if name == "yorsie" else PROJECT_ROOT
+    WORKTREE_BASE = (
+        Path(r["worktree_base"]).expanduser()
+        if r.get("worktree_mode") == "parallel" and r.get("worktree_base")
+        else PROJECT_ROOT
+    )
+    BRANCH_PREFIX = r.get("branch_prefix", "orch")
+    MERGE_TARGET = r.get("merge_target", "main")
+    REMOTE = r.get("remote", "origin")
+    LOG_SUBDIR = r.get("log_subdir", name)
+    WORKTREE_MODE = r.get("worktree_mode", "single-stream")
+    TEST_CMD = r.get("test_cmd", "")
+    FIRE_TEMPLATE = r.get("fire_command_template", "")
+    IS_META_FIRE = bool(r.get("meta_fire", False))
+    return name
+
+
+# Initial population at module load → defaults to yorsie (backward-compat with v3.3).
+# A3 (CLI parser) will re-call set_active_repo(<name>) before any work if --repo or
+# `## Repo:` header specifies a different target.
+set_active_repo()
+
+
+def parse_repo_from_brief(filepath) -> Optional[str]:
+    """Parse ## Repo: <name> from a brief/batch file header."""
+    try:
+        content = Path(filepath).read_text(encoding="utf-8")
+        m = re.search(r'^## Repo:\s*(\S+)', content[:2000], re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
 
 TONI_TIMEOUT = 45 * 60
 TONI_COOLDOWN = 10
@@ -100,6 +207,31 @@ class Result:
 # ═══════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════
+def ensure_log_subdir(subdir: str) -> Path:
+    """Create and return the log subdirectory for a repo."""
+    d = LOG_DIR / subdir
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def run_log_migration():
+    """One-time migration: move top-level toni-*.log files into logs/yorsie/."""
+    marker = LOG_DIR / ".migrated-v3.4"
+    if marker.exists():
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    yorsie_dir = LOG_DIR / "yorsie"
+    yorsie_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    moved = 0
+    for f in LOG_DIR.glob("toni-*.log"):
+        dest = yorsie_dir / f.name
+        if not dest.exists():
+            shutil.move(str(f), str(dest))
+            moved += 1
+    marker.write_text(f"Migrated {moved} files at {datetime.now().isoformat()}\n")
+
+
 def setup_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -112,6 +244,7 @@ def setup_logging():
     return logger, lf
 
 log, log_file = setup_logging()
+run_log_migration()
 
 # ═══════════════════════════════════════════════════════
 # BRIEF PARSER
@@ -337,7 +470,8 @@ def get_migrations() -> set:
 # ═══════════════════════════════════════════════════════
 def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_log = LOG_DIR / f"toni-{batch_file.stem}-{ts}.log"
+    log_subdir = ensure_log_subdir(LOG_SUBDIR)
+    out_log = log_subdir / f"toni-{batch_file.stem}-{ts}.log"
     try:
         brief_rel = batch_file.relative_to(project)
     except ValueError:
@@ -474,7 +608,7 @@ def clear_running():
 # ═══════════════════════════════════════════════════════
 def create_worktree(name: str, wid: int) -> Optional[Path]:
     wt = WORKTREE_BASE / f"toni-{wid}"
-    br = f"orch-{name}-w{wid}"
+    br = f"{BRANCH_PREFIX}-{name}-w{wid}"
     try:
         if wt.exists():
             subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {wt} --force",
@@ -508,17 +642,43 @@ def merge_branch(br: str) -> bool:
 # BATCH RUNNER
 # ═══════════════════════════════════════════════════════
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
+    meta_wt = None
+    if IS_META_FIRE and worktree is None:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        meta_wt = Path(f"/tmp/orch-fire-{ts}")
+        br = f"{BRANCH_PREFIX}-{batch_file.stem}"
+        try:
+            if meta_wt.exists():
+                subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {meta_wt} --force",
+                    shell=True, capture_output=True)
+            r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} -b {br}",
+                shell=True, capture_output=True, text=True)
+            if r.returncode != 0:
+                r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} {br}",
+                    shell=True, capture_output=True, text=True)
+            if r.returncode == 0:
+                log.info(f"Meta-fire worktree: {meta_wt} (branch: {br})")
+                worktree = meta_wt
+            else:
+                log.error(f"Meta-fire worktree failed: {r.stderr}")
+        except Exception as e:
+            log.error(f"Meta-fire worktree error: {e}")
+
     proj = worktree or PROJECT_ROOT
     started = datetime.now()
     briefs_preview = parse_batch(batch_file)
     write_running(batch_file, len(briefs_preview))
     try:
-        return _run_batch_inner(batch_file, proj, started, worktree)
+        result = _run_batch_inner(batch_file, proj, started, worktree)
     finally:
         clear_running()
+        if meta_wt:
+            cleanup_worktree(meta_wt)
+    return result
 
 def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=None) -> Result:
-    target = proj / "yorsie" / "briefs" / batch_file.name
+    briefs_subdir = ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
+    target = proj / briefs_subdir / batch_file.name
     if not batch_file.is_relative_to(proj):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(batch_file.read_bytes())
@@ -528,7 +688,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # Auto branch creation (D-148) — skip if using worktrees
     branch_name = None
     if worktree is None:
-        branch_name = f"orch-{batch_file.stem}"
+        branch_name = f"{BRANCH_PREFIX}-{batch_file.stem}"
         try:
             r = subprocess.run(
                 f"git checkout -b {branch_name}",
@@ -583,27 +743,27 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                 else:
                     log.warning(f"⚠️ Commit failed: {r.stderr.strip()}")
 
-                # Merge back to main
-                subprocess.run("git checkout main", shell=True, capture_output=True, cwd=str(proj))
+                # Merge back to merge target
+                subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
                 r = subprocess.run(
                     f"git merge {branch_name} --no-edit",
                     shell=True, capture_output=True, text=True, cwd=str(proj)
                 )
                 if r.returncode == 0:
-                    log.info(f"🔀 Merged {branch_name} → main")
+                    log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET}")
                     # Clean up feature branch
                     subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
                 else:
                     log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
                     log.error(f"   {r.stderr.strip()}")
             else:
-                # Failed batch — switch back to main, leave branch for inspection
-                subprocess.run("git checkout main", shell=True, capture_output=True, cwd=str(proj))
+                # Failed batch — switch back to merge target, leave branch for inspection
+                subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
                 log.warning(f"⚠️ Batch failed — branch {branch_name} left for inspection")
         except Exception as e:
             log.warning(f"⚠️ Git automation error: {e}")
-            # Ensure we're back on main
-            subprocess.run("git checkout main", shell=True, capture_output=True, cwd=str(proj))
+            # Ensure we're back on merge target
+            subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
 
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
@@ -687,7 +847,7 @@ def run_parallel(files: list[Path], force: bool = False):
     log.info("\nMerging sequentially...")
     for r, wt in sorted(results, key=lambda x: x[0].batch_file):
         if r.status == Status.PASSED:
-            br = f"orch-{Path(r.batch_file).stem}-w{wts.index(wt)+1}"
+            br = f"{BRANCH_PREFIX}-{Path(r.batch_file).stem}-w{wts.index(wt)+1}"
             if merge_branch(br) and RUN_PLAYWRIGHT:
                 ok, _ = run_playwright()
                 if not ok: log.error("PW failed post-merge — stopping"); break
@@ -742,6 +902,7 @@ def watch():
 def show_status():
     s = load_state()
     print(f"\n{'═'*60}\nSPECTRICOM ORCHESTRATOR v3.1 STATUS\n{'═'*60}")
+    print(f"  Project:    {PROJECT_ROOT}")
     c, f = s.get("completed",[]), s.get("failed",[])
     print(f"\n  Completed: {len(c)}")
     for x in c[-5:]: print(f"    ✅ {x['batch_file']} — {x.get('duration_s',0):.0f}s, {x.get('briefs','?')} briefs")
@@ -794,7 +955,8 @@ def resolve(p: str) -> Path:
 def main():
     ap = argparse.ArgumentParser(description="Spectricom Orchestrator v3.1")
     sp = ap.add_subparsers(dest="cmd")
-    sp.add_parser("status")
+    stp = sp.add_parser("status")
+    stp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
     sp.add_parser("watch")
 
     rp = sp.add_parser("run")
@@ -802,22 +964,41 @@ def main():
     rp.add_argument("--approve", action="store_true", help="Pre-approve execution")
     rp.add_argument("--force", action="store_true", help="Skip ALL safety checks")
     rp.add_argument("--skip-deps", action="store_true", help="Ignore dependency check")
+    rp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     qp = sp.add_parser("queue")
     qp.add_argument("batch_files", nargs="+")
     qp.add_argument("--approve", action="store_true", required=True)
     qp.add_argument("--force", action="store_true")
     qp.add_argument("--skip-deps", action="store_true")
+    qp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     pp = sp.add_parser("parallel")
     pp.add_argument("batch_files", nargs="+")
     pp.add_argument("--approve", action="store_true", required=True)
     pp.add_argument("--force", action="store_true")
+    pp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     dp = sp.add_parser("deps")
     dp.add_argument("batch_file")
+    dp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     a = ap.parse_args()
+
+    # OI-026 A3: resolve repo — --repo CLI > ## Repo: header > default
+    repo_name = getattr(a, 'repo', '') or ''
+    if not repo_name:
+        batch_arg = getattr(a, 'batch_file', None) or (getattr(a, 'batch_files', None) or [None])[0]
+        if batch_arg:
+            try:
+                repo_name = parse_repo_from_brief(resolve(batch_arg)) or ''
+            except FileNotFoundError:
+                pass
+    try:
+        set_active_repo(repo_name)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
     if a.cmd == "run":
         bf = resolve(a.batch_file)

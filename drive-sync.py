@@ -18,7 +18,9 @@ ORCH=Path.home()/"spectricom-orchestrator"
 TOKEN=ORCH/"drive-token.json"
 CREDS=ORCH/"drive-credentials.json"
 DL=Path("/mnt/c/Users/gkass/Downloads")
-BRIEFS=Path.home()/"spectricom-dev-pipeline"/"yorsie"/"briefs"
+from repo_config import load_default_repo_config as _ldrc
+_default_name, _default_cfg = _ldrc()
+BRIEFS=Path(_default_cfg["project_dir"]).expanduser()/_default_cfg.get("briefs_subdir","briefs")
 PORT=8090
 SCOPES=["https://www.googleapis.com/auth/drive"]
 ROUTES=[
