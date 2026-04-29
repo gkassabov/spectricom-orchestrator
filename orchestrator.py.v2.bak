@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""
+SPECTRICOM ORCHESTRATOR v2
+==========================
+Automated Toni batch execution pipeline.
+
+Usage:
+  python3 orchestrator.py run <batch-file>
+  python3 orchestrator.py queue <batch-file> ...
+  python3 orchestrator.py watch
+  python3 orchestrator.py parallel <f1> <f2> ...
+  python3 orchestrator.py status
+"""
+
+import os, sys, re, time, json, signal, logging, hashlib, subprocess, argparse
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ═══════════════════════════════════════════════════════
+# CONFIGURATION — edit these to match your setup
+# ═══════════════════════════════════════════════════════
+PROJECT_ROOT = Path.home() / "spectricom-dev-pipeline"
+YORSIE_DIR = PROJECT_ROOT / "yorsie"
+BRIEFS_DIR = YORSIE_DIR / "briefs"
+ORCH_DIR = Path.home() / "spectricom-orchestrator"
+LOG_DIR = ORCH_DIR / "logs"
+STATE_FILE = ORCH_DIR / "state.json"
+WORKTREE_BASE = Path.home() / "yorsie-toni"
+
+TONI_TIMEOUT = 45 * 60
+TONI_COOLDOWN = 10
+MAX_PARALLEL = 3
+RUN_PLAYWRIGHT = False
+PLAYWRIGHT_CMD = "npx playwright test"
+
+# ═══════════════════════════════════════════════════════
+# DATA
+# ═══════════════════════════════════════════════════════
+class Status(str, Enum):
+    PENDING="pending"; RUNNING="running"; PASSED="passed"; FAILED="failed"; SKIPPED="skipped"
+
+@dataclass
+class Brief:
+    id: str; title: str; status: str="pending"; depends_on: list=field(default_factory=list)
+
+@dataclass
+class Result:
+    batch_file: str; status: Status; started: str; finished: str
+    duration_s: float; exit_code: int; briefs: int
+    playwright_ok: Optional[bool]=None; pw_tests: int=0
+    new_migrations: list=field(default_factory=list)
+    error: Optional[str]=None; log_file: Optional[str]=None
+    worktree: Optional[str]=None
+
+# ═══════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════
+def setup_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    lf = LOG_DIR / f"orch-{ts}.log"
+    fmt = logging.Formatter("%(asctime)s [%(levelname)-7s] %(message)s", datefmt="%H:%M:%S")
+    fh = logging.FileHandler(lf); fh.setFormatter(fmt)
+    ch = logging.StreamHandler(); ch.setFormatter(fmt)
+    logger = logging.getLogger("orch"); logger.setLevel(logging.INFO)
+    logger.addHandler(fh); logger.addHandler(ch)
+    return logger, lf
+
+log, log_file = setup_logging()
+
+# ═══════════════════════════════════════════════════════
+# BRIEF PARSER
+# ═══════════════════════════════════════════════════════
+def parse_batch(filepath: Path) -> list[Brief]:
+    content = filepath.read_text(encoding="utf-8")
+    briefs = []
+    id_pat = re.compile(r'^\s*-?\s*id:\s*(.+)', re.MULTILINE)
+    title_pat = re.compile(r'^\s*title:\s*"?(.+?)"?\s*$', re.MULTILINE)
+    deps_pat = re.compile(r'^\s*depends_on:\s*\[([^\]]*)\]', re.MULTILINE)
+    ids_raw = id_pat.findall(content)
+    ids = [i for i in ids_raw if not i.strip().strip('"').strip("'").lower() in ('string','number','boolean','integer','pending','true','false')]
+    titles = title_pat.findall(content)
+    for i, bid in enumerate(ids):
+        bid = bid.strip().strip('"').strip("'")
+        title = titles[i].strip() if i < len(titles) else bid
+        start = content.find(f"id: {bid}")
+        if start == -1: start = content.find(bid)
+        nxt = len(content)
+        for j, oid in enumerate(ids):
+            if j > i:
+                pos = content.find(f"id: {oid.strip()}", start+1)
+                if pos != -1: nxt = pos; break
+        section = content[start:nxt]
+        dm = deps_pat.search(section)
+        deps = [d.strip().strip('"').strip("'") for d in dm.group(1).split(",") if d.strip()] if dm else []
+        briefs.append(Brief(id=bid, title=title, depends_on=deps))
+    if not briefs:
+        briefs.append(Brief(id=filepath.stem, title=f"Batch: {filepath.name}"))
+    log.info(f"Parsed {filepath.name}: {len(briefs)} briefs")
+    for b in briefs:
+        dep = f" (deps: {b.depends_on})" if b.depends_on else ""
+        log.info(f"  -> {b.id}: {b.title}{dep}")
+    return briefs
+
+# ═══════════════════════════════════════════════════════
+# MIGRATION CHECK
+# ═══════════════════════════════════════════════════════
+def get_migrations() -> set:
+    d = PROJECT_ROOT / "supabase" / "migrations"
+    if not d.exists(): d = YORSIE_DIR / "supabase" / "migrations"
+    if not d.exists(): return set()
+    return {f.name for f in d.glob("*.sql")}
+
+# ═══════════════════════════════════════════════════════
+# TONI EXECUTOR
+# ═══════════════════════════════════════════════════════
+def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_log = LOG_DIR / f"toni-{batch_file.stem}-{ts}.log"
+    try:
+        brief_rel = batch_file.relative_to(project)
+    except ValueError:
+        brief_rel = batch_file.name
+    cmd = (
+        f"cd {project} && "
+        f"unset ANTHROPIC_API_KEY && "
+        f"claude --dangerously-skip-permissions "
+        f'"Read {brief_rel} and execute all briefs in order."'
+    )
+    log.info(f"Firing Toni: {batch_file.name}")
+    log.info(f"  Project: {project}")
+    log.info(f"  Timeout: {TONI_TIMEOUT // 60}m")
+    log.info(f"  Log: {out_log}")
+    try:
+        with open(out_log, "w") as lf:
+            lf.write(f"=== TONI EXECUTION ===\nBatch: {batch_file.name}\n")
+            lf.write(f"Started: {datetime.now().isoformat()}\nCommand: {cmd}\n{'='*60}\n\n")
+            lf.flush()
+            proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash",
+                stdout=lf, stderr=subprocess.STDOUT, cwd=str(project),
+                preexec_fn=os.setsid)
+            ec = proc.wait(timeout=TONI_TIMEOUT)
+            lf.write(f"\n{'='*60}\nFinished: {datetime.now().isoformat()}\nExit: {ec}\n")
+        log.info(f"Toni finished: exit {ec}")
+        return ec, str(out_log)
+    except subprocess.TimeoutExpired:
+        log.error(f"Toni TIMEOUT after {TONI_TIMEOUT//60}m")
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        time.sleep(3)
+        try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError: pass
+        return -1, str(out_log)
+    except Exception as e:
+        log.error(f"Toni error: {e}")
+        return -2, str(out_log)
+
+# ═══════════════════════════════════════════════════════
+# POST-EXECUTION
+# ═══════════════════════════════════════════════════════
+def run_playwright() -> tuple[bool, int]:
+    log.info("Running Playwright...")
+    try:
+        r = subprocess.run(PLAYWRIGHT_CMD, shell=True, capture_output=True,
+            text=True, timeout=300, cwd=str(PROJECT_ROOT))
+        m = re.search(r'(\d+)\s+passed', r.stdout + r.stderr)
+        cnt = int(m.group(1)) if m else 0
+        ok = r.returncode == 0
+        log.info(f"Playwright: {'PASSED' if ok else 'FAILED'} ({cnt} tests)")
+        if not ok: log.warning(f"Stderr:\n{r.stderr[-500:]}")
+        return ok, cnt
+    except subprocess.TimeoutExpired:
+        log.error("Playwright timed out"); return False, 0
+    except Exception as e:
+        log.error(f"Playwright error: {e}"); return False, 0
+
+def notify(result: Result):
+    e = "✅" if result.status == Status.PASSED else "❌"
+    msg = f"{e} {result.batch_file} — {result.status.value} | {result.briefs} briefs | {result.duration_s:.0f}s"
+    if result.playwright_ok is not None:
+        msg += f" | PW: {'✅' if result.playwright_ok else '❌'} ({result.pw_tests})"
+    if result.new_migrations:
+        msg += f"\n  ⚠️  {len(result.new_migrations)} migrations to apply manually"
+        for m in result.new_migrations:
+            msg += f"\n    npx supabase db query --linked -f supabase/migrations/{m}"
+    log.info(f"\n{'━'*60}\n{msg}\n{'━'*60}")
+
+# ═══════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════
+def load_state() -> dict:
+    if STATE_FILE.exists(): return json.loads(STATE_FILE.read_text())
+    return {"queue":[], "completed":[], "failed":[], "watched":{}}
+def save_state(s):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(s, indent=2, default=str))
+def fhash(p: Path) -> str:
+    return hashlib.md5(p.read_bytes()).hexdigest()
+
+# ═══════════════════════════════════════════════════════
+# WORKTREES (PARALLEL)
+# ═══════════════════════════════════════════════════════
+def create_worktree(name: str, wid: int) -> Optional[Path]:
+    wt = WORKTREE_BASE / f"toni-{wid}"
+    br = f"orch-{name}-w{wid}"
+    try:
+        if wt.exists():
+            subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {wt} --force",
+                shell=True, capture_output=True)
+        r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {wt} -b {br}",
+            shell=True, capture_output=True, text=True)
+        if r.returncode != 0:
+            r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {wt} {br}",
+                shell=True, capture_output=True, text=True)
+        if r.returncode == 0:
+            log.info(f"Worktree: {wt} (branch: {br})"); return wt
+        log.error(f"Worktree fail: {r.stderr}"); return None
+    except Exception as e:
+        log.error(f"Worktree error: {e}"); return None
+
+def cleanup_worktree(wt: Path):
+    try:
+        subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {wt} --force",
+            shell=True, capture_output=True)
+        log.info(f"Cleaned: {wt}")
+    except: pass
+
+def merge_branch(br: str) -> bool:
+    r = subprocess.run(f"cd {PROJECT_ROOT} && git merge {br} --no-edit",
+        shell=True, capture_output=True, text=True)
+    if r.returncode == 0:
+        log.info(f"Merged {br}"); return True
+    log.error(f"Merge conflict on {br} — MANUAL RESOLUTION NEEDED"); return False
+
+# ═══════════════════════════════════════════════════════
+# BATCH RUNNER
+# ═══════════════════════════════════════════════════════
+def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
+    proj = worktree or PROJECT_ROOT
+    started = datetime.now()
+    # Copy brief to briefs dir
+    target = proj / "yorsie" / "briefs" / batch_file.name
+    if not batch_file.is_relative_to(proj):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(batch_file.read_bytes())
+        log.info(f"Copied brief to {target}")
+    briefs = parse_batch(batch_file)
+    mig_before = get_migrations()
+    ec, out_log = fire_toni(target, proj)
+    finished = datetime.now()
+    dur = (finished - started).total_seconds()
+    status = Status.PASSED if ec == 0 else Status.FAILED
+    mig_after = get_migrations()
+    new_mig = sorted(mig_after - mig_before)
+    if new_mig:
+        log.warning(f"⚠️  NEW MIGRATIONS — apply manually:")
+        for m in new_mig:
+            log.warning(f"  npx supabase db query --linked -f supabase/migrations/{m}")
+    pw_ok, pw_cnt = (None, 0)
+    if RUN_PLAYWRIGHT and ec == 0 and worktree is None:
+        pw_ok, pw_cnt = run_playwright()
+        if not pw_ok: status = Status.FAILED
+    result = Result(batch_file=batch_file.name, status=status,
+        started=started.isoformat(), finished=finished.isoformat(),
+        duration_s=dur, exit_code=ec, briefs=len(briefs),
+        playwright_ok=pw_ok, pw_tests=pw_cnt,
+        new_migrations=new_mig, log_file=out_log,
+        worktree=str(worktree) if worktree else None)
+    notify(result)
+    return result
+
+# ═══════════════════════════════════════════════════════
+# QUEUE (SEQUENTIAL)
+# ═══════════════════════════════════════════════════════
+def run_queue(files: list[Path]):
+    state = load_state(); results = []
+    log.info(f"\n{'═'*60}\nQUEUE: {len(files)} batches\n{'═'*60}")
+    for i, bf in enumerate(files):
+        log.info(f"\n{'─'*60}\nBATCH {i+1}/{len(files)}: {bf.name}\n{'─'*60}")
+        r = run_batch(bf); results.append(r)
+        state["completed" if r.status==Status.PASSED else "failed"].append(asdict(r))
+        save_state(state)
+        if r.status == Status.FAILED:
+            rem = len(files)-i-1
+            if rem: log.error(f"⛔ Queue HALTED — {rem} batches skipped")
+            break
+        if i < len(files)-1:
+            log.info(f"Cooldown {TONI_COOLDOWN}s..."); time.sleep(TONI_COOLDOWN)
+    p = sum(1 for r in results if r.status==Status.PASSED)
+    t = sum(r.duration_s for r in results)
+    b = sum(r.briefs for r in results)
+    log.info(f"\n{'═'*60}\nQUEUE DONE: {p}/{len(results)} passed | {b} briefs | {t:.0f}s\n{'═'*60}")
+    return results
+
+# ═══════════════════════════════════════════════════════
+# PARALLEL
+# ═══════════════════════════════════════════════════════
+def run_parallel(files: list[Path]):
+    if len(files) > MAX_PARALLEL:
+        log.error(f"Max {MAX_PARALLEL} workers"); return
+    log.info(f"\n{'═'*60}\nPARALLEL: {len(files)} batches\n{'═'*60}")
+    wts = []
+    for i, bf in enumerate(files):
+        wt = create_worktree(bf.stem, i+1)
+        if not wt:
+            for w in wts: cleanup_worktree(w)
+            return
+        wts.append(wt)
+    results = []
+    with ThreadPoolExecutor(max_workers=len(files)) as ex:
+        futs = {ex.submit(run_batch, bf, wt): (bf, wt) for bf, wt in zip(files, wts)}
+        for f in as_completed(futs):
+            bf, wt = futs[f]
+            try:
+                r = f.result(); results.append((r, wt))
+            except Exception as e:
+                log.error(f"Worker crash: {bf.name} — {e}")
+    log.info("\nMerging sequentially...")
+    for r, wt in sorted(results, key=lambda x: x[0].batch_file):
+        if r.status == Status.PASSED:
+            br = f"orch-{Path(r.batch_file).stem}-w{wts.index(wt)+1}"
+            if merge_branch(br) and RUN_PLAYWRIGHT:
+                ok, _ = run_playwright()
+                if not ok: log.error("PW failed post-merge — stopping"); break
+        cleanup_worktree(wt)
+    p = sum(1 for r,_ in results if r.status==Status.PASSED)
+    log.info(f"\nPARALLEL DONE: {p}/{len(results)} passed")
+
+# ═══════════════════════════════════════════════════════
+# WATCHER
+# ═══════════════════════════════════════════════════════
+def watch():
+    BRIEFS_DIR.mkdir(parents=True, exist_ok=True)
+    state = load_state()
+    log.info(f"\n{'═'*60}\nWATCHER: {BRIEFS_DIR}\nCtrl+C to stop\n{'═'*60}\n")
+    try:
+        while True:
+            for f in sorted(BRIEFS_DIR.glob("*.md")):
+                h = fhash(f)
+                if h not in state.get("watched", {}):
+                    log.info(f"📄 New brief: {f.name}")
+                    state.setdefault("watched", {})[h] = {"file": f.name, "at": datetime.now().isoformat()}
+                    save_state(state)
+                    r = run_batch(f)
+                    state["completed" if r.status==Status.PASSED else "failed"].append(asdict(r))
+                    save_state(state)
+                    log.info("Resuming watch...\n")
+            time.sleep(5)
+    except KeyboardInterrupt:
+        log.info("\nWatcher stopped.")
+
+# ═══════════════════════════════════════════════════════
+# STATUS
+# ═══════════════════════════════════════════════════════
+def show_status():
+    s = load_state()
+    print(f"\n{'═'*60}\nSPECTRICOM ORCHESTRATOR STATUS\n{'═'*60}")
+    c, f = s.get("completed",[]), s.get("failed",[])
+    print(f"\n  Completed: {len(c)}")
+    for x in c[-5:]: print(f"    ✅ {x['batch_file']} — {x.get('duration_s',0):.0f}s, {x.get('briefs','?')} briefs")
+    if f:
+        print(f"\n  Failed: {len(f)}")
+        for x in f[-5:]: print(f"    ❌ {x['batch_file']}")
+    if BRIEFS_DIR.exists():
+        done = {x["batch_file"] for x in c}
+        pend = [b for b in BRIEFS_DIR.glob("*.md") if b.name not in done]
+        if pend:
+            print(f"\n  Pending: {len(pend)}")
+            for p in pend: print(f"    📋 {p.name}")
+    print(f"\n  Logs: {LOG_DIR}\n{'═'*60}\n")
+
+# ═══════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════
+def resolve(p: str) -> Path:
+    for candidate in [Path(p), BRIEFS_DIR/Path(p).name, PROJECT_ROOT/p]:
+        if candidate.exists(): return candidate.resolve()
+    raise FileNotFoundError(f"Brief not found: {p}")
+
+def main():
+    ap = argparse.ArgumentParser(description="Spectricom Orchestrator")
+    sp = ap.add_subparsers(dest="cmd")
+    sp.add_parser("status")
+    sp.add_parser("watch")
+    rp = sp.add_parser("run"); rp.add_argument("batch_file")
+    qp = sp.add_parser("queue"); qp.add_argument("batch_files", nargs="+")
+    pp = sp.add_parser("parallel"); pp.add_argument("batch_files", nargs="+")
+    a = ap.parse_args()
+    if a.cmd == "run":
+        r = run_batch(resolve(a.batch_file))
+        s = load_state(); s["completed" if r.status==Status.PASSED else "failed"].append(asdict(r)); save_state(s)
+        sys.exit(0 if r.status==Status.PASSED else 1)
+    elif a.cmd == "queue":
+        rs = run_queue([resolve(f) for f in a.batch_files])
+        sys.exit(0 if all(r.status==Status.PASSED for r in rs) else 1)
+    elif a.cmd == "watch": watch()
+    elif a.cmd == "parallel": run_parallel([resolve(f) for f in a.batch_files])
+    elif a.cmd == "status": show_status()
+    else: ap.print_help()
+
+if __name__ == "__main__":
+    main()

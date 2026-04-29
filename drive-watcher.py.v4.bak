@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""
+SPECTRICOM AUTO-SYNC DAEMON v4
+Handles Windows (1)(2) suffixes. Always pushes latest version.
+  python3 drive-watcher.py start
+  python3 drive-watcher.py stop
+  python3 drive-watcher.py status
+  python3 drive-watcher.py run       ← foreground for testing
+"""
+import sys,os,time,re,json,hashlib
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+
+ORCH=Path.home()/"spectricom-orchestrator"
+DL=Path("/mnt/c/Users/gkass/Downloads")
+DS=Path("/mnt/c/Users/gkass/Documents/Spectricom")
+WATCH_DIRS=[DL,DS]
+PID_FILE=ORCH/"drive-watcher.pid"
+HASH_FILE=ORCH/"drive-watcher-hashes.json"
+LOG_FILE=ORCH/"logs"/"drive-watcher.log"
+TOKEN=ORCH/"drive-token.json"
+POLL=10
+SCOPES=["https://www.googleapis.com/auth/drive"]
+
+ROUTES=[
+    (r"Spectricom_Document_Registry","Registry"),
+    (r"Spectricom_Parallel_Dev_Master","Plans"),
+    (r"spectricom-orchestrator-arch","Plans"),
+    (r"Spectricom_Logs","Logs"),
+    (r"Gemma_System_Prompt","Prompts"),
+    (r"spectricom-context-slim","Context"),
+    (r"yorsie-design-system|yorsie-your-intel|yorsie-bug-registry|yorsie-compact-feature","Yorsie/Design"),
+    (r"toni-batch","Yorsie/Briefs"),
+    (r"yorsie-synth|yorsie-food-synth","Yorsie/Synth"),
+    (r"SPIKE-","Spikes"),
+]
+GLOBS=["Spectricom_*.md","spectricom-*.md","Gemma_System_Prompt*.md",
+       "yorsie-*.md","toni-batch-*.md","SPIKE-*.md"]
+
+def route(fn):
+    for p,f in ROUTES:
+        if re.search(p,fn,re.I): return f
+    return ""
+
+def clean_name(fn):
+    return re.sub(r'\s*\(\d+\)(?=\.)', '', fn)
+
+def is_old(fn):
+    return '-old' in fn.lower()
+
+def pick_latest(files):
+    groups = defaultdict(list)
+    for f in files:
+        if is_old(f.name): continue
+        key = clean_name(f.name)
+        groups[key].append(f)
+    latest = {}
+    for key, group in groups.items():
+        newest = max(group, key=lambda f: f.stat().st_mtime)
+        latest[key] = newest
+    return latest
+
+def fhash(p): return hashlib.md5(p.read_bytes()).hexdigest()
+def load_hashes():
+    if HASH_FILE.exists(): return json.loads(HASH_FILE.read_text())
+    return {}
+def save_hashes(h): HASH_FILE.write_text(json.dumps(h))
+
+def log(msg):
+    ts=datetime.now().strftime("%H:%M:%S")
+    line=f"{ts} {msg}"
+    print(line,flush=True)
+    LOG_FILE.parent.mkdir(parents=True,exist_ok=True)
+    with open(LOG_FILE,"a") as f: f.write(line+"\n")
+
+def get_svc():
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    creds=Credentials.from_authorized_user_file(str(TOKEN),SCOPES)
+    if not creds.valid and creds.expired and creds.refresh_token:
+        creds.refresh(Request()); TOKEN.write_text(creds.to_json())
+    return build("drive","v3",credentials=creds)
+
+def find(s,name,pid=None):
+    q=f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if pid: q+=f" and '{pid}' in parents"
+    r=s.files().list(q=q,fields="files(id)",pageSize=5).execute().get("files",[])
+    return r[0]["id"] if r else None
+
+def resolve(s,path,rid):
+    cid=rid
+    for p in path.split("/"):
+        fid=find(s,p,cid)
+        if not fid:
+            m={"name":p,"mimeType":"application/vnd.google-apps.folder","parents":[cid]}
+            fid=s.files().create(body=m,fields="id").execute()["id"]
+        cid=fid
+    return cid
+
+def upload_to_drive(s,local_path,folder_id,drive_name):
+    from googleapiclient.http import MediaFileUpload
+    q=f"name='{drive_name}' and '{folder_id}' in parents and trashed=false"
+    ex=s.files().list(q=q,fields="files(id)").execute().get("files",[])
+    media=MediaFileUpload(str(local_path),resumable=True)
+    if ex:
+        s.files().update(fileId=ex[0]["id"],media_body=media).execute()
+        return "updated"
+    else:
+        s.files().create(body={"name":drive_name,"parents":[folder_id]},
+            media_body=media,fields="id").execute()
+        return "created"
+
+def archive_old_versions(s, root_id, folder_id, drive_name):
+    base = re.sub(r'[-_]v?\d+[-_.]\d+[-_.]*\d*\.md$', '', drive_name)
+    if base == drive_name.replace('.md',''): return
+    q = f"name contains '{base}' and '{folder_id}' in parents and trashed=false"
+    files = s.files().list(q=q, fields="files(id,name)").execute().get("files",[])
+    archive_id = None
+    for f in files:
+        if f["name"] == drive_name: continue
+        if not f["name"].startswith(base): continue
+        if not archive_id:
+            archive_id = resolve(s, "Archive", root_id)
+        s.files().update(fileId=f["id"],
+            addParents=archive_id, removeParents=folder_id).execute()
+        log(f"  📦 Archived: {f['name']}")
+
+def scan_and_push(s,root_id,hashes):
+    changed=False
+    all_files=[]
+    for wd in WATCH_DIRS:
+        if not wd.exists(): continue
+        for pat in GLOBS:
+            all_files.extend(wd.glob(pat))
+    latest=pick_latest(all_files)
+    for drive_name, local_file in latest.items():
+        d=route(drive_name)
+        if not d: continue
+        h=fhash(local_file)
+        key=f"{drive_name}:{h}"
+        if key in hashes: continue
+        try:
+            fid=resolve(s,d,root_id)
+            a=upload_to_drive(s,local_file,fid,drive_name)
+            src=local_file.name
+            label=f" (from {src})" if src!=drive_name else ""
+            log(f"✅ {drive_name} → {d}/ ({a}){label}")
+            archive_old_versions(s, root_id, fid, drive_name)
+            hashes[key]=datetime.now().isoformat()
+            changed=True
+        except Exception as e:
+            log(f"❌ {drive_name}: {e}")
+    return changed
+
+def run_daemon():
+    log("═══════════════════════════════════════")
+    log("DRIVE WATCHER v3 — latest-only, (N)-aware")
+    log(f"Watching: {DL}")
+    log(f"Watching: {DS}")
+    log("═══════════════════════════════════════")
+    s=get_svc()
+    root_id=find(s,"Spectricom")
+    if not root_id: log("❌ Spectricom folder not found"); sys.exit(1)
+    log("✅ Connected to Spectricom/")
+    hashes=load_hashes()
+    if scan_and_push(s,root_id,hashes): save_hashes(hashes)
+    log("Watching for changes...")
+    try:
+        while True:
+            time.sleep(POLL)
+            try:
+                if scan_and_push(s,root_id,hashes): save_hashes(hashes)
+            except Exception as e:
+                log(f"⚠️ {e}")
+                try: s=get_svc()
+                except: pass
+    except KeyboardInterrupt:
+        log("Stopped.")
+
+def cmd_start():
+    if PID_FILE.exists():
+        pid=int(PID_FILE.read_text().strip())
+        try: os.kill(pid,0); print(f"Already running (PID {pid})"); return
+        except ProcessLookupError: pass
+    pid=os.fork()
+    if pid>0:
+        PID_FILE.write_text(str(pid))
+        print(f"✅ Drive watcher v3 started (PID {pid})")
+        print(f"   Logs: tail -f {LOG_FILE}"); return
+    os.setsid()
+    sys.stdout=open(os.devnull,'w'); sys.stderr=open(os.devnull,'w')
+    run_daemon()
+
+def cmd_stop():
+    if not PID_FILE.exists(): print("Not running"); return
+    pid=int(PID_FILE.read_text().strip())
+    try: os.kill(pid,15); PID_FILE.unlink(); print(f"✅ Stopped (PID {pid})")
+    except ProcessLookupError: PID_FILE.unlink(); print("Was not running")
+
+def cmd_status():
+    if not PID_FILE.exists(): print("❌ Not running"); return
+    pid=int(PID_FILE.read_text().strip())
+    try:
+        os.kill(pid,0); print(f"✅ Running (PID {pid})")
+        if LOG_FILE.exists():
+            lines=LOG_FILE.read_text().strip().split("\n")
+            for l in lines[-5:]: print(f"  {l}")
+    except ProcessLookupError: print("❌ Dead"); PID_FILE.unlink()
+
+if __name__=="__main__":
+    cmd=sys.argv[1] if len(sys.argv)>1 else ""
+    if cmd=="start": cmd_start()
+    elif cmd=="stop": cmd_stop()
+    elif cmd=="status": cmd_status()
+    elif cmd=="run": run_daemon()
+    else: print(__doc__)
