@@ -39,7 +39,9 @@ BRIDGE_PID = ORCH_DIR / "bridge.pid"
 WATCHER_PID = ORCH_DIR / "watcher.pid"
 BRIDGE_LOG = ORCH_DIR / "logs" / "bridge.log"
 ORCH_LOG_DIR = ORCH_DIR / "logs"
-BRIEFS_DIR = Path.home() / "spectricom-dev-pipeline" / "yorsie" / "briefs"
+from repo_config import load_default_repo_config as _ldrc
+_default_name, _default_cfg = _ldrc()
+BRIEFS_DIR = Path(_default_cfg["project_dir"]).expanduser() / _default_cfg.get("briefs_subdir", "briefs")
 
 DEFAULT_PORT = 8091
 
@@ -183,7 +185,7 @@ def get_brief_progress():
 def get_git_progress():
     """Get live git activity from the project repo during Toni execution."""
     import subprocess
-    PROJECT = Path.home() / "spectricom-dev-pipeline"
+    PROJECT = Path(_default_cfg["project_dir"]).expanduser()
     running = get_running()
 
     result = {
@@ -305,6 +307,7 @@ ACTIONS = {
         "label": "Service Status",
         "cmd": "bash ~/spectricom-orchestrator/startup.sh status"
     },
+    # YORSIE-specific dashboard shortcuts (per OI-026 v1-2 A7 scope).
     "dev-server-start": {
         "label": "Start Dev Server",
         "cmd": "bash -c 'cd ~/spectricom-dev-pipeline/yorsie && nohup npm run dev > /tmp/dev-server.log 2>&1 &'"

@@ -7,6 +7,8 @@ from pathlib import Path
 
 ORCH = Path.home() / "spectricom-orchestrator"
 DASH = ORCH / "orch-dashboard.py"
+from repo_config import load_default_repo_config as _ldrc
+_default_name, _default_cfg = _ldrc()
 
 # Read current dashboard
 content = DASH.read_text()
@@ -18,7 +20,7 @@ git_progress_func = '''
 def get_git_progress():
     """Get live git activity from the project repo during Toni execution."""
     import subprocess
-    PROJECT = Path.home() / "spectricom-dev-pipeline"
+    PROJECT = Path(_default_cfg["project_dir"]).expanduser()
     running = get_running()
 
     result = {

@@ -165,6 +165,19 @@ def set_active_repo(name: str = "") -> str:
 # `## Repo:` header specifies a different target.
 set_active_repo()
 
+
+def parse_repo_from_brief(filepath) -> Optional[str]:
+    """Parse ## Repo: <name> from a brief/batch file header."""
+    try:
+        content = Path(filepath).read_text(encoding="utf-8")
+        m = re.search(r'^## Repo:\s*(\S+)', content[:2000], re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
 TONI_TIMEOUT = 45 * 60
 TONI_COOLDOWN = 10
 MAX_PARALLEL = 3
@@ -194,6 +207,31 @@ class Result:
 # ═══════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════
+def ensure_log_subdir(subdir: str) -> Path:
+    """Create and return the log subdirectory for a repo."""
+    d = LOG_DIR / subdir
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def run_log_migration():
+    """One-time migration: move top-level toni-*.log files into logs/yorsie/."""
+    marker = LOG_DIR / ".migrated-v3.4"
+    if marker.exists():
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    yorsie_dir = LOG_DIR / "yorsie"
+    yorsie_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    moved = 0
+    for f in LOG_DIR.glob("toni-*.log"):
+        dest = yorsie_dir / f.name
+        if not dest.exists():
+            shutil.move(str(f), str(dest))
+            moved += 1
+    marker.write_text(f"Migrated {moved} files at {datetime.now().isoformat()}\n")
+
+
 def setup_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -206,6 +244,7 @@ def setup_logging():
     return logger, lf
 
 log, log_file = setup_logging()
+run_log_migration()
 
 # ═══════════════════════════════════════════════════════
 # BRIEF PARSER
@@ -431,7 +470,8 @@ def get_migrations() -> set:
 # ═══════════════════════════════════════════════════════
 def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_log = LOG_DIR / f"toni-{batch_file.stem}-{ts}.log"
+    log_subdir = ensure_log_subdir(LOG_SUBDIR)
+    out_log = log_subdir / f"toni-{batch_file.stem}-{ts}.log"
     try:
         brief_rel = batch_file.relative_to(project)
     except ValueError:
@@ -568,7 +608,7 @@ def clear_running():
 # ═══════════════════════════════════════════════════════
 def create_worktree(name: str, wid: int) -> Optional[Path]:
     wt = WORKTREE_BASE / f"toni-{wid}"
-    br = f"orch-{name}-w{wid}"
+    br = f"{BRANCH_PREFIX}-{name}-w{wid}"
     try:
         if wt.exists():
             subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {wt} --force",
@@ -602,17 +642,43 @@ def merge_branch(br: str) -> bool:
 # BATCH RUNNER
 # ═══════════════════════════════════════════════════════
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
+    meta_wt = None
+    if IS_META_FIRE and worktree is None:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        meta_wt = Path(f"/tmp/orch-fire-{ts}")
+        br = f"{BRANCH_PREFIX}-{batch_file.stem}"
+        try:
+            if meta_wt.exists():
+                subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {meta_wt} --force",
+                    shell=True, capture_output=True)
+            r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} -b {br}",
+                shell=True, capture_output=True, text=True)
+            if r.returncode != 0:
+                r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} {br}",
+                    shell=True, capture_output=True, text=True)
+            if r.returncode == 0:
+                log.info(f"Meta-fire worktree: {meta_wt} (branch: {br})")
+                worktree = meta_wt
+            else:
+                log.error(f"Meta-fire worktree failed: {r.stderr}")
+        except Exception as e:
+            log.error(f"Meta-fire worktree error: {e}")
+
     proj = worktree or PROJECT_ROOT
     started = datetime.now()
     briefs_preview = parse_batch(batch_file)
     write_running(batch_file, len(briefs_preview))
     try:
-        return _run_batch_inner(batch_file, proj, started, worktree)
+        result = _run_batch_inner(batch_file, proj, started, worktree)
     finally:
         clear_running()
+        if meta_wt:
+            cleanup_worktree(meta_wt)
+    return result
 
 def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=None) -> Result:
-    target = proj / "yorsie" / "briefs" / batch_file.name
+    briefs_subdir = ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
+    target = proj / briefs_subdir / batch_file.name
     if not batch_file.is_relative_to(proj):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(batch_file.read_bytes())
@@ -622,7 +688,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # Auto branch creation (D-148) — skip if using worktrees
     branch_name = None
     if worktree is None:
-        branch_name = f"orch-{batch_file.stem}"
+        branch_name = f"{BRANCH_PREFIX}-{batch_file.stem}"
         try:
             r = subprocess.run(
                 f"git checkout -b {branch_name}",
@@ -677,27 +743,27 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                 else:
                     log.warning(f"⚠️ Commit failed: {r.stderr.strip()}")
 
-                # Merge back to main
-                subprocess.run("git checkout main", shell=True, capture_output=True, cwd=str(proj))
+                # Merge back to merge target
+                subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
                 r = subprocess.run(
                     f"git merge {branch_name} --no-edit",
                     shell=True, capture_output=True, text=True, cwd=str(proj)
                 )
                 if r.returncode == 0:
-                    log.info(f"🔀 Merged {branch_name} → main")
+                    log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET}")
                     # Clean up feature branch
                     subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
                 else:
                     log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
                     log.error(f"   {r.stderr.strip()}")
             else:
-                # Failed batch — switch back to main, leave branch for inspection
-                subprocess.run("git checkout main", shell=True, capture_output=True, cwd=str(proj))
+                # Failed batch — switch back to merge target, leave branch for inspection
+                subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
                 log.warning(f"⚠️ Batch failed — branch {branch_name} left for inspection")
         except Exception as e:
             log.warning(f"⚠️ Git automation error: {e}")
-            # Ensure we're back on main
-            subprocess.run("git checkout main", shell=True, capture_output=True, cwd=str(proj))
+            # Ensure we're back on merge target
+            subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
 
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
@@ -781,7 +847,7 @@ def run_parallel(files: list[Path], force: bool = False):
     log.info("\nMerging sequentially...")
     for r, wt in sorted(results, key=lambda x: x[0].batch_file):
         if r.status == Status.PASSED:
-            br = f"orch-{Path(r.batch_file).stem}-w{wts.index(wt)+1}"
+            br = f"{BRANCH_PREFIX}-{Path(r.batch_file).stem}-w{wts.index(wt)+1}"
             if merge_branch(br) and RUN_PLAYWRIGHT:
                 ok, _ = run_playwright()
                 if not ok: log.error("PW failed post-merge — stopping"); break
@@ -836,6 +902,7 @@ def watch():
 def show_status():
     s = load_state()
     print(f"\n{'═'*60}\nSPECTRICOM ORCHESTRATOR v3.1 STATUS\n{'═'*60}")
+    print(f"  Project:    {PROJECT_ROOT}")
     c, f = s.get("completed",[]), s.get("failed",[])
     print(f"\n  Completed: {len(c)}")
     for x in c[-5:]: print(f"    ✅ {x['batch_file']} — {x.get('duration_s',0):.0f}s, {x.get('briefs','?')} briefs")
@@ -888,7 +955,8 @@ def resolve(p: str) -> Path:
 def main():
     ap = argparse.ArgumentParser(description="Spectricom Orchestrator v3.1")
     sp = ap.add_subparsers(dest="cmd")
-    sp.add_parser("status")
+    stp = sp.add_parser("status")
+    stp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
     sp.add_parser("watch")
 
     rp = sp.add_parser("run")
@@ -896,22 +964,41 @@ def main():
     rp.add_argument("--approve", action="store_true", help="Pre-approve execution")
     rp.add_argument("--force", action="store_true", help="Skip ALL safety checks")
     rp.add_argument("--skip-deps", action="store_true", help="Ignore dependency check")
+    rp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     qp = sp.add_parser("queue")
     qp.add_argument("batch_files", nargs="+")
     qp.add_argument("--approve", action="store_true", required=True)
     qp.add_argument("--force", action="store_true")
     qp.add_argument("--skip-deps", action="store_true")
+    qp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     pp = sp.add_parser("parallel")
     pp.add_argument("batch_files", nargs="+")
     pp.add_argument("--approve", action="store_true", required=True)
     pp.add_argument("--force", action="store_true")
+    pp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     dp = sp.add_parser("deps")
     dp.add_argument("batch_file")
+    dp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     a = ap.parse_args()
+
+    # OI-026 A3: resolve repo — --repo CLI > ## Repo: header > default
+    repo_name = getattr(a, 'repo', '') or ''
+    if not repo_name:
+        batch_arg = getattr(a, 'batch_file', None) or (getattr(a, 'batch_files', None) or [None])[0]
+        if batch_arg:
+            try:
+                repo_name = parse_repo_from_brief(resolve(batch_arg)) or ''
+            except FileNotFoundError:
+                pass
+    try:
+        set_active_repo(repo_name)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
 
     if a.cmd == "run":
         bf = resolve(a.batch_file)

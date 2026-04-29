@@ -19,7 +19,9 @@ import rate_limiter
 
 ORCH=Path.home()/"spectricom-orchestrator"
 TOKEN=ORCH/"drive-token.json"
-LOCAL_BRIEFS=Path.home()/"spectricom-dev-pipeline"/"yorsie"/"briefs"
+from repo_config import load_default_repo_config as _ldrc
+_default_name, _default_cfg = _ldrc()
+LOCAL_BRIEFS=Path(_default_cfg["project_dir"]).expanduser()/_default_cfg.get("briefs_subdir","briefs")
 PID_FILE=ORCH/"bridge.pid"
 LOG_FILE=ORCH/"logs"/"bridge.log"
 HASH_FILE=ORCH/"bridge-hashes.json"
