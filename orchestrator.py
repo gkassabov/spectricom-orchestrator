@@ -60,16 +60,110 @@ except ImportError:
     HAS_SLACK = False
 
 # ═══════════════════════════════════════════════════════
-# CONFIGURATION
+# CONFIGURATION (OI-026 v3.4 — multi-repo via config/repos.yaml)
 # ═══════════════════════════════════════════════════════
-PROJECT_ROOT = Path.home() / "spectricom-dev-pipeline"
-YORSIE_DIR = PROJECT_ROOT / "yorsie"
-BRIEFS_DIR = YORSIE_DIR / "briefs"
+import yaml as _yaml
+
 ORCH_DIR = Path.home() / "spectricom-orchestrator"
 LOG_DIR = ORCH_DIR / "logs"
 STATE_FILE = ORCH_DIR / "state.json"
 RUNNING_FILE = ORCH_DIR / "running.json"
-WORKTREE_BASE = Path.home() / "yorsie-toni"
+REPOS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "repos.yaml"
+
+# Per-repo state — populated by set_active_repo() at module load (defaults to yorsie).
+# A3 will re-call set_active_repo() after CLI / brief-header parsing to switch repos pre-fire.
+ACTIVE_REPO_NAME: str = ""
+ACTIVE_REPO_CONFIG: dict = {}
+PROJECT_ROOT: Path = Path()        # set by set_active_repo(); legacy var name preserved
+YORSIE_DIR: Path = Path()           # yorsie-only convenience: project_root / "yorsie" when active=yorsie, else project_root
+BRIEFS_DIR: Path = Path()           # project_root / briefs_subdir
+WORKTREE_BASE: Path = Path()        # parallel mode: yorsie-toni base; single-stream: project_root (unused)
+BRANCH_PREFIX: str = ""
+MERGE_TARGET: str = "main"
+REMOTE: str = "origin"
+LOG_SUBDIR: str = ""
+WORKTREE_MODE: str = "single-stream"
+TEST_CMD: str = ""
+FIRE_TEMPLATE: str = ""
+IS_META_FIRE: bool = False
+
+
+def load_repo_config() -> dict:
+    """Load ~/spectricom-orchestrator/config/repos.yaml and return parsed dict.
+
+    Validates: file exists, has `repos:` key with at least one entry, exactly one
+    entry has `default: true`. Raises RuntimeError on any violation.
+    """
+    if not REPOS_CONFIG_PATH.exists():
+        raise RuntimeError(f"Repo config not found: {REPOS_CONFIG_PATH}")
+    cfg = _yaml.safe_load(REPOS_CONFIG_PATH.read_text())
+    if not isinstance(cfg, dict) or "repos" not in cfg or not cfg["repos"]:
+        raise RuntimeError(f"Malformed repo config: {REPOS_CONFIG_PATH} (expected 'repos:' map)")
+    defaults = [n for n, r in cfg["repos"].items() if r.get("default")]
+    if len(defaults) != 1:
+        raise RuntimeError(
+            f"Repo config must declare exactly one default repo; found {len(defaults)}: {defaults}"
+        )
+    return cfg
+
+
+def set_active_repo(name: str = "") -> str:
+    """Switch active repo and populate module-level state from repos.yaml.
+
+    Args:
+        name: Repo name (e.g. 'yorsie', 'ai-foundation', 'clinical-mp', 'orchestrator').
+              Empty string → use the default repo from config (yorsie for v3.4.0).
+
+    Returns:
+        The active repo name (resolved).
+
+    Raises:
+        RuntimeError if name is provided but not declared in repos.yaml.
+    """
+    global ACTIVE_REPO_NAME, ACTIVE_REPO_CONFIG
+    global PROJECT_ROOT, YORSIE_DIR, BRIEFS_DIR, WORKTREE_BASE
+    global BRANCH_PREFIX, MERGE_TARGET, REMOTE, LOG_SUBDIR
+    global WORKTREE_MODE, TEST_CMD, FIRE_TEMPLATE, IS_META_FIRE
+
+    cfg = load_repo_config()
+    repos = cfg["repos"]
+
+    if not name:
+        name = next(n for n, r in repos.items() if r.get("default"))
+
+    if name not in repos:
+        valid = ", ".join(sorted(repos.keys()))
+        raise RuntimeError(f"Unknown repo: {name}. Valid: {valid}")
+
+    r = repos[name]
+    ACTIVE_REPO_NAME = name
+    ACTIVE_REPO_CONFIG = r
+    PROJECT_ROOT = Path(r["project_dir"]).expanduser()
+    BRIEFS_DIR = PROJECT_ROOT / r.get("briefs_subdir", "briefs")
+    # YORSIE_DIR is preserved as a legacy convenience: when yorsie is active it points at the yorsie subdir
+    # of the monorepo (matches v3.3 behavior); for any other repo it equals project_root (used only by
+    # yorsie-specific callsites such as the supabase migrations helper).
+    YORSIE_DIR = PROJECT_ROOT / "yorsie" if name == "yorsie" else PROJECT_ROOT
+    WORKTREE_BASE = (
+        Path(r["worktree_base"]).expanduser()
+        if r.get("worktree_mode") == "parallel" and r.get("worktree_base")
+        else PROJECT_ROOT
+    )
+    BRANCH_PREFIX = r.get("branch_prefix", "orch")
+    MERGE_TARGET = r.get("merge_target", "main")
+    REMOTE = r.get("remote", "origin")
+    LOG_SUBDIR = r.get("log_subdir", name)
+    WORKTREE_MODE = r.get("worktree_mode", "single-stream")
+    TEST_CMD = r.get("test_cmd", "")
+    FIRE_TEMPLATE = r.get("fire_command_template", "")
+    IS_META_FIRE = bool(r.get("meta_fire", False))
+    return name
+
+
+# Initial population at module load → defaults to yorsie (backward-compat with v3.3).
+# A3 (CLI parser) will re-call set_active_repo(<name>) before any work if --repo or
+# `## Repo:` header specifies a different target.
+set_active_repo()
 
 TONI_TIMEOUT = 45 * 60
 TONI_COOLDOWN = 10

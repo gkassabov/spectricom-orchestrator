@@ -1,0 +1,62 @@
+# OI-026 v3.4 multi-repo config
+# Per spec: OI-026-orchestrator-v3-4-multi-repo-spec-v1-2.md
+# Loaded by orchestrator.py via load_repo_config()
+# Default repo (first with `default: true`) determines yorsie-backward-compat behavior
+
+repos:
+  yorsie:
+    project_dir: /home/gkassa/spectricom-dev-pipeline
+    branch_prefix: orch
+    merge_target: main
+    remote: origin
+    log_subdir: yorsie
+    worktree_mode: parallel
+    worktree_base: /home/gkassa/yorsie-toni
+    briefs_subdir: yorsie/briefs
+    test_cmd: "cd yorsie && npm test"
+    fire_command_template: |
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+    default: true
+
+  ai-foundation:
+    project_dir: /home/gkassa/spectricom-ai-foundation
+    branch_prefix: orch-aif
+    merge_target: main
+    remote: origin
+    log_subdir: ai-foundation
+    worktree_mode: single-stream
+    briefs_subdir: briefs
+    test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
+    fire_command_template: |
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+    default: false
+
+  clinical-mp:
+    project_dir: /home/gkassa/spectricom-clinical-mp
+    branch_prefix: orch-mp
+    merge_target: main
+    remote: origin
+    log_subdir: clinical-mp
+    worktree_mode: single-stream
+    briefs_subdir: briefs
+    test_cmd: "npm test"
+    fire_command_template: |
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+    default: false
+
+  orchestrator:
+    project_dir: /home/gkassa/spectricom-orchestrator
+    branch_prefix: orch-orch
+    merge_target: main
+    remote: origin
+    log_subdir: orchestrator
+    worktree_mode: single-stream
+    meta_fire: true
+    briefs_subdir: briefs
+    test_cmd: "pytest 2>/dev/null || echo 'orchestrator has no test suite yet'"
+    fire_command_template: |
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+    default: false
+
+  # Future repos (scaffolded per S5S37 decision #6, NOT LIVE):
+  # gateway: (Spectricom Gateway repo, Phase 3+)
