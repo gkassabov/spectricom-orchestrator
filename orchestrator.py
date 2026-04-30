@@ -178,7 +178,7 @@ def parse_repo_from_brief(filepath) -> Optional[str]:
     return None
 
 
-TONI_TIMEOUT = 45 * 60
+TONI_TIMEOUT = int(os.environ.get("TONI_TIMEOUT_MIN", "45")) * 60  # OI-027: env-var override; default 45m
 TONI_COOLDOWN = 10
 MAX_PARALLEL = 3
 RUN_PLAYWRIGHT = False
