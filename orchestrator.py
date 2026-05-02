@@ -64,7 +64,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════
 import yaml as _yaml
 
-ORCH_DIR = Path.home() / "spectricom-orchestrator"
+ORCH_DIR = Path(__file__).parent.resolve()
 LOG_DIR = ORCH_DIR / "logs"
 STATE_FILE = ORCH_DIR / "state.json"
 RUNNING_FILE = ORCH_DIR / "running.json"
@@ -705,6 +705,41 @@ def merge_branch(br: str) -> bool:
         log.info(f"Merged {br}"); return True
     log.error(f"Merge conflict on {br} — MANUAL RESOLUTION NEEDED"); return False
 
+
+def _self_mod_auto_merge(orch_dir: Path, branch_name: str) -> bool:
+    """Auto-merge meta-fire branch to main after successful self-mod fire.
+
+    Returns True if merge succeeded (or no commits to merge), False on failure.
+    Note: after auto-merge, the orchestrator's loaded Python modules are unchanged
+    in memory; new code on disk takes effect on next invocation.
+    """
+    try:
+        r = subprocess.run(
+            f"git -C {orch_dir} rev-list --count main..{branch_name}",
+            shell=True, capture_output=True, text=True
+        )
+        count = int(r.stdout.strip()) if r.returncode == 0 else 0
+    except (ValueError, Exception):
+        count = 0
+
+    if count == 0:
+        log.info("Self-mod auto-merge: no commits to bring in; skipping")
+        return True
+
+    r = subprocess.run(
+        f"git -C {orch_dir} merge --ff-only {branch_name}",
+        shell=True, capture_output=True, text=True
+    )
+    if r.returncode == 0:
+        log.info(f"✅ Self-mod auto-merge: brought {count} commits to main")
+        return True
+    else:
+        log.warning(
+            f"⚠️  Self-mod auto-merge failed (non-ff). Branch preserved: {branch_name}. "
+            f"Run: cd {orch_dir} && git merge --ff-only {branch_name}"
+        )
+        return False
+
 # ═══════════════════════════════════════════════════════
 # SIT POST-MERGE INTEGRATION (A58a — advisory v1)
 # ═══════════════════════════════════════════════════════
@@ -842,21 +877,24 @@ def sit_report_aggregate(since: Optional[str] = None):
 # ═══════════════════════════════════════════════════════
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     meta_wt = None
+    meta_branch = None
+    is_self_mod = IS_META_FIRE and (PROJECT_ROOT.resolve() == ORCH_DIR)
+
     if IS_META_FIRE and worktree is None:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         meta_wt = Path(f"/tmp/orch-fire-{ts}")
-        br = f"{BRANCH_PREFIX}-{batch_file.stem}"
+        meta_branch = f"{BRANCH_PREFIX}-{batch_file.stem}"
         try:
             if meta_wt.exists():
                 subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {meta_wt} --force",
                     shell=True, capture_output=True)
-            r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} -b {br}",
+            r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} -b {meta_branch}",
                 shell=True, capture_output=True, text=True)
             if r.returncode != 0:
-                r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} {br}",
+                r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} {meta_branch}",
                     shell=True, capture_output=True, text=True)
             if r.returncode == 0:
-                log.info(f"Meta-fire worktree: {meta_wt} (branch: {br})")
+                log.info(f"Meta-fire worktree: {meta_wt} (branch: {meta_branch})")
                 worktree = meta_wt
             else:
                 log.error(f"Meta-fire worktree failed: {r.stderr}")
@@ -867,12 +905,24 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     started = datetime.now()
     briefs_preview = parse_batch(batch_file)
     write_running(batch_file, len(briefs_preview))
+    result = None
     try:
         result = _run_batch_inner(batch_file, proj, started, worktree)
     finally:
         clear_running()
         if meta_wt:
-            cleanup_worktree(meta_wt)
+            if is_self_mod and meta_branch:
+                if result is not None and result.exit_code == 0:
+                    merged = _self_mod_auto_merge(ORCH_DIR, meta_branch)
+                    if merged:
+                        cleanup_worktree(meta_wt)
+                else:
+                    log.warning(
+                        f"Self-mod fire failed; branch preserved: {meta_branch}. "
+                        f"Inspect {meta_wt} for state."
+                    )
+            else:
+                cleanup_worktree(meta_wt)
     return result
 
 def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=None) -> Result:
