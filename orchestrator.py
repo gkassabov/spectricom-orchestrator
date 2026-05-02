@@ -187,6 +187,7 @@ RUN_PLAYWRIGHT = False
 PLAYWRIGHT_CMD = "npx playwright test"
 SKIP_SIT = False
 SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
+PROTECTED_BRANCHES = {"main", "master", "develop", "staging"}
 
 # ═══════════════════════════════════════════════════════
 # DATA
@@ -1321,6 +1322,119 @@ def show_deps(filepath: Path):
         print(f"    {status} {d}")
     print(f"\n  Status: {'🟢 ALL MET — ready to run' if all_met else '🔒 BLOCKED — ' + str(len(unmet)) + ' unmet'}")
 
+
+# ═══════════════════════════════════════════════════════
+# BRANCH SWEEP (B3)
+# ═══════════════════════════════════════════════════════
+def _get_current_branch(repo_path: Path) -> str:
+    """Get currently checked-out branch name."""
+    r = subprocess.run(
+        "git rev-parse --abbrev-ref HEAD",
+        shell=True, capture_output=True, text=True, cwd=str(repo_path),
+    )
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _is_branch_merged(repo_path: Path, branch: str, target: str = "main") -> bool:
+    """Check if branch is an ancestor of target (i.e., fully merged)."""
+    r = subprocess.run(
+        f"git merge-base --is-ancestor {branch} {target}",
+        shell=True, capture_output=True, cwd=str(repo_path),
+    )
+    return r.returncode == 0
+
+
+def list_branches(repo_path: Path, pattern: str = "orch-*") -> list:
+    """List branches matching pattern with merge status. Returns list of tuples."""
+    r = subprocess.run(
+        f"git for-each-ref 'refs/heads/{pattern}' "
+        f"--format='%(refname:short) %(committerdate:iso-strict) %(subject)'",
+        shell=True, capture_output=True, text=True, cwd=str(repo_path),
+    )
+    if r.returncode != 0:
+        print(f"Error listing branches: {r.stderr}")
+        return []
+
+    branches = []
+    for line in r.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split(" ", 2)
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        date = parts[1] if len(parts) > 1 else "?"
+        subject = parts[2] if len(parts) > 2 else ""
+        merged = _is_branch_merged(repo_path, name)
+        branches.append((name, date, subject, merged))
+
+    branches.sort(key=lambda x: x[1], reverse=True)
+
+    if not branches:
+        print(f"No branches matching '{pattern}' found.")
+        return branches
+
+    print(f"\n{'═'*80}")
+    print(f"BRANCHES matching '{pattern}' in {repo_path}")
+    print(f"{'═'*80}")
+    for name, date, subject, merged in branches:
+        status = "✅ merged" if merged else "❌ unmerged"
+        print(f"  {status}  {name}  {date[:19]}  {subject[:50]}")
+    print(f"{'═'*80}")
+    merged_count = sum(1 for _, _, _, m in branches if m)
+    unmerged_count = sum(1 for _, _, _, m in branches if not m)
+    print(f"  Total: {len(branches)} ({merged_count} merged, {unmerged_count} unmerged)")
+
+    return branches
+
+
+def clean_branches(repo_path: Path, pattern: str = "orch-*", force: bool = False):
+    """Delete branches matching pattern. Only merged by default; --force for unmerged."""
+    current = _get_current_branch(repo_path)
+    branches = list_branches(repo_path, pattern)
+
+    if not branches:
+        return
+
+    deleted = 0
+    skipped = 0
+    for name, date, subject, merged in branches:
+        if name in PROTECTED_BRANCHES:
+            print(f"  ⛔ Protected: {name} — skipping")
+            skipped += 1
+            continue
+        if name == current:
+            print(f"  ⛔ Current HEAD: {name} — skipping")
+            skipped += 1
+            continue
+
+        if merged:
+            r = subprocess.run(
+                f"git branch -d {name}",
+                shell=True, capture_output=True, text=True, cwd=str(repo_path),
+            )
+            if r.returncode == 0:
+                print(f"  🗑️  Deleted (merged): {name}")
+                deleted += 1
+            else:
+                print(f"  ⚠️  Failed to delete {name}: {r.stderr.strip()}")
+        elif force:
+            r = subprocess.run(
+                f"git branch -D {name}",
+                shell=True, capture_output=True, text=True, cwd=str(repo_path),
+            )
+            if r.returncode == 0:
+                print(f"  🗑️  Deleted (force): {name}")
+                deleted += 1
+            else:
+                print(f"  ⚠️  Failed to delete {name}: {r.stderr.strip()}")
+        else:
+            print(f"  ⏭️  Skipping unmerged: {name} (use --force to delete)")
+            skipped += 1
+
+    print(f"\n  Summary: {deleted} deleted, {skipped} skipped")
+
+
 # ═══════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════
@@ -1366,6 +1480,12 @@ def main():
     sit_rp = sp.add_parser("sit:report")
     sit_rp.add_argument("--since", default=None, help="ISO date to filter from (e.g. 2026-05-01)")
     sit_rp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
+
+    bp = sp.add_parser("branches")
+    bp.add_argument("action", choices=["list", "clean"])
+    bp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
+    bp.add_argument("--pattern", default="orch-*", help="Branch glob pattern (default: orch-*)")
+    bp.add_argument("--force", action="store_true", help="Delete unmerged branches too")
 
     a = ap.parse_args()
 
@@ -1425,6 +1545,13 @@ def main():
 
     elif a.cmd == "status":
         show_status()
+
+    elif a.cmd == "branches":
+        repo_path = PROJECT_ROOT
+        if a.action == "list":
+            list_branches(repo_path, a.pattern)
+        elif a.action == "clean":
+            clean_branches(repo_path, a.pattern, force=a.force)
 
     else:
         ap.print_help()
