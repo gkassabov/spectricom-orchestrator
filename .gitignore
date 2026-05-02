@@ -21,6 +21,7 @@ rate-limits.json
 running.json
 bridge-hashes.json
 drive-watcher-hashes.json
+state/
 
 # Backup files
 *.bak

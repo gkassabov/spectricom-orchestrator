@@ -670,6 +670,72 @@ def clear_running():
         pass
 
 
+def _write_running_marker(batch_file: Path, repo_name: str, repo_path: Path,
+                          branch: str, meta_fire_worktree: Optional[Path],
+                          is_self_mod: bool):
+    """Write state/running.json marker for in-flight fire visibility."""
+    marker_dir = ORCH_DIR / "state"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / "running.json"
+    marker.write_text(json.dumps({
+        "pid": os.getpid(),
+        "batch_id": batch_file.stem,
+        "repo": repo_name,
+        "repo_path": str(repo_path),
+        "branch": branch,
+        "started_at": datetime.now().astimezone().isoformat(),
+        "meta_fire_worktree": str(meta_fire_worktree) if meta_fire_worktree else None,
+        "is_self_mod": is_self_mod,
+    }, indent=2))
+
+
+def _clear_running_marker():
+    """Remove state/running.json marker."""
+    marker = ORCH_DIR / "state" / "running.json"
+    try:
+        marker.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _check_stale_marker() -> bool:
+    """Check for stale or active running.json marker at startup.
+
+    Returns True if safe to proceed. Exits with code 4 if another fire is active.
+    """
+    marker = ORCH_DIR / "state" / "running.json"
+    if not marker.exists():
+        return True
+
+    try:
+        data = json.loads(marker.read_text())
+    except (json.JSONDecodeError, IOError):
+        marker.unlink(missing_ok=True)
+        return True
+
+    pid = data.get("pid", 0)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        log.warning(
+            f"⚠️  Stale running.json from {data.get('started_at', '?')} "
+            f"(pid {pid} no longer alive); cleaned up."
+        )
+        marker.unlink(missing_ok=True)
+        return True
+    except PermissionError:
+        pass
+
+    print(
+        f"❌ Another orchestrator fire is in progress "
+        f"(pid {pid}, batch {data.get('batch_id', '?')}, "
+        f"started {data.get('started_at', '?')}). "
+        f"Wait or kill the existing process.",
+        file=sys.stderr,
+    )
+    sys.exit(4)
+
+
 # ═══════════════════════════════════════════════════════
 # WORKTREES (PARALLEL)
 # ═══════════════════════════════════════════════════════
@@ -905,11 +971,17 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     started = datetime.now()
     briefs_preview = parse_batch(batch_file)
     write_running(batch_file, len(briefs_preview))
+    _write_running_marker(
+        batch_file, ACTIVE_REPO_NAME, PROJECT_ROOT,
+        meta_branch or f"{BRANCH_PREFIX}-{batch_file.stem}",
+        meta_wt, is_self_mod,
+    )
     result = None
     try:
         result = _run_batch_inner(batch_file, proj, started, worktree)
     finally:
         clear_running()
+        _clear_running_marker()
         if meta_wt:
             if is_self_mod and meta_branch:
                 if result is not None and result.exit_code == 0:
@@ -1166,6 +1238,47 @@ def watch():
 def show_status():
     s = load_state()
     print(f"\n{'═'*60}\nSPECTRICOM ORCHESTRATOR v3.1 STATUS\n{'═'*60}")
+
+    marker = ORCH_DIR / "state" / "running.json"
+    if marker.exists():
+        try:
+            data = json.loads(marker.read_text())
+            pid = data.get("pid", 0)
+            pid_alive = False
+            try:
+                os.kill(pid, 0)
+                pid_alive = True
+            except (ProcessLookupError, PermissionError):
+                pass
+
+            if pid_alive:
+                started_str = data.get("started_at", "?")
+                elapsed = ""
+                try:
+                    start_dt = datetime.fromisoformat(started_str)
+                    elapsed_s = (datetime.now().astimezone() - start_dt).total_seconds()
+                    elapsed = f" ({int(elapsed_s // 60)}m {int(elapsed_s % 60)}s elapsed)"
+                except Exception:
+                    pass
+                print(f"\n  🔥 ACTIVE FIRE:")
+                print(f"    PID:      {pid}")
+                print(f"    Batch:    {data.get('batch_id', '?')}")
+                print(f"    Repo:     {data.get('repo', '?')}")
+                print(f"    Branch:   {data.get('branch', '?')}")
+                print(f"    Started:  {started_str}{elapsed}")
+                if data.get("meta_fire_worktree"):
+                    print(f"    Worktree: {data['meta_fire_worktree']}")
+            else:
+                print(f"\n  ⚠️  Stale running.json from {data.get('started_at', '?')} "
+                      f"(pid {pid} no longer alive)")
+                print(f"    Cleaning up stale marker...")
+                marker.unlink(missing_ok=True)
+        except (json.JSONDecodeError, IOError):
+            print(f"\n  ⚠️  Corrupt running.json — cleaning up")
+            marker.unlink(missing_ok=True)
+    else:
+        print(f"\n  No active fire.")
+
     print(f"  Project:    {PROJECT_ROOT}")
     c, f = s.get("completed",[]), s.get("failed",[])
     print(f"\n  Completed: {len(c)}")
@@ -1277,6 +1390,7 @@ def main():
         SKIP_SIT = True
 
     if a.cmd == "run":
+        _check_stale_marker()
         bf = resolve(a.batch_file)
         briefs = parse_batch(bf)
         if not approval_gate(bf, briefs, approve=a.approve, force=a.force,
