@@ -13,7 +13,7 @@ Usage (imported):
   from rate_limiter import pre_flight, record, show
 """
 
-import json, sys, argparse
+import json, os, sys, argparse
 from pathlib import Path
 from datetime import datetime, date
 
@@ -76,6 +76,10 @@ def pre_flight(brief_count: int) -> tuple[bool, str]:
     Check if execution is within daily rate limits.
     Returns (allowed: bool, message: str).
     """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return True, "✅ Rate cap skipped — cli-mode-no-cap (ANTHROPIC_API_KEY unset)"
+
     caps = load_caps()
     batch_cap = caps["daily_batches"]
     brief_cap = caps["daily_briefs"]
