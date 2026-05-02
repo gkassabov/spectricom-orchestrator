@@ -178,7 +178,9 @@ def parse_repo_from_brief(filepath) -> Optional[str]:
     return None
 
 
-TONI_TIMEOUT = int(os.environ.get("TONI_TIMEOUT_MIN", "45")) * 60  # OI-027: env-var override; default 45m
+TIMEOUT_DEFAULT_MIN = 45
+TIMEOUT_HARD_CAP_MIN = 180
+TONI_TIMEOUT = int(os.environ.get("TONI_TIMEOUT_MIN", str(TIMEOUT_DEFAULT_MIN))) * 60
 TONI_COOLDOWN = 10
 MAX_PARALLEL = 3
 RUN_PLAYWRIGHT = False
@@ -289,6 +291,69 @@ def parse_batch(filepath: Path) -> list[Brief]:
         dep = f" (deps: {b.depends_on})" if b.depends_on else ""
         log.info(f"  -> {b.id}: {b.title}{dep}")
     return briefs
+
+# ═══════════════════════════════════════════════════════
+# BRIEF TIMEOUT PARSING (A62)
+# ═══════════════════════════════════════════════════════
+def parse_brief_timeout(filepath: Path) -> Optional[int]:
+    """Parse TONI_TIMEOUT_MIN advisory from brief file header.
+    Returns timeout in minutes, or None if not declared.
+    """
+    try:
+        content = filepath.read_text(encoding="utf-8")[:4000]
+    except Exception:
+        return None
+
+    m = re.search(r'^## TONI_TIMEOUT_MIN:\s*(\d+)', content, re.MULTILINE)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r'^## Fire mechanism:.*TONI_TIMEOUT_MIN=(\d+)', content, re.MULTILINE)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r'^## Estimated runtime:\s*(.+)', content, re.MULTILINE)
+    if m:
+        runtime_line = m.group(1)
+        rm = re.search(r'(\d+)\s*-\s*(\d+)\s*m', runtime_line)
+        if rm:
+            upper = int(rm.group(2))
+            return int(upper * 1.25)
+        rm = re.search(r'(\d+)\s*m', runtime_line)
+        if rm:
+            return int(int(rm.group(1)) * 1.25)
+
+    return None
+
+
+def resolve_timeout(brief_path: Optional[Path] = None) -> tuple[int, str]:
+    """Resolve timeout with precedence: env-var > brief-declared > default.
+    Returns (timeout_minutes, source_label). Hard cap at 180m.
+    """
+    env_raw = os.environ.get("TONI_TIMEOUT_MIN", "")
+    if env_raw:
+        timeout = int(env_raw)
+        source = "env-var"
+    elif brief_path:
+        brief_val = parse_brief_timeout(brief_path)
+        if brief_val is not None:
+            timeout = brief_val
+            source = "brief-declared"
+        else:
+            timeout = TIMEOUT_DEFAULT_MIN
+            source = "default"
+    else:
+        timeout = TIMEOUT_DEFAULT_MIN
+        source = "default"
+
+    if timeout > TIMEOUT_HARD_CAP_MIN:
+        log.warning(
+            f"Timeout {timeout}min exceeds hard cap {TIMEOUT_HARD_CAP_MIN}min; clamping"
+        )
+        timeout = TIMEOUT_HARD_CAP_MIN
+
+    return timeout, source
+
 
 # ═══════════════════════════════════════════════════════
 # DEPENDENCY CASCADE
@@ -818,6 +883,12 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         target.write_bytes(batch_file.read_bytes())
         log.info(f"Copied brief to {target}")
     briefs = parse_batch(batch_file)
+
+    # A62: resolve timeout from env-var > brief-declared > default
+    global TONI_TIMEOUT
+    timeout_min, timeout_src = resolve_timeout(batch_file)
+    TONI_TIMEOUT = timeout_min * 60
+    log.info(f"timeout={timeout_min}min source={timeout_src}")
 
     # Auto branch creation (D-148) — skip if using worktrees
     branch_name = None
