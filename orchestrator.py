@@ -831,7 +831,9 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
     archive = archive_path or SIT_ARCHIVE_DIR
     archive.mkdir(parents=True, exist_ok=True)
 
-    sit_cmd = "npm run sit:smoke -- --no-auto-spawn"
+    # Playwright config uses env var NO_AUTO_SPAWN (not a CLI flag); with
+    # reuseExistingServer: true, no orchestrator-side suppression needed.
+    sit_cmd = "npm run sit:smoke"
     log.info(f"🧪 Running SIT post-merge: {sit_cmd}")
     started = time.time()
 
@@ -855,15 +857,18 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
                 report_path = str(dest)
                 log.info(f"📋 SIT report archived: {dest.name}")
 
+        error_excerpt = None
         if passed:
             log.info(f"✅ SIT PASSED ({duration:.1f}s)")
         else:
             log.warning(f"⚠️  SIT FAILED (exit {r.returncode}, {duration:.1f}s) — advisory only, not blocking merge")
             if r.stdout:
                 log.warning(f"   stdout: {r.stdout[-500:]}")
+            error_excerpt = (r.stderr or r.stdout or "")[-1000:].strip() or None
 
         # Log to orchestrator-sit-log.json
-        _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path)
+        _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path,
+                         error_excerpt=error_excerpt)
 
         return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration)
 
@@ -880,7 +885,8 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
 
 
 def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: int,
-                     duration: float, report_path: Optional[str], error: Optional[str] = None):
+                     duration: float, report_path: Optional[str], error: Optional[str] = None,
+                     error_excerpt: Optional[str] = None):
     """Append SIT outcome to orchestrator-sit-log.json."""
     log_file = archive / "orchestrator-sit-log.json"
     entries = []
@@ -890,7 +896,7 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
         except (json.JSONDecodeError, IOError):
             entries = []
 
-    entries.append({
+    entry = {
         "timestamp": datetime.now().isoformat(),
         "repo": str(repo_path),
         "passed": passed,
@@ -898,7 +904,10 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
         "duration_s": round(duration, 2),
         "report_path": report_path,
         "error": error,
-    })
+    }
+    if error_excerpt is not None:
+        entry["error_excerpt"] = error_excerpt
+    entries.append(entry)
     log_file.write_text(json.dumps(entries, indent=2))
 
 

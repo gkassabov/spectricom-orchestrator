@@ -123,3 +123,54 @@ class TestSitLogOutcome:
             assert len(entries) == 2
             assert entries[1]["passed"] is False
             assert entries[1]["error"] == "assertion"
+
+    def test_log_sit_outcome_persists_error_excerpt(self):
+        """error_excerpt is persisted in JSON when provided."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive = Path(tmpdir)
+            import orchestrator
+            orchestrator._log_sit_outcome(
+                archive, Path("/tmp/repo"), False, 1, 0.7, None,
+                error_excerpt="error: unknown option '--no-auto-spawn'"
+            )
+
+            log_file = archive / "orchestrator-sit-log.json"
+            entries = json.loads(log_file.read_text())
+            assert len(entries) == 1
+            assert entries[0]["error_excerpt"] == "error: unknown option '--no-auto-spawn'"
+
+    def test_log_sit_outcome_no_error_excerpt_when_passed(self):
+        """error_excerpt field is absent when SIT passes and excerpt is None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive = Path(tmpdir)
+            import orchestrator
+            orchestrator._log_sit_outcome(
+                archive, Path("/tmp/repo"), True, 0, 5.0, None,
+                error_excerpt=None
+            )
+
+            log_file = archive / "orchestrator-sit-log.json"
+            entries = json.loads(log_file.read_text())
+            assert len(entries) == 1
+            assert "error_excerpt" not in entries[0]
+
+
+class TestSitCmdNoAutoSpawn:
+    """Guards against regression of the --no-auto-spawn flag bug (A63)."""
+
+    @patch('subprocess.run')
+    def test_sit_cmd_does_not_pass_no_auto_spawn_flag(self, mock_run):
+        """sit_cmd must not contain --no-auto-spawn."""
+        mock_run.return_value = MagicMock(returncode=0, stdout='', stderr='')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir)
+            archive_path = Path(tmpdir) / "archive"
+            archive_path.mkdir()
+
+            import orchestrator
+            orchestrator.SKIP_SIT = False
+            orchestrator.run_sit_post_merge(repo_path, archive_path)
+
+            called_cmd = mock_run.call_args[0][0]
+            assert "--no-auto-spawn" not in called_cmd
