@@ -183,6 +183,8 @@ TONI_COOLDOWN = 10
 MAX_PARALLEL = 3
 RUN_PLAYWRIGHT = False
 PLAYWRIGHT_CMD = "npx playwright test"
+SKIP_SIT = False
+SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
 
 # ═══════════════════════════════════════════════════════
 # DATA
@@ -639,6 +641,138 @@ def merge_branch(br: str) -> bool:
     log.error(f"Merge conflict on {br} — MANUAL RESOLUTION NEEDED"); return False
 
 # ═══════════════════════════════════════════════════════
+# SIT POST-MERGE INTEGRATION (A58a — advisory v1)
+# ═══════════════════════════════════════════════════════
+@dataclass
+class SitOutcome:
+    passed: bool
+    exit_code: int
+    report_path: Optional[str] = None
+    error: Optional[str] = None
+    duration_s: float = 0.0
+
+
+def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> SitOutcome:
+    """Run SIT smoke tests after merge. Advisory only — does NOT block.
+
+    Returns SitOutcome with pass/fail status and archived report path.
+    """
+    if SKIP_SIT:
+        log.info("⏭️  SIT skipped (--skip-sit)")
+        return SitOutcome(passed=True, exit_code=0, error="skipped")
+
+    archive = archive_path or SIT_ARCHIVE_DIR
+    archive.mkdir(parents=True, exist_ok=True)
+
+    sit_cmd = "npm run sit:smoke -- --no-auto-spawn"
+    log.info(f"🧪 Running SIT post-merge: {sit_cmd}")
+    started = time.time()
+
+    try:
+        r = subprocess.run(
+            sit_cmd, shell=True, capture_output=True, text=True,
+            cwd=str(repo_path), timeout=300
+        )
+        duration = time.time() - started
+        passed = r.returncode == 0
+
+        # Archive SIT report if it exists
+        report_path = None
+        sit_reports_dir = repo_path / "sit-reports"
+        if sit_reports_dir.exists():
+            import shutil, glob as _glob
+            reports = sorted(sit_reports_dir.glob("alex-mp-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if reports:
+                dest = archive / reports[0].name
+                shutil.copy2(reports[0], dest)
+                report_path = str(dest)
+                log.info(f"📋 SIT report archived: {dest.name}")
+
+        if passed:
+            log.info(f"✅ SIT PASSED ({duration:.1f}s)")
+        else:
+            log.warning(f"⚠️  SIT FAILED (exit {r.returncode}, {duration:.1f}s) — advisory only, not blocking merge")
+            if r.stdout:
+                log.warning(f"   stdout: {r.stdout[-500:]}")
+
+        # Log to orchestrator-sit-log.json
+        _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path)
+
+        return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration)
+
+    except subprocess.TimeoutExpired:
+        duration = time.time() - started
+        log.warning(f"⚠️  SIT TIMEOUT after {duration:.1f}s — advisory only")
+        _log_sit_outcome(archive, repo_path, False, -1, duration, None, error="timeout")
+        return SitOutcome(passed=False, exit_code=-1, error="timeout", duration_s=duration)
+    except Exception as e:
+        duration = time.time() - started
+        log.warning(f"⚠️  SIT ERROR: {e} — advisory only")
+        _log_sit_outcome(archive, repo_path, False, -1, duration, None, error=str(e))
+        return SitOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration)
+
+
+def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: int,
+                     duration: float, report_path: Optional[str], error: Optional[str] = None):
+    """Append SIT outcome to orchestrator-sit-log.json."""
+    log_file = archive / "orchestrator-sit-log.json"
+    entries = []
+    if log_file.exists():
+        try:
+            entries = json.loads(log_file.read_text())
+        except (json.JSONDecodeError, IOError):
+            entries = []
+
+    entries.append({
+        "timestamp": datetime.now().isoformat(),
+        "repo": str(repo_path),
+        "passed": passed,
+        "exit_code": exit_code,
+        "duration_s": round(duration, 2),
+        "report_path": report_path,
+        "error": error,
+    })
+    log_file.write_text(json.dumps(entries, indent=2))
+
+
+def sit_report_aggregate(since: Optional[str] = None):
+    """Aggregate archived SIT reports since a given date."""
+    archive = SIT_ARCHIVE_DIR
+    if not archive.exists():
+        print("No SIT archive found."); return
+
+    log_file = archive / "orchestrator-sit-log.json"
+    if not log_file.exists():
+        print("No SIT log entries found."); return
+
+    entries = json.loads(log_file.read_text())
+    if since:
+        entries = [e for e in entries if e["timestamp"] >= since]
+
+    if not entries:
+        print(f"No SIT runs found since {since or 'beginning'}."); return
+
+    total = len(entries)
+    passed = sum(1 for e in entries if e["passed"])
+    failed = total - passed
+
+    print(f"\n{'═'*60}")
+    print(f"SIT REPORT AGGREGATE (since {since or 'all time'})")
+    print(f"{'═'*60}")
+    print(f"  Total runs:  {total}")
+    print(f"  Passed:      {passed} ({100*passed/total:.0f}%)")
+    print(f"  Failed:      {failed} ({100*failed/total:.0f}%)")
+    avg_dur = sum(e.get("duration_s", 0) for e in entries) / total
+    print(f"  Avg duration: {avg_dur:.1f}s")
+    print(f"\n  Recent entries:")
+    for e in entries[-10:]:
+        status = "✅" if e["passed"] else "❌"
+        err = f" ({e['error']})" if e.get("error") else ""
+        print(f"    {status} {e['timestamp'][:19]} — {e.get('duration_s', 0):.1f}s{err}")
+    print(f"{'═'*60}\n")
+
+
+# ═══════════════════════════════════════════════════════
 # BATCH RUNNER
 # ═══════════════════════════════════════════════════════
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
@@ -753,6 +887,15 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET}")
                     # Clean up feature branch
                     subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                    # A58a: Post-merge SIT (advisory v1)
+                    if ACTIVE_REPO_NAME == "clinical-mp":
+                        sit_outcome = run_sit_post_merge(proj)
+                        if not sit_outcome.passed:
+                            # Annotate: SIT failure is advisory only in v1
+                            subprocess.run(
+                                f'git notes add -m "SIT: FAILED (advisory) — exit {sit_outcome.exit_code}"',
+                                shell=True, capture_output=True, cwd=str(proj)
+                            )
                 else:
                     log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
                     log.error(f"   {r.stderr.strip()}")
@@ -964,6 +1107,7 @@ def main():
     rp.add_argument("--approve", action="store_true", help="Pre-approve execution")
     rp.add_argument("--force", action="store_true", help="Skip ALL safety checks")
     rp.add_argument("--skip-deps", action="store_true", help="Ignore dependency check")
+    rp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     rp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     qp = sp.add_parser("queue")
@@ -971,17 +1115,23 @@ def main():
     qp.add_argument("--approve", action="store_true", required=True)
     qp.add_argument("--force", action="store_true")
     qp.add_argument("--skip-deps", action="store_true")
+    qp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     qp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     pp = sp.add_parser("parallel")
     pp.add_argument("batch_files", nargs="+")
     pp.add_argument("--approve", action="store_true", required=True)
     pp.add_argument("--force", action="store_true")
+    pp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     pp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     dp = sp.add_parser("deps")
     dp.add_argument("batch_file")
     dp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
+
+    sit_rp = sp.add_parser("sit:report")
+    sit_rp.add_argument("--since", default=None, help="ISO date to filter from (e.g. 2026-05-01)")
+    sit_rp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     a = ap.parse_args()
 
@@ -999,6 +1149,11 @@ def main():
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
+
+    # Apply --skip-sit globally before any command runs
+    global SKIP_SIT
+    if getattr(a, 'skip_sit', False):
+        SKIP_SIT = True
 
     if a.cmd == "run":
         bf = resolve(a.batch_file)
@@ -1029,6 +1184,9 @@ def main():
 
     elif a.cmd == "deps":
         show_deps(resolve(a.batch_file))
+
+    elif a.cmd == "sit:report":
+        sit_report_aggregate(since=a.since)
 
     elif a.cmd == "status":
         show_status()

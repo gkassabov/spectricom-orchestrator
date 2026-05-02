@@ -81,6 +81,36 @@ max_iterations: 8
 - Per-task budget: 50,000 tokens (marked blocked if exceeded)
 - All token usage logged with cost estimates
 
+## Post-Merge SIT Integration (A58a)
+
+After every successful Toni merge in clinical-mp, the orchestrator automatically runs `npm run sit:smoke` (Playwright smoke tests). This is **advisory in v1** — failures are logged and annotated but do NOT block the queue or roll back the merge.
+
+### Skip SIT
+
+```bash
+# Skip SIT for a single run (time-sensitive)
+python3 orchestrator.py run batch.md --approve --skip-sit
+```
+
+### SIT Report Aggregation
+
+```bash
+# Aggregate all SIT results
+python3 orchestrator.py sit:report
+
+# Since a specific date
+python3 orchestrator.py sit:report --since 2026-05-01
+```
+
+### Behavior
+
+- SIT runs after merge, before next brief fires
+- Reports archived to `sit-archive/`
+- Outcomes logged to `sit-archive/orchestrator-sit-log.json`
+- Merge commit annotated (via git notes) on SIT failure
+- 5-minute timeout per SIT run
+- Does NOT block queue progression in v1
+
 ## Project Structure
 
 ```
