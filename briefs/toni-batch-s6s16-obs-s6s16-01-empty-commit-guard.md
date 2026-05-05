@@ -1,6 +1,6 @@
 # Toni Batch S6S16 — OBS-S6S16-01: Conditional commit (no empty markers)
 
-## Repo: spectricom-orchestrator
+## Repo: orchestrator
 ## Batch ID: s6s16-obs-s6s16-01-empty-commit-guard
 ## Briefs: 1
 ## Estimated runtime: 10-15m

@@ -207,7 +207,7 @@ class Result:
     playwright_ok: Optional[bool]=None; pw_tests: int=0
     new_migrations: list=field(default_factory=list)
     error: Optional[str]=None; log_file: Optional[str]=None
-    worktree: Optional[str]=None
+    worktree: Optional[str]=None; no_changes: bool=False
 
 # ═══════════════════════════════════════════════════════
 # LOGGING
@@ -606,7 +606,8 @@ def run_playwright() -> tuple[bool, int]:
 
 def notify(result: Result):
     e = "✅" if result.status == Status.PASSED else "❌"
-    msg = f"{e} {result.batch_file} — {result.status.value} | {result.briefs} briefs | {result.duration_s:.0f}s"
+    status_label = "passed (no changes)" if result.no_changes else result.status.value
+    msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
     if result.playwright_ok is not None:
         msg += f" | PW: {'✅' if result.playwright_ok else '❌'} ({result.pw_tests})"
     if result.new_migrations:
@@ -1065,43 +1066,59 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         if not pw_ok: status = Status.FAILED
 
     # Auto-commit + merge back to main (D-148)
+    no_change_run = False
     if branch_name and worktree is None:
         try:
             if status == Status.PASSED:
                 # Commit all changes on feature branch
                 subprocess.run("git add -A", shell=True, cwd=str(proj), capture_output=True)
-                commit_msg = f"fix: {batch_file.stem} — {len(briefs)} briefs"
-                r = subprocess.run(
-                    f'git commit -m "{commit_msg}" --allow-empty',
-                    shell=True, capture_output=True, text=True, cwd=str(proj)
-                )
-                if r.returncode == 0:
-                    log.info(f"📦 Committed: {commit_msg}")
-                else:
-                    log.warning(f"⚠️ Commit failed: {r.stderr.strip()}")
 
-                # Merge back to merge target
-                subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
-                r = subprocess.run(
-                    f"git merge {branch_name} --no-edit",
-                    shell=True, capture_output=True, text=True, cwd=str(proj)
+                diff_check = subprocess.run(
+                    "git diff --cached --quiet",
+                    shell=True, capture_output=True, cwd=str(proj)
                 )
-                if r.returncode == 0:
-                    log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET}")
-                    # Clean up feature branch
-                    subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
-                    # A58a: Post-merge SIT (advisory v1)
-                    if ACTIVE_REPO_NAME == "clinical-mp":
-                        sit_outcome = run_sit_post_merge(proj)
-                        if not sit_outcome.passed:
-                            # Annotate: SIT failure is advisory only in v1
-                            subprocess.run(
-                                f'git notes add -m "SIT: FAILED (advisory) — exit {sit_outcome.exit_code}"',
-                                shell=True, capture_output=True, cwd=str(proj)
-                            )
+                has_changes = diff_check.returncode != 0
+
+                if has_changes:
+                    commit_msg = f"fix: {batch_file.stem} — {len(briefs)} briefs"
+                    r = subprocess.run(
+                        f'git commit -m "{commit_msg}"',
+                        shell=True, capture_output=True, text=True, cwd=str(proj)
+                    )
+                    if r.returncode == 0:
+                        log.info(f"📦 Committed: {commit_msg}")
+                    else:
+                        log.warning(f"⚠️ Commit failed: {r.stderr.strip()}")
+
+                    # Merge back to merge target
+                    subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                    r = subprocess.run(
+                        f"git merge {branch_name} --no-edit",
+                        shell=True, capture_output=True, text=True, cwd=str(proj)
+                    )
+                    if r.returncode == 0:
+                        log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET}")
+                        # Clean up feature branch
+                        subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                        # A58a: Post-merge SIT (advisory v1)
+                        if ACTIVE_REPO_NAME == "clinical-mp":
+                            sit_outcome = run_sit_post_merge(proj)
+                            if not sit_outcome.passed:
+                                subprocess.run(
+                                    f'git notes add -m "SIT: FAILED (advisory) — exit {sit_outcome.exit_code}"',
+                                    shell=True, capture_output=True, cwd=str(proj)
+                                )
+                    else:
+                        log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
+                        log.error(f"   {r.stderr.strip()}")
                 else:
-                    log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
-                    log.error(f"   {r.stderr.strip()}")
+                    log.warning(
+                        "⚠️ Toni produced no changes — skipping commit "
+                        "(usually means idempotent re-fire or halt-and-report)."
+                    )
+                    no_change_run = True
+                    subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                    subprocess.run(f"git branch -D {branch_name}", shell=True, capture_output=True, cwd=str(proj))
             else:
                 # Failed batch — switch back to merge target, leave branch for inspection
                 subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
@@ -1116,7 +1133,8 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         duration_s=dur, exit_code=ec, briefs=len(briefs),
         playwright_ok=pw_ok, pw_tests=pw_cnt,
         new_migrations=new_mig, log_file=out_log,
-        worktree=str(worktree) if worktree else None)
+        worktree=str(worktree) if worktree else None,
+        no_changes=no_change_run)
     notify(result)
     rate_limiter.record(batch_file.name, len(briefs), dur, status.value)
 
@@ -1157,9 +1175,11 @@ def run_queue(files: list[Path], force: bool = False, skip_deps: bool = False):
         if i < len(files)-1:
             log.info(f"Cooldown {TONI_COOLDOWN}s..."); time.sleep(TONI_COOLDOWN)
     p = sum(1 for r in results if r.status==Status.PASSED)
+    nc = sum(1 for r in results if r.no_changes)
     t = sum(r.duration_s for r in results)
     b = sum(r.briefs for r in results)
-    log.info(f"\n{'═'*60}\nQUEUE DONE: {p}/{len(results)} passed | {b} briefs | {t:.0f}s\n{'═'*60}")
+    nc_tag = f" ({nc} no changes)" if nc else ""
+    log.info(f"\n{'═'*60}\nQUEUE DONE: {p}/{len(results)} passed{nc_tag} | {b} briefs | {t:.0f}s\n{'═'*60}")
     return results
 
 # ═══════════════════════════════════════════════════════
@@ -1199,7 +1219,9 @@ def run_parallel(files: list[Path], force: bool = False):
                 if not ok: log.error("PW failed post-merge — stopping"); break
         cleanup_worktree(wt)
     p = sum(1 for r,_ in results if r.status==Status.PASSED)
-    log.info(f"\nPARALLEL DONE: {p}/{len(results)} passed")
+    nc = sum(1 for r,_ in results if r.no_changes)
+    nc_tag = f" ({nc} no changes)" if nc else ""
+    log.info(f"\nPARALLEL DONE: {p}/{len(results)} passed{nc_tag}")
 
 # ═══════════════════════════════════════════════════════
 # WATCHER
