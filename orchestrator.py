@@ -1077,29 +1077,65 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     "git diff --cached --quiet",
                     shell=True, capture_output=True, cwd=str(proj)
                 )
-                has_changes = diff_check.returncode != 0
+                # OBS-S6S17-02: Toni (post-OBS-S6S16-01) commits autonomously — staging
+                # may be empty even though Toni made commits on the branch. Count commits
+                # ahead of merge target, OR-combine with staged-changes check.
+                rev_count_proc = subprocess.run(
+                    f"git rev-list --count {MERGE_TARGET}..HEAD",
+                    shell=True, capture_output=True, text=True, cwd=str(proj)
+                )
+                toni_commits = (
+                    int(rev_count_proc.stdout.strip())
+                    if rev_count_proc.returncode == 0 and rev_count_proc.stdout.strip().isdigit()
+                    else 0
+                )
+                has_staged_changes = diff_check.returncode != 0
+                has_changes = has_staged_changes or toni_commits > 0
+                if toni_commits > 0:
+                    log.info(f"📦 Toni made {toni_commits} commit(s) on {branch_name}")
 
                 if has_changes:
-                    commit_msg = f"fix: {batch_file.stem} — {len(briefs)} briefs"
-                    r = subprocess.run(
-                        f'git commit -m "{commit_msg}"',
-                        shell=True, capture_output=True, text=True, cwd=str(proj)
-                    )
-                    if r.returncode == 0:
-                        log.info(f"📦 Committed: {commit_msg}")
+                    if has_staged_changes:
+                        commit_msg = f"fix: {batch_file.stem} — {len(briefs)} briefs"
+                        r = subprocess.run(
+                            f'git commit -m "{commit_msg}"',
+                            shell=True, capture_output=True, text=True, cwd=str(proj)
+                        )
+                        if r.returncode == 0:
+                            log.info(f"📦 Committed: {commit_msg}")
+                        else:
+                            log.warning(f"⚠️ Commit failed: {r.stderr.strip()}")
                     else:
-                        log.warning(f"⚠️ Commit failed: {r.stderr.strip()}")
+                        log.info(f"📦 Skipping orchestrator commit — Toni already committed {toni_commits} commit(s)")
 
                     # Merge back to merge target
+                    pre_merge_tip = subprocess.run(
+                        f"git rev-parse {MERGE_TARGET}",
+                        shell=True, capture_output=True, text=True, cwd=str(proj)
+                    ).stdout.strip()
                     subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
                     r = subprocess.run(
                         f"git merge {branch_name} --no-edit",
                         shell=True, capture_output=True, text=True, cwd=str(proj)
                     )
                     if r.returncode == 0:
-                        log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET}")
-                        # Clean up feature branch
-                        subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                        post_merge_tip = subprocess.run(
+                            f"git rev-parse {MERGE_TARGET}",
+                            shell=True, capture_output=True, text=True, cwd=str(proj)
+                        ).stdout.strip()
+                        if post_merge_tip == pre_merge_tip and toni_commits > 0:
+                            # OBS-S6S17-02: defense-in-depth — main didn't advance despite
+                            # Toni having made commits. This is the silent-failure mode.
+                            log.error(
+                                f"❌ Merge reported success but {MERGE_TARGET} tip unchanged "
+                                f"({pre_merge_tip[:7]}). Toni had {toni_commits} commit(s) on "
+                                f"{branch_name}. NOT deleting branch — manual recovery needed."
+                            )
+                            status = Status.FAILED
+                        else:
+                            log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET} ({pre_merge_tip[:7]} → {post_merge_tip[:7]})")
+                            # Clean up feature branch
+                            subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
                         # A58a: Post-merge SIT (advisory v1)
                         if ACTIVE_REPO_NAME == "clinical-mp":
                             sit_outcome = run_sit_post_merge(proj)
