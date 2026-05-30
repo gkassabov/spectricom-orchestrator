@@ -186,6 +186,22 @@ MAX_PARALLEL = 3
 RUN_PLAYWRIGHT = False
 PLAYWRIGHT_CMD = "npx playwright test"
 SKIP_SIT = False
+# S6S47 P1 hardening (D-S6S46-B): post-merge build gate + blocking SIT.
+# Both default ON for clinical-mp; disable via env for emergency bypass.
+BUILD_GATE_ENABLED = os.environ.get("DISABLE_BUILD_GATE", "") == ""
+SIT_BLOCKING = os.environ.get("DISABLE_SIT_BLOCKING", "") == ""
+BUILD_GATE_CMD = "npx tsc --noEmit && npm run build"
+BUILD_GATE_TIMEOUT = 600  # 10 min
+SIT_TIMEOUT = 600  # S6S47: 300 was too tight for full smoke suite w/ 4 workers
+# S6S47: SIT blocks only on NEW failures vs this known-failing baseline.
+# These are pre-existing tracked bugs (verified failing on 632b236 pre-PCFG),
+# so they must NOT cause every brief's gate to false-FAIL. Remove an ID here
+# once its bug is actually fixed.
+SIT_KNOWN_FAILING = {
+    "home-count-parity",            # BUG-026 (pre-existing, S6S46 baseline)
+    "encounter-autosave-roundtrip", # BUG-018 (pre-existing, S6S46 baseline)
+    "mini-me-bridge-consent-gate",  # BUG-v4r-005 (pre-existing, verified failing on 632b236)
+}
 SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
 PROTECTED_BRANCHES = {"main", "master", "develop", "staging"}
 
@@ -548,6 +564,7 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         f"cd {project} && "
         f"stdbuf -oL "
         f"claude --dangerously-skip-permissions "
+        f"--model claude-opus-4-8 --effort high "
         f'"Read {brief_rel} and execute all briefs in order."'
     )
     # Update running.json with log file path
@@ -809,6 +826,58 @@ def _self_mod_auto_merge(orch_dir: Path, branch_name: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════
+# BUILD GATE (S6S47 P1 hardening — D-S6S46-B)
+# Post-merge tsc + build. BLOCKING: failure → caller sets Status.FAILED,
+# existing run_queue halt-on-fail (line ~1208) stops the queue.
+# Root cause it addresses: no between-brief build gate → 30 TS errors
+# accumulated silently across the Phase 2 autopilot (S6S46 cleanup 055aab6).
+# ═══════════════════════════════════════════════════════
+@dataclass
+class BuildGateOutcome:
+    passed: bool
+    exit_code: int
+    error: Optional[str] = None
+    duration_s: float = 0.0
+
+
+def run_build_gate(repo_path: Path) -> BuildGateOutcome:
+    """Run tsc --noEmit && npm run build after merge. BLOCKING gate.
+
+    Returns BuildGateOutcome; caller promotes a fail to Status.FAILED.
+    Disable via DISABLE_BUILD_GATE env (emergency bypass only).
+    """
+    if not BUILD_GATE_ENABLED:
+        log.info("⏭️  Build gate disabled (DISABLE_BUILD_GATE)")
+        return BuildGateOutcome(passed=True, exit_code=0, error="disabled")
+
+    log.info(f"🔧 Running build gate: {BUILD_GATE_CMD}")
+    started = time.time()
+    try:
+        r = subprocess.run(
+            BUILD_GATE_CMD, shell=True, capture_output=True, text=True,
+            cwd=str(repo_path), timeout=BUILD_GATE_TIMEOUT
+        )
+        duration = time.time() - started
+        passed = r.returncode == 0
+        if passed:
+            log.info(f"✅ BUILD GATE PASSED ({duration:.1f}s)")
+            return BuildGateOutcome(passed=True, exit_code=0, duration_s=duration)
+        log.error(f"❌ BUILD GATE FAILED (exit {r.returncode}, {duration:.1f}s) — BLOCKING, queue will halt")
+        tail = (r.stdout or "")[-800:] + "\n" + (r.stderr or "")[-800:]
+        log.error(f"   {tail.strip()[-1000:]}")
+        return BuildGateOutcome(passed=False, exit_code=r.returncode,
+                                error=tail.strip()[-1000:], duration_s=duration)
+    except subprocess.TimeoutExpired:
+        duration = time.time() - started
+        log.error(f"❌ BUILD GATE TIMEOUT after {duration:.1f}s — BLOCKING")
+        return BuildGateOutcome(passed=False, exit_code=-1, error="timeout", duration_s=duration)
+    except Exception as e:
+        duration = time.time() - started
+        log.error(f"❌ BUILD GATE ERROR: {e} — BLOCKING")
+        return BuildGateOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration)
+
+
+# ═══════════════════════════════════════════════════════
 # SIT POST-MERGE INTEGRATION (A58a — advisory v1)
 # ═══════════════════════════════════════════════════════
 @dataclass
@@ -841,10 +910,30 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
     try:
         r = subprocess.run(
             sit_cmd, shell=True, capture_output=True, text=True,
-            cwd=str(repo_path), timeout=300
+            cwd=str(repo_path), timeout=SIT_TIMEOUT
         )
         duration = time.time() - started
-        passed = r.returncode == 0
+        # S6S47: baseline-aware. Block only on NEW failures, not pre-existing
+        # known-failing specs (BUG-018/BUG-026). Parse failing spec basenames
+        # from playwright output; if every failing spec is in SIT_KNOWN_FAILING,
+        # treat as pass-with-known-failures.
+        raw = (r.stdout or "") + "\n" + (r.stderr or "")
+        import re as _re
+        failing_specs = set()
+        for m in _re.finditer(r"✘\s+\d+\s+\[[^\]]*\]\s+›\s+(\S+\.spec\.ts)", raw):
+            failing_specs.add(Path(m.group(1)).stem.replace(".spec", ""))
+        new_failures = {s for s in failing_specs
+                        if not any(k in s for k in SIT_KNOWN_FAILING)}
+        if r.returncode == 0:
+            passed = True
+        elif failing_specs and not new_failures:
+            passed = True
+            log.warning(f"🟡 SIT: {len(failing_specs)} known-failing spec(s) "
+                        f"({', '.join(sorted(failing_specs))}) — NOT blocking (baseline)")
+        else:
+            passed = False
+            if new_failures:
+                log.error(f"🆕 SIT NEW failures (blocking): {', '.join(sorted(new_failures))}")
 
         # Archive SIT report if it exists
         report_path = None
@@ -1136,14 +1225,31 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                             log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET} ({pre_merge_tip[:7]} → {post_merge_tip[:7]})")
                             # Clean up feature branch
                             subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
-                        # A58a: Post-merge SIT (advisory v1)
+                        # S6S47 P1 hardening (D-S6S46-B): post-merge gates.
+                        # Order: build gate (tsc+build) → SIT (visual smoke).
+                        # Both BLOCKING: a fail sets Status.FAILED so run_queue
+                        # halt-on-fail stops the queue (no firing onto a broken base).
                         if ACTIVE_REPO_NAME == "clinical-mp":
-                            sit_outcome = run_sit_post_merge(proj)
-                            if not sit_outcome.passed:
+                            # Gate 1: build (catches typecheck/build drift)
+                            bg = run_build_gate(proj)
+                            if not bg.passed:
                                 subprocess.run(
-                                    f'git notes add -m "SIT: FAILED (advisory) — exit {sit_outcome.exit_code}"',
+                                    f'git notes add -m "BUILD GATE: FAILED — exit {bg.exit_code}"',
                                     shell=True, capture_output=True, cwd=str(proj)
                                 )
+                                status = Status.FAILED
+                            # Gate 2: SIT visual smoke — only if build passed
+                            if status == Status.PASSED:
+                                sit_outcome = run_sit_post_merge(proj)
+                                if not sit_outcome.passed:
+                                    label = "BLOCKING" if SIT_BLOCKING else "advisory"
+                                    subprocess.run(
+                                        f'git notes add -m "SIT: FAILED ({label}) — exit {sit_outcome.exit_code}"',
+                                        shell=True, capture_output=True, cwd=str(proj)
+                                    )
+                                    if SIT_BLOCKING:
+                                        log.error("⛔ SIT failed and SIT_BLOCKING — marking batch FAILED")
+                                        status = Status.FAILED
                     else:
                         log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
                         log.error(f"   {r.stderr.strip()}")

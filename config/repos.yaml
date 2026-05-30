@@ -15,7 +15,7 @@ repos:
     briefs_subdir: yorsie/briefs
     test_cmd: "cd yorsie && npm test"
     fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: true
 
   ai-foundation:
@@ -28,7 +28,7 @@ repos:
     briefs_subdir: briefs
     test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
     fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: false
 
   clinical-mp:
@@ -41,7 +41,7 @@ repos:
     briefs_subdir: briefs
     test_cmd: "npm test"
     fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: false
 
   orchestrator:
@@ -55,7 +55,7 @@ repos:
     briefs_subdir: briefs
     test_cmd: "pytest 2>/dev/null || echo 'orchestrator has no test suite yet'"
     fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions "{brief_prompt}"
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: false
 
   # Future repos (scaffolded per S5S37 decision #6, NOT LIVE):
