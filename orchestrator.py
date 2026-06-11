@@ -850,11 +850,14 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
         log.info("⏭️  Build gate disabled (DISABLE_BUILD_GATE)")
         return BuildGateOutcome(passed=True, exit_code=0, error="disabled")
 
-    log.info(f"🔧 Running build gate: {BUILD_GATE_CMD}")
+    # Per-repo build gate: repos.yaml may declare `build_gate_cmd` (e.g. "pytest -q"
+    # for Python repos). Falls back to the global TS default, preserving every TS repo.
+    gate_cmd = ACTIVE_REPO_CONFIG.get("build_gate_cmd", BUILD_GATE_CMD)
+    log.info(f"🔧 Running build gate [{ACTIVE_REPO_NAME or 'default'}]: {gate_cmd}")
     started = time.time()
     try:
         r = subprocess.run(
-            BUILD_GATE_CMD, shell=True, capture_output=True, text=True,
+            gate_cmd, shell=True, capture_output=True, text=True,
             cwd=str(repo_path), timeout=BUILD_GATE_TIMEOUT
         )
         duration = time.time() - started
@@ -1142,7 +1145,29 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     ec, out_log = fire_toni(target, proj)
     finished = datetime.now()
     dur = (finished - started).total_seconds()
-    status = Status.PASSED if ec == 0 else Status.FAILED
+    # S6S49 fix: claude-code 2.1.123 returns a NON-ZERO exit even on a fully
+    # successful run (thinking-block teardown regression). Trusting ec alone
+    # made the orchestrator discard good work (006/007 produced correct,
+    # compiling code yet were logged FAILED, leaving edits uncommitted).
+    # Real success signal = Toni produced work (commits ahead of target OR
+    # staged/unstaged changes in the tree). The post-merge BUILD GATE remains
+    # the quality arbiter, so this cannot merge broken code — it only stops a
+    # bad exit code from throwing away good code. ec is still recorded.
+    if worktree is None and branch_name:
+        _staged = subprocess.run("git status --porcelain", shell=True,
+            capture_output=True, text=True, cwd=str(proj)).stdout.strip()
+        _ahead = subprocess.run(f"git rev-list --count {MERGE_TARGET}..HEAD",
+            shell=True, capture_output=True, text=True, cwd=str(proj)).stdout.strip()
+        try: _ahead_n = int(_ahead)
+        except ValueError: _ahead_n = 0
+        _produced_work = bool(_staged) or _ahead_n > 0
+    else:
+        _produced_work = (ec == 0)
+    status = Status.PASSED if (ec == 0 or _produced_work) else Status.FAILED
+    if ec != 0 and _produced_work:
+        log.warning(f"⚠️  Toni exited non-zero (ec={ec}) but produced work "
+                    f"(staged/ahead) — treating as PASSED; build gate will verify. "
+                    f"(claude-code 2.1.123 exit-code regression)")
     mig_after = get_migrations()
     new_mig = sorted(mig_after - mig_before)
     if new_mig:

@@ -27,6 +27,7 @@ repos:
     worktree_mode: single-stream
     briefs_subdir: briefs
     test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
+    build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
     fire_command_template: |
       cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: false
@@ -60,3 +61,16 @@ repos:
 
   # Future repos (scaffolded per S5S37 decision #6, NOT LIVE):
   # gateway: (Spectricom Gateway repo, Phase 3+)
+
+  collateral:
+    project_dir: /home/gkassa/spectricom-collateral
+    branch_prefix: orch-col
+    merge_target: main
+    remote: origin
+    log_subdir: collateral
+    worktree_mode: single-stream
+    briefs_subdir: briefs
+    test_cmd: "echo 'collateral: no automated suite — acceptance per brief section 7 rendered-UI verification'"
+    fire_command_template: |
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-fable-5 --effort high "{brief_prompt}"
+    default: false
