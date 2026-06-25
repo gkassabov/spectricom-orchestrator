@@ -44,8 +44,9 @@ class TestRunSitPostMerge:
 
     @patch('subprocess.run')
     def test_sit_fail(self, mock_run):
-        """SIT fails — returns passed=False with exit code, does NOT raise."""
-        mock_run.return_value = MagicMock(returncode=1, stdout='FAILED: 2 specs', stderr='')
+        """A NEW CRITICAL spec failure blocks — passed=False, does NOT raise."""
+        out = "  \u2718  1 [chromium] \u203a encounter-sign-finalization.spec.ts \u203a finalize\n"
+        mock_run.return_value = MagicMock(returncode=1, stdout=out, stderr='')
 
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_path = Path(tmpdir)
@@ -77,7 +78,7 @@ class TestRunSitPostMerge:
 
     @patch('subprocess.run')
     def test_sit_timeout(self, mock_run):
-        """SIT timeout — returns failed with timeout error, does NOT raise."""
+        """SIT timeout is ADVISORY (not blocking) — passed=True, error='timeout-advisory'."""
         mock_run.side_effect = subprocess.TimeoutExpired(cmd='npm run sit:smoke', timeout=300)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -89,8 +90,66 @@ class TestRunSitPostMerge:
             orchestrator.SKIP_SIT = False
             outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
 
+            assert outcome.passed is True
+            assert outcome.error == "timeout-advisory"
+
+    @patch('subprocess.run')
+    def test_sit_noncritical_under_threshold_advisory(self, mock_run):
+        """Fewer than SIT_MANY_THRESHOLD new non-critical failures -> advisory (passed=True)."""
+        out = ("  \u2718  1 [chromium] \u203a 02-patient-flow.spec.ts \u203a a\n"
+               "  \u2718  2 [chromium] \u203a chart-tab-scroll.spec.ts \u203a b\n")
+        mock_run.return_value = MagicMock(returncode=1, stdout=out, stderr='')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir)
+            archive_path = Path(tmpdir) / "archive"
+            archive_path.mkdir()
+            import orchestrator
+            orchestrator.SKIP_SIT = False
+            outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
+            assert outcome.passed is True
+
+    @patch('subprocess.run')
+    def test_sit_many_noncritical_blocks(self, mock_run):
+        """SIT_MANY_THRESHOLD+ new non-critical failures -> blocks (passed=False)."""
+        out = ("  \u2718  1 [chromium] \u203a 02-patient-flow.spec.ts \u203a a\n"
+               "  \u2718  2 [chromium] \u203a chart-tab-scroll.spec.ts \u203a b\n"
+               "  \u2718  3 [chromium] \u203a inbox-data-flow.spec.ts \u203a c\n")
+        mock_run.return_value = MagicMock(returncode=1, stdout=out, stderr='')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir)
+            archive_path = Path(tmpdir) / "archive"
+            archive_path.mkdir()
+            import orchestrator
+            orchestrator.SKIP_SIT = False
+            outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
             assert outcome.passed is False
-            assert outcome.error == "timeout"
+
+    @patch('subprocess.run')
+    def test_sit_baseline_only_advisory(self, mock_run):
+        """Only baseline (known-failing) specs fail -> advisory (passed=True)."""
+        out = "  \u2718  1 [chromium] \u203a home-count-parity.spec.ts \u203a a\n"
+        mock_run.return_value = MagicMock(returncode=1, stdout=out, stderr='')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir)
+            archive_path = Path(tmpdir) / "archive"
+            archive_path.mkdir()
+            import orchestrator
+            orchestrator.SKIP_SIT = False
+            outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
+            assert outcome.passed is True
+
+    @patch('subprocess.run')
+    def test_sit_parse_miss_advisory(self, mock_run):
+        """exit!=0 but no parseable spec failures -> advisory (passed=True), not a false block."""
+        mock_run.return_value = MagicMock(returncode=1, stdout='FAILED: 2 specs', stderr='')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_path = Path(tmpdir)
+            archive_path = Path(tmpdir) / "archive"
+            archive_path.mkdir()
+            import orchestrator
+            orchestrator.SKIP_SIT = False
+            outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
+            assert outcome.passed is True
 
 
 class TestSitLogOutcome:

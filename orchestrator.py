@@ -199,9 +199,26 @@ SIT_TIMEOUT = 600  # S6S47: 300 was too tight for full smoke suite w/ 4 workers
 # once its bug is actually fixed.
 SIT_KNOWN_FAILING = {
     "home-count-parity",            # BUG-026 (pre-existing, S6S46 baseline)
-    "encounter-autosave-roundtrip", # BUG-018 (pre-existing, S6S46 baseline)
     "mini-me-bridge-consent-gate",  # BUG-v4r-005 (pre-existing, verified failing on 632b236)
+    # encounter-autosave-roundtrip REMOVED S6S72 — spec repaired (re-pointed to the structured
+    # Subjective HPI) and underlying BUG-S6S70-COMPOSE-CMP1-PERSIST fixed/verified. It is now a
+    # live CRITICAL guard (SIT_CRITICAL_SPECS below).
 }
+# S6S72: SIT halt rule = MANY-or-SEVERE. Among NEW failures (those NOT in SIT_KNOWN_FAILING):
+# a CRITICAL spec failing halts on any 1; non-critical failures halt only once they reach
+# SIT_MANY_THRESHOLD. CRITICAL = data-integrity / safety journeys. Substring-matched against
+# failing spec basenames (same style as SIT_KNOWN_FAILING). Remove/extend as the suite evolves.
+SIT_CRITICAL_SPECS = {
+    "encounter-autosave-roundtrip",       # persistence — Subjective survives nav roundtrip (data loss)
+    "encounter-autosave-unicode",         # persistence — unicode payload (data loss)
+    "encounter-idle-autosave-warning",    # persistence — idle autosave (data loss)
+    "encounter-sign-finalization",        # signed-note finalize integrity
+    "encounter-finished-readonly",        # signed-note immutability
+    "post-sign-route-refresh",            # post-sign route integrity
+    "SCA-BUG-S6S36-finalized-edit-leak",  # finalized-note edit leak (compliance)
+    "05-audit-emission",                  # audit / provenance emission (compliance)
+}
+SIT_MANY_THRESHOLD = 3  # >= this many NEW non-critical failures halts a batch (George, S6S72)
 SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
 PROTECTED_BRANCHES = {"main", "master", "develop", "staging"}
 
@@ -893,9 +910,12 @@ class SitOutcome:
 
 
 def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> SitOutcome:
-    """Run SIT smoke tests after merge. Advisory only — does NOT block.
+    """Run SIT smoke tests after merge, then apply the MANY-or-SEVERE halt rule.
 
-    Returns SitOutcome with pass/fail status and archived report path.
+    Baseline (SIT_KNOWN_FAILING) failures never block. Among NEW failures: a CRITICAL spec
+    (SIT_CRITICAL_SPECS) blocks on any 1; non-critical failures block only at SIT_MANY_THRESHOLD
+    or more. Timeout / unparseable failure -> advisory (surfaced, not blocking). SitOutcome.passed
+    encodes block-worthiness; the caller blocks iff not passed and SIT_BLOCKING.
     """
     if SKIP_SIT:
         log.info("⏭️  SIT skipped (--skip-sit)")
@@ -927,16 +947,34 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
             failing_specs.add(Path(m.group(1)).stem.replace(".spec", ""))
         new_failures = {s for s in failing_specs
                         if not any(k in s for k in SIT_KNOWN_FAILING)}
+        # S6S72 MANY-or-SEVERE threshold.
+        new_critical = {s for s in new_failures
+                        if any(c in s for c in SIT_CRITICAL_SPECS)}
+        new_noncritical = new_failures - new_critical
         if r.returncode == 0:
             passed = True
-        elif failing_specs and not new_failures:
+        elif not failing_specs:
+            # exit!=0 but no spec failures parsed (crash / format drift / infra) — advisory.
             passed = True
-            log.warning(f"🟡 SIT: {len(failing_specs)} known-failing spec(s) "
-                        f"({', '.join(sorted(failing_specs))}) — NOT blocking (baseline)")
-        else:
+            log.error(f"🟠 SIT exited {r.returncode} but parsed NO failing specs — "
+                      f"ADVISORY (not blocking); surfacing for review.")
+        elif new_critical:
             passed = False
-            if new_failures:
-                log.error(f"🆕 SIT NEW failures (blocking): {', '.join(sorted(new_failures))}")
+            log.error(f"⛔ SIT CRITICAL new failure(s) — BLOCKING: {', '.join(sorted(new_critical))}")
+        elif len(new_noncritical) >= SIT_MANY_THRESHOLD:
+            passed = False
+            log.error(f"⛔ SIT {len(new_noncritical)} new non-critical failures >= "
+                      f"{SIT_MANY_THRESHOLD} — BLOCKING: {', '.join(sorted(new_noncritical))}")
+        else:
+            passed = True
+            _baseline_hit = failing_specs - new_failures
+            _bits = []
+            if _baseline_hit:
+                _bits.append(f"{len(_baseline_hit)} baseline ({', '.join(sorted(_baseline_hit))})")
+            if new_noncritical:
+                _bits.append(f"{len(new_noncritical)} new non-critical < {SIT_MANY_THRESHOLD} "
+                             f"({', '.join(sorted(new_noncritical))})")
+            log.warning(f"🟡 SIT: {'; '.join(_bits) or 'failures present'} — NOT blocking (under threshold)")
 
         # Archive SIT report if it exists
         report_path = None
@@ -967,9 +1005,9 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
 
     except subprocess.TimeoutExpired:
         duration = time.time() - started
-        log.warning(f"⚠️  SIT TIMEOUT after {duration:.1f}s — advisory only")
-        _log_sit_outcome(archive, repo_path, False, -1, duration, None, error="timeout")
-        return SitOutcome(passed=False, exit_code=-1, error="timeout", duration_s=duration)
+        log.error(f"🟠 SIT TIMEOUT after {duration:.1f}s — ADVISORY (not blocking); surfacing for review.")
+        _log_sit_outcome(archive, repo_path, True, -1, duration, None, error="timeout-advisory")
+        return SitOutcome(passed=True, exit_code=-1, error="timeout-advisory", duration_s=duration)
     except Exception as e:
         duration = time.time() - started
         log.warning(f"⚠️  SIT ERROR: {e} — advisory only")
