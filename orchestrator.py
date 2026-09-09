@@ -84,7 +84,6 @@ REMOTE: str = "origin"
 LOG_SUBDIR: str = ""
 WORKTREE_MODE: str = "single-stream"
 TEST_CMD: str = ""
-FIRE_TEMPLATE: str = ""
 IS_META_FIRE: bool = False
 
 
@@ -123,7 +122,7 @@ def set_active_repo(name: str = "") -> str:
     global ACTIVE_REPO_NAME, ACTIVE_REPO_CONFIG
     global PROJECT_ROOT, YORSIE_DIR, BRIEFS_DIR, WORKTREE_BASE
     global BRANCH_PREFIX, MERGE_TARGET, REMOTE, LOG_SUBDIR
-    global WORKTREE_MODE, TEST_CMD, FIRE_TEMPLATE, IS_META_FIRE
+    global WORKTREE_MODE, TEST_CMD, IS_META_FIRE
 
     cfg = load_repo_config()
     repos = cfg["repos"]
@@ -155,7 +154,6 @@ def set_active_repo(name: str = "") -> str:
     LOG_SUBDIR = r.get("log_subdir", name)
     WORKTREE_MODE = r.get("worktree_mode", "single-stream")
     TEST_CMD = r.get("test_cmd", "")
-    FIRE_TEMPLATE = r.get("fire_command_template", "")
     IS_META_FIRE = bool(r.get("meta_fire", False))
     return name
 
@@ -226,6 +224,96 @@ SIT_CRITICAL_SPECS = {
 }
 SIT_MANY_THRESHOLD = 3  # >= this many NEW non-critical failures halts a batch (George, S6S72)
 SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
+
+# ═══════════════════════════════════════════════════════
+# PRE-MERGE GATE POLICY (S7-CORE-4 [ORCH-1] — gate-then-merge)
+# Gates run ON THE ROUTE BRANCH, BEFORE the merge to MERGE_TARGET. A red gate leaves
+# the branch unmerged and MERGE_TARGET untouched. (2026-09-09 incident: merge-then-gate
+# let a red sit:gate land on main.)
+# Eligibility is deliberately explicit per repo — there is no implicit
+# "declares build_gate_cmd ⇒ gated" rule — so turning a gate on is a visible, ratified
+# change. Repos absent from this table are UNGATED and that is a stated decision
+# (run_pre_merge_gates returns PASS with reason "ungated by policy").
+#   gates    : ordered tuple of "build" (run_build_gate) / "sit" (run_sit_post_merge)
+#   env_file : dotenv sourced via GATE_ENV_SOURCE in the gate shell, cwd = repo root,
+#              values never logged (canon §23.9d). Declared-but-missing ⇒ BLOCKED(environment).
+#              None ⇒ no sourcing and no requirement.
+PRE_MERGE_GATES = {
+    # S6S47 / D-S6S46-B: build (tsc+build) then SIT (npm run sit:gate). Same set as before;
+    # only the execution point moved (pre-merge).
+    "clinical-mp":  {"gates": ("build", "sit"), "env_file": ".env"},
+    # AC-ORCH1-09: meta-fire lane gated by build_gate_cmd (pytest -q). env_file=None on purpose:
+    # the orchestrator's own .env.example declares ANTHROPIC_API_KEY, and sourcing that into the
+    # gate shell would trip the CODE-GUARD (exit 3) inside every test that imports orchestrator.
+    "orchestrator": {"gates": ("build",), "env_file": None},
+    # ai-foundation / norra declare build_gate_cmd in repos.yaml but were never wired into the
+    # gate lane (a836886 left the clinical-mp-only condition in place). Not widened here —
+    # reported as a typed gap for ratification, not changed silently.
+}
+GATE_ENV_SOURCE = "set -a; . ./{env_file}; set +a"  # canon §23.9d: no set -x, no echo
+
+# ── PDLC F-20 (first instance, defined by [ORCH-1]) ────────────────────────────────
+# BLOCKED(environment) vs FAIL(product). A red gate is BLOCKED(environment) iff its combined
+# stdout+stderr matches one of these signals, or a declared env_file is missing, or the gate
+# names a required env var that IS a key in the repo's env_file (see _classify_gate_failure).
+# Anything else red is FAIL(product). Extend F-20 by extending these tables only.
+#   (signal id, regex over gate output, human description)
+ENV_BLOCK_SIGNALS = (
+    ("medplum-unreachable",
+     r"ECONNREFUSED\s+(?:127\.0\.0\.1|localhost|\[::1\]):8103"
+     r"|localhost:8103[^\n]*(?:ECONNREFUSED|fetch failed)"
+     r"|(?:ECONNREFUSED|fetch failed)[^\n]*localhost:8103",
+     "Medplum at http://localhost:8103 not answering"),
+    ("docker-unavailable",
+     r"Cannot connect to the Docker daemon|docker daemon is not running|Is the docker daemon running",
+     "Docker not running"),
+    ("port-in-use",
+     r"\bEADDRINUSE\b",
+     "required port already bound"),
+    ("network-dns",
+     r"\bENOTFOUND\b|\bEAI_AGAIN\b|getaddrinfo E[A-Z_]+",
+     "network/DNS failure reaching a dependency"),
+    ("toolchain-missing",
+     r"\b(?:npx|npm|node|pytest|python3?|tsc|vitest|playwright): (?:command )?not found",
+     "missing toolchain binary"),
+    ("env-file-unsourceable",
+     r"\./\.env: (?:line )?\d+:",
+     ".env present but the shell could not source it"),
+)
+# A gate throw naming a required env var, e.g. "requires `MEDPLUM_CLIENT_ID`" (2026-09-09).
+# Fires as signal "env-var-unsourced" only when the named var IS a key in the repo's env_file —
+# the value exists but did not reach the gate shell. Key names are read; values never are.
+ENV_VAR_MISSING_PATTERNS = (
+    r"requires\s+[`'\"]?([A-Z][A-Z0-9_]{2,})[`'\"]?",
+    r"[`'\"]?([A-Z][A-Z0-9_]{2,})[`'\"]?\s+(?:is|was)\s+(?:not set|not defined|missing|required|undefined)",
+    r"[Mm]issing\s+(?:required\s+)?(?:env(?:ironment)?\s+var(?:iable)?)?\s*:?\s*[`'\"]?([A-Z][A-Z0-9_]{2,})",
+)
+_ENV_BLOCK_SIGNALS_RE = [(sid, re.compile(rx, re.IGNORECASE), desc) for sid, rx, desc in ENV_BLOCK_SIGNALS]
+_ENV_VAR_MISSING_RE = [re.compile(rx) for rx in ENV_VAR_MISSING_PATTERNS]
+
+
+class GateOutcome(str, Enum):
+    PASS = "PASS"
+    BLOCKED_ENV = "BLOCKED(environment)"
+    FAIL_PRODUCT = "FAIL(product)"
+
+
+@dataclass
+class GateVerdict:
+    outcome: GateOutcome
+    gate: Optional[str] = None      # "build" | "sit" | "env" | None (ungated / all green)
+    signal: Optional[str] = None    # F-20 signal id, or a short product reason
+    detail: Optional[str] = None    # what triggered it — never a secret value
+
+    @property
+    def label(self) -> str:
+        s = self.outcome.value
+        if self.signal:
+            s += f" — {self.gate or 'gate'}: {self.signal}"
+        if self.detail:
+            s += f" ({self.detail})"
+        return s
+
 PROTECTED_BRANCHES = {"main", "master", "develop", "staging"}
 
 # ═══════════════════════════════════════════════════════
@@ -247,6 +335,7 @@ class Result:
     new_migrations: list=field(default_factory=list)
     error: Optional[str]=None; log_file: Optional[str]=None
     worktree: Optional[str]=None; no_changes: bool=False
+    gate_outcome: Optional[str]=None  # [ORCH-1] PASS | BLOCKED(environment) | FAIL(product) | None (gate not run)
 
 # ═══════════════════════════════════════════════════════
 # LOGGING
@@ -645,9 +734,13 @@ def run_playwright() -> tuple[bool, int]:
         log.error(f"Playwright error: {e}"); return False, 0
 
 def notify(result: Result):
-    e = "✅" if result.status == Status.PASSED else "❌"
+    e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else "❌")
     status_label = "passed (no changes)" if result.no_changes else result.status.value
     msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
+    if result.gate_outcome:
+        msg += f" | gate: {result.gate_outcome}"
+    if result.error:
+        msg += f"\n  {result.error}"
     if result.playwright_ok is not None:
         msg += f" | PW: {'✅' if result.playwright_ok else '❌'} ({result.pw_tests})"
     if result.new_migrations:
@@ -814,13 +907,25 @@ def merge_branch(br: str) -> bool:
     log.error(f"Merge conflict on {br} — MANUAL RESOLUTION NEEDED"); return False
 
 
-def _self_mod_auto_merge(orch_dir: Path, branch_name: str) -> bool:
+def _self_mod_auto_merge(orch_dir: Path, branch_name: str, gate_outcome: Optional[str] = None) -> bool:
     """Auto-merge meta-fire branch to main after successful self-mod fire.
 
     Returns True if merge succeeded (or no commits to merge), False on failure.
     Note: after auto-merge, the orchestrator's loaded Python modules are unchanged
     in memory; new code on disk takes effect on next invocation.
+
+    S7-CORE-4 [ORCH-1]: this lane is GATED. run_batch (the only production caller) runs
+    run_pre_merge_gates on the worktree checkout first and passes the verdict as
+    gate_outcome; anything but PASS is refused here and the branch preserved.
+    gate_outcome=None means the caller made no gate claim (tests / manual use) and is
+    honoured as-is — the production path always passes the verdict.
     """
+    if gate_outcome is not None and gate_outcome != GateOutcome.PASS.value:
+        log.error(
+            f"⛔ Self-mod auto-merge REFUSED — pre-merge gate {gate_outcome}. "
+            f"Branch preserved: {branch_name}. After review: cd {orch_dir} && git merge --ff-only {branch_name}"
+        )
+        return False
     try:
         r = subprocess.run(
             f"git -C {orch_dir} rev-list --count main..{branch_name}",
@@ -861,10 +966,30 @@ class BuildGateOutcome:
     exit_code: int
     error: Optional[str] = None
     duration_s: float = 0.0
+    output: str = ""  # [ORCH-1] combined stdout+stderr tail for F-20 classification (never logged whole)
+
+
+def _gate_env_file(repo_path: Path) -> tuple[Optional[str], Optional[Path]]:
+    """(declared env_file name or None, its Path under repo_path or None) per PRE_MERGE_GATES."""
+    policy = PRE_MERGE_GATES.get(ACTIVE_REPO_NAME) or {}
+    name = policy.get("env_file")
+    return name, (repo_path / name if name else None)
+
+
+def _gate_shell_cmd(cmd: str, repo_path: Path) -> str:
+    """Prefix a gate command with dotenv sourcing (GATE_ENV_SOURCE) when the repo policy
+    declares an env_file and it exists. cwd is repo_path, so `. ./.env` resolves to the gated
+    repo root. A declared-but-missing env_file is caught before any gate runs
+    (run_pre_merge_gates), so the sourcing line can never abort the run silently.
+    Secrets-silent: no set -x, no echo; values are never read by the orchestrator."""
+    name, path = _gate_env_file(repo_path)
+    if name and path.is_file():
+        return f"{GATE_ENV_SOURCE.format(env_file=name)}; {cmd}"
+    return cmd
 
 
 def run_build_gate(repo_path: Path) -> BuildGateOutcome:
-    """Run tsc --noEmit && npm run build after merge. BLOCKING gate.
+    """Run tsc --noEmit && npm run build on the route branch, BEFORE merge ([ORCH-1]). BLOCKING gate.
 
     Returns BuildGateOutcome; caller promotes a fail to Status.FAILED.
     Disable via DISABLE_BUILD_GATE env (emergency bypass only).
@@ -880,7 +1005,7 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
     started = time.time()
     try:
         r = subprocess.run(
-            gate_cmd, shell=True, capture_output=True, text=True,
+            _gate_shell_cmd(gate_cmd, repo_path), shell=True, capture_output=True, text=True,
             cwd=str(repo_path), timeout=BUILD_GATE_TIMEOUT
         )
         duration = time.time() - started
@@ -892,7 +1017,8 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
         tail = (r.stdout or "")[-800:] + "\n" + (r.stderr or "")[-800:]
         log.error(f"   {tail.strip()[-1000:]}")
         return BuildGateOutcome(passed=False, exit_code=r.returncode,
-                                error=tail.strip()[-1000:], duration_s=duration)
+                                error=tail.strip()[-1000:], duration_s=duration,
+                                output=((r.stdout or "") + "\n" + (r.stderr or ""))[-20000:])
     except subprocess.TimeoutExpired:
         duration = time.time() - started
         log.error(f"❌ BUILD GATE TIMEOUT after {duration:.1f}s — BLOCKING")
@@ -900,7 +1026,7 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
     except Exception as e:
         duration = time.time() - started
         log.error(f"❌ BUILD GATE ERROR: {e} — BLOCKING")
-        return BuildGateOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration)
+        return BuildGateOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e))
 
 
 # ═══════════════════════════════════════════════════════
@@ -913,10 +1039,14 @@ class SitOutcome:
     report_path: Optional[str] = None
     error: Optional[str] = None
     duration_s: float = 0.0
+    output: str = ""  # [ORCH-1] combined stdout+stderr tail for F-20 classification (never logged whole)
 
 
 def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> SitOutcome:
-    """Run SIT smoke tests after merge, then apply the MANY-or-SEVERE halt rule.
+    """Run SIT smoke tests, then apply the MANY-or-SEVERE halt rule.
+
+    [ORCH-1] Name retained for its call sites (tests import it by name); since S7-CORE-4 this
+    runs on the route branch BEFORE the merge via run_pre_merge_gates, not after.
 
     Baseline (SIT_KNOWN_FAILING) failures never block. Among NEW failures: a CRITICAL spec
     (SIT_CRITICAL_SPECS) blocks on any 1; non-critical failures block only at SIT_MANY_THRESHOLD
@@ -938,7 +1068,7 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
 
     try:
         r = subprocess.run(
-            sit_cmd, shell=True, capture_output=True, text=True,
+            _gate_shell_cmd(sit_cmd, repo_path), shell=True, capture_output=True, text=True,
             cwd=str(repo_path), timeout=SIT_TIMEOUT
         )
         duration = time.time() - started
@@ -985,7 +1115,8 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path,
                          error_excerpt=error_excerpt)
 
-        return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration)
+        return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration,
+                          output="" if passed else raw[-20000:])
 
     except subprocess.TimeoutExpired:
         duration = time.time() - started
@@ -996,7 +1127,93 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         duration = time.time() - started
         log.warning(f"⚠️  SIT ERROR: {e} — advisory only")
         _log_sit_outcome(archive, repo_path, False, -1, duration, None, error=str(e))
-        return SitOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration)
+        return SitOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e))
+
+
+# ═══════════════════════════════════════════════════════
+# PRE-MERGE GATE RUNNER + F-20 CLASSIFIER (S7-CORE-4 [ORCH-1])
+# ═══════════════════════════════════════════════════════
+def _env_file_keys(path: Optional[Path]) -> set:
+    """Key NAMES declared in a dotenv file. Values are discarded at the split and never
+    logged (canon §23.9d)."""
+    keys = set()
+    if not path or not path.is_file():
+        return keys
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            k = line.split("=", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+                keys.add(k)
+    except OSError:
+        pass
+    return keys
+
+
+def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: int) -> GateVerdict:
+    """PDLC F-20: BLOCKED(environment) vs FAIL(product) for a red gate. Only the F-20 tables
+    decide. The matched token is quoted (≤80 chars); the gate output is never echoed whole."""
+    text = output or ""
+    for sid, rx, desc in _ENV_BLOCK_SIGNALS_RE:
+        m = rx.search(text)
+        if m:
+            return GateVerdict(GateOutcome.BLOCKED_ENV, gate, sid, f"{desc}; matched '{m.group(0)[:80]}'")
+    _, env_path = _gate_env_file(repo_path)
+    keys = _env_file_keys(env_path)
+    for rx in _ENV_VAR_MISSING_RE:
+        for m in rx.finditer(text):
+            var = m.group(1)
+            if var in keys:
+                return GateVerdict(GateOutcome.BLOCKED_ENV, gate, "env-var-unsourced",
+                                   f"gate requires {var}; it is a key in {env_path.name} but did not reach the gate shell")
+    return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}",
+                       "no F-20 environment signal in gate output — product verdict stands")
+
+
+def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> GateVerdict:
+    """Run the repo's PRE_MERGE_GATES on the route branch checked out at repo_path, BEFORE any
+    merge. Returns a three-way GateVerdict: PASS / BLOCKED(environment) / FAIL(product).
+    Callers merge iff outcome is PASS. The pre-existing operator escapes (DISABLE_BUILD_GATE,
+    DISABLE_SIT_BLOCKING, --skip-sit) are honoured inside the gate functions, unchanged."""
+    policy = PRE_MERGE_GATES.get(ACTIVE_REPO_NAME)
+    where = f" on {branch_name}" if branch_name else ""
+    if not policy or not policy.get("gates"):
+        log.info(f"🚪 Pre-merge gate{where}: repo '{ACTIVE_REPO_NAME}' is UNGATED by PRE_MERGE_GATES (explicit) — merge proceeds")
+        return GateVerdict(GateOutcome.PASS, None, None, f"{ACTIVE_REPO_NAME}: ungated by policy")
+
+    env_name, env_path = _gate_env_file(repo_path)
+    if env_name:
+        if env_path.is_file():
+            log.info(f"🔐 Pre-merge gate{where}: {env_name} will be sourced from {repo_path} into the gate shell (values not logged)")
+        else:
+            v = GateVerdict(GateOutcome.BLOCKED_ENV, "env", "env-file-missing", f"{env_path} not found")
+            log.error(f"⛔ Pre-merge gate{where}: {v.label}")
+            return v
+
+    for gate in policy["gates"]:
+        if gate == "build":
+            bg = run_build_gate(repo_path)
+            if not bg.passed:
+                v = _classify_gate_failure("build", bg.output or bg.error or "", repo_path, bg.exit_code)
+                log.error(f"⛔ Pre-merge gate{where}: {v.label}")
+                return v
+        elif gate == "sit":
+            so = run_sit_post_merge(repo_path)
+            if not so.passed:
+                if SIT_BLOCKING:
+                    v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code)
+                    log.error(f"⛔ Pre-merge gate{where}: {v.label}")
+                    return v
+                log.warning("⚠️  SIT red but DISABLE_SIT_BLOCKING is set — advisory (pre-existing operator escape)")
+        else:
+            log.warning(f"⚠️  Unknown gate '{gate}' in PRE_MERGE_GATES — ignored")
+    v = GateVerdict(GateOutcome.PASS, None, None, f"{'+'.join(policy['gates'])} green{where}")
+    log.info(f"✅ Pre-merge gate{where}: {v.label}")
+    return v
 
 
 def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: int,
@@ -1109,10 +1326,17 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
         _clear_running_marker()
         if meta_wt:
             if is_self_mod and meta_branch:
-                if result is not None and result.exit_code == 0:
-                    merged = _self_mod_auto_merge(ORCH_DIR, meta_branch)
+                if result is not None and result.exit_code == 0 and result.status == Status.PASSED:
+                    # [ORCH-1] gate verdict was rendered in _run_batch_inner on the worktree checkout
+                    merged = _self_mod_auto_merge(ORCH_DIR, meta_branch, gate_outcome=result.gate_outcome)
                     if merged:
                         cleanup_worktree(meta_wt)
+                elif result is not None and result.gate_outcome not in (None, GateOutcome.PASS.value):
+                    log.error(
+                        f"⛔ Self-mod merge WITHHELD — {result.gate_outcome}: {result.error}. "
+                        f"Branch preserved: {meta_branch}. Worktree preserved: {meta_wt}. "
+                        f"After review: cd {ORCH_DIR} && git merge --ff-only {meta_branch}"
+                    )
                 else:
                     log.warning(
                         f"Self-mod fire failed; branch preserved: {meta_branch}. "
@@ -1203,6 +1427,8 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
 
     # Auto-commit + merge back to main (D-148)
     no_change_run = False
+    gate_outcome: Optional[str] = None   # [ORCH-1] PASS | BLOCKED(environment) | FAIL(product) | None (gate not run)
+    gate_error: Optional[str] = None     # [ORCH-1] human verdict line (never a secret value)
     if branch_name and worktree is None:
         try:
             if status == Status.PASSED:
@@ -1244,62 +1470,58 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     else:
                         log.info(f"📦 Skipping orchestrator commit — Toni already committed {toni_commits} commit(s)")
 
-                    # Merge back to merge target
-                    pre_merge_tip = subprocess.run(
-                        f"git rev-parse {MERGE_TARGET}",
-                        shell=True, capture_output=True, text=True, cwd=str(proj)
-                    ).stdout.strip()
-                    subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
-                    r = subprocess.run(
-                        f"git merge {branch_name} --no-edit",
-                        shell=True, capture_output=True, text=True, cwd=str(proj)
-                    )
-                    if r.returncode == 0:
-                        post_merge_tip = subprocess.run(
+                    # S7-CORE-4 [ORCH-1]: GATE-THEN-MERGE. Gates run HERE, on the route branch
+                    # (still checked out at proj), BEFORE `git merge`. Red gate ⇒ no merge,
+                    # MERGE_TARGET tip untouched, branch preserved for review.
+                    # (2026-09-09: merge-then-gate let a red sit:gate land on main.)
+                    # Gate set is per-repo via PRE_MERGE_GATES (clinical-mp: build → SIT, S6S47).
+                    verdict = run_pre_merge_gates(proj, branch_name)
+                    gate_outcome = verdict.outcome.value
+                    if verdict.outcome is not GateOutcome.PASS:
+                        gate_error = verdict.label
+                        subprocess.run(
+                            f'git notes add -m "PRE-MERGE GATE: {gate_outcome} — {verdict.gate}: {verdict.signal}"',
+                            shell=True, capture_output=True, cwd=str(proj)
+                        )
+                        status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
+                        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                        log.error(
+                            f"⛔ {gate_outcome} — {MERGE_TARGET} NOT merged. Branch preserved: {branch_name}. "
+                            f"Inspect: cd {proj} && git log --oneline {MERGE_TARGET}..{branch_name} "
+                            f"&& git diff {MERGE_TARGET}...{branch_name}"
+                        )
+                    else:
+                        # Merge back to merge target — green gate only
+                        pre_merge_tip = subprocess.run(
                             f"git rev-parse {MERGE_TARGET}",
                             shell=True, capture_output=True, text=True, cwd=str(proj)
                         ).stdout.strip()
-                        if post_merge_tip == pre_merge_tip and toni_commits > 0:
-                            # OBS-S6S17-02: defense-in-depth — main didn't advance despite
-                            # Toni having made commits. This is the silent-failure mode.
-                            log.error(
-                                f"❌ Merge reported success but {MERGE_TARGET} tip unchanged "
-                                f"({pre_merge_tip[:7]}). Toni had {toni_commits} commit(s) on "
-                                f"{branch_name}. NOT deleting branch — manual recovery needed."
-                            )
-                            status = Status.FAILED
-                        else:
-                            log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET} ({pre_merge_tip[:7]} → {post_merge_tip[:7]})")
-                            # Clean up feature branch
-                            subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
-                        # S6S47 P1 hardening (D-S6S46-B): post-merge gates.
-                        # Order: build gate (tsc+build) → SIT (visual smoke).
-                        # Both BLOCKING: a fail sets Status.FAILED so run_queue
-                        # halt-on-fail stops the queue (no firing onto a broken base).
-                        if ACTIVE_REPO_NAME == "clinical-mp":
-                            # Gate 1: build (catches typecheck/build drift)
-                            bg = run_build_gate(proj)
-                            if not bg.passed:
-                                subprocess.run(
-                                    f'git notes add -m "BUILD GATE: FAILED — exit {bg.exit_code}"',
-                                    shell=True, capture_output=True, cwd=str(proj)
+                        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                        r = subprocess.run(
+                            f"git merge {branch_name} --no-edit",
+                            shell=True, capture_output=True, text=True, cwd=str(proj)
+                        )
+                        if r.returncode == 0:
+                            post_merge_tip = subprocess.run(
+                                f"git rev-parse {MERGE_TARGET}",
+                                shell=True, capture_output=True, text=True, cwd=str(proj)
+                            ).stdout.strip()
+                            if post_merge_tip == pre_merge_tip and toni_commits > 0:
+                                # OBS-S6S17-02: defense-in-depth — main didn't advance despite
+                                # Toni having made commits. This is the silent-failure mode.
+                                log.error(
+                                    f"❌ Merge reported success but {MERGE_TARGET} tip unchanged "
+                                    f"({pre_merge_tip[:7]}). Toni had {toni_commits} commit(s) on "
+                                    f"{branch_name}. NOT deleting branch — manual recovery needed."
                                 )
                                 status = Status.FAILED
-                            # Gate 2: SIT visual smoke — only if build passed
-                            if status == Status.PASSED:
-                                sit_outcome = run_sit_post_merge(proj)
-                                if not sit_outcome.passed:
-                                    label = "BLOCKING" if SIT_BLOCKING else "advisory"
-                                    subprocess.run(
-                                        f'git notes add -m "SIT: FAILED ({label}) — exit {sit_outcome.exit_code}"',
-                                        shell=True, capture_output=True, cwd=str(proj)
-                                    )
-                                    if SIT_BLOCKING:
-                                        log.error("⛔ SIT failed and SIT_BLOCKING — marking batch FAILED")
-                                        status = Status.FAILED
-                    else:
-                        log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
-                        log.error(f"   {r.stderr.strip()}")
+                            else:
+                                log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET} ({pre_merge_tip[:7]} → {post_merge_tip[:7]})")
+                                # Clean up feature branch
+                                subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                        else:
+                            log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
+                            log.error(f"   {r.stderr.strip()}")
                 else:
                     log.warning(
                         "⚠️ Toni produced no changes — skipping commit "
@@ -1316,14 +1538,29 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             log.warning(f"⚠️ Git automation error: {e}")
             # Ensure we're back on merge target
             subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+    elif worktree is not None and IS_META_FIRE and status == Status.PASSED:
+        # S7-CORE-4 [ORCH-1] meta-fire lane: the route branch is the worktree checkout at
+        # `proj`. Gate it HERE so the Result carries the verdict BEFORE run_batch decides
+        # whether to call _self_mod_auto_merge (--ff-only). Red ⇒ run_batch withholds the merge.
+        meta_branch = f"{BRANCH_PREFIX}-{batch_file.stem}"
+        try:
+            verdict = run_pre_merge_gates(proj, meta_branch)
+        except Exception as e:
+            verdict = _classify_gate_failure("build", str(e), proj, -1)
+            log.error(f"⛔ Pre-merge gate raised on {meta_branch}: {e} → {verdict.label}")
+        gate_outcome = verdict.outcome.value
+        if verdict.outcome is not GateOutcome.PASS:
+            gate_error = verdict.label
+            status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
 
+    log.info(f"🏁 FINAL STATUS: {status.value} | gate: {gate_error or gate_outcome or 'not run'}")
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),
         playwright_ok=pw_ok, pw_tests=pw_cnt,
         new_migrations=new_mig, log_file=out_log,
         worktree=str(worktree) if worktree else None,
-        no_changes=no_change_run)
+        no_changes=no_change_run, gate_outcome=gate_outcome, error=gate_error)
     notify(result)
     rate_limiter.record(batch_file.name, len(briefs), dur, status.value)
 
@@ -1357,9 +1594,9 @@ def run_queue(files: list[Path], force: bool = False, skip_deps: bool = False):
         r = run_batch(bf); results.append(r)
         state["completed" if r.status==Status.PASSED else "failed"].append(asdict(r))
         save_state(state)
-        if r.status == Status.FAILED:
+        if r.status in (Status.FAILED, Status.BLOCKED):
             rem = len(files)-i-1
-            if rem: log.error(f"⛔ Queue HALTED — {rem} batches skipped")
+            if rem: log.error(f"⛔ Queue HALTED ({r.gate_outcome or r.status.value}) — {rem} batches skipped")
             break
         if i < len(files)-1:
             log.info(f"Cooldown {TONI_COOLDOWN}s..."); time.sleep(TONI_COOLDOWN)

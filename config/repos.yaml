@@ -14,8 +14,6 @@ repos:
     worktree_base: /home/gkassa/yorsie-toni
     briefs_subdir: yorsie/briefs
     test_cmd: "cd yorsie && npm test"
-    fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: true
 
   ai-foundation:
@@ -28,8 +26,6 @@ repos:
     briefs_subdir: briefs
     test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
     build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
-    fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: false
 
   clinical-mp:
@@ -41,8 +37,6 @@ repos:
     worktree_mode: single-stream
     briefs_subdir: briefs
     test_cmd: "npm test"
-    fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: false
 
   orchestrator:
@@ -54,9 +48,8 @@ repos:
     worktree_mode: single-stream
     meta_fire: true
     briefs_subdir: briefs
-    test_cmd: "pytest 2>/dev/null || echo 'orchestrator has no test suite yet'"
-    fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
+    test_cmd: "pytest -q"
+    build_gate_cmd: "pytest -q"   # AC-ORCH1-09: meta-fire pre-merge gate (PRE_MERGE_GATES in orchestrator.py)
     default: false
 
   # Future repos (scaffolded per S5S37 decision #6, NOT LIVE):
@@ -71,8 +64,6 @@ repos:
     worktree_mode: single-stream
     briefs_subdir: briefs
     test_cmd: "echo 'collateral: no automated suite — acceptance per brief section 7 rendered-UI verification'"
-    fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-fable-5 --effort high "{brief_prompt}"
     default: false
 
   norra:
@@ -85,6 +76,4 @@ repos:
     briefs_subdir: briefs
     test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
     build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
-    fire_command_template: |
-      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
     default: false
