@@ -181,6 +181,12 @@ def parse_repo_from_brief(filepath) -> Optional[str]:
 TIMEOUT_DEFAULT_MIN = 45
 TIMEOUT_HARD_CAP_MIN = 180
 TONI_TIMEOUT = int(os.environ.get("TONI_TIMEOUT_MIN", str(TIMEOUT_DEFAULT_MIN))) * 60
+
+# Executor model/effort (D-S7CORE3-05, S7-CORE-4 [MODEL-1]).
+# Precedence: CLI --model/--effort > env TONI_MODEL/TONI_EFFORT > default.
+# Requires claude-code CLI >= 2.1.251 for claude-fable-5-1.
+TONI_MODEL = os.environ.get("TONI_MODEL", "claude-fable-5-1")
+TONI_EFFORT = os.environ.get("TONI_EFFORT", "high")
 TONI_COOLDOWN = 10
 MAX_PARALLEL = 3
 RUN_PLAYWRIGHT = False
@@ -581,7 +587,7 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         f"cd {project} && "
         f"stdbuf -oL "
         f"claude --dangerously-skip-permissions "
-        f"--model claude-opus-4-8 --effort high "
+        f"--model {TONI_MODEL} --effort {TONI_EFFORT} "
         f'"Read {brief_rel} and execute all briefs in order."'
     )
     # Update running.json with log file path
@@ -1671,6 +1677,8 @@ def main():
     rp.add_argument("--skip-deps", action="store_true", help="Ignore dependency check")
     rp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     rp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
+    rp.add_argument("--model", default="", help="Executor model (default: env TONI_MODEL or claude-fable-5-1)")
+    rp.add_argument("--effort", default="", help="Executor effort (default: env TONI_EFFORT or high)")
 
     qp = sp.add_parser("queue")
     qp.add_argument("batch_files", nargs="+")
@@ -1679,6 +1687,8 @@ def main():
     qp.add_argument("--skip-deps", action="store_true")
     qp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     qp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
+    qp.add_argument("--model", default="", help="Executor model (default: env TONI_MODEL or claude-fable-5-1)")
+    qp.add_argument("--effort", default="", help="Executor effort (default: env TONI_EFFORT or high)")
 
     pp = sp.add_parser("parallel")
     pp.add_argument("batch_files", nargs="+")
@@ -1686,6 +1696,8 @@ def main():
     pp.add_argument("--force", action="store_true")
     pp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     pp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
+    pp.add_argument("--model", default="", help="Executor model (default: env TONI_MODEL or claude-fable-5-1)")
+    pp.add_argument("--effort", default="", help="Executor effort (default: env TONI_EFFORT or high)")
 
     dp = sp.add_parser("deps")
     dp.add_argument("batch_file")
@@ -1722,6 +1734,14 @@ def main():
     global SKIP_SIT
     if getattr(a, 'skip_sit', False):
         SKIP_SIT = True
+
+    # Executor model/effort override (S7-CORE-4 [MODEL-1], D-S7CORE3-05)
+    global TONI_MODEL, TONI_EFFORT
+    if getattr(a, 'model', ''):
+        TONI_MODEL = a.model
+    if getattr(a, 'effort', ''):
+        TONI_EFFORT = a.effort
+    log.info(f"Executor: model={TONI_MODEL} effort={TONI_EFFORT}")
 
     if a.cmd == "run":
         _check_stale_marker()
