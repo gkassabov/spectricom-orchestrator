@@ -48,8 +48,8 @@ repos:
     worktree_mode: single-stream
     meta_fire: true
     briefs_subdir: briefs
-    test_cmd: "pytest -q"
-    build_gate_cmd: "pytest -q"   # AC-ORCH1-09: meta-fire pre-merge gate (PRE_MERGE_GATES in orchestrator.py)
+    test_cmd: "pytest -q tests/"
+    build_gate_cmd: "pytest -q tests/"   # AC-ORCH1-09: meta-fire pre-merge gate (PRE_MERGE_GATES in orchestrator.py)
     default: false
 
   # Future repos (scaffolded per S5S37 decision #6, NOT LIVE):
