@@ -56,5 +56,6 @@ echo "    Logs · Master_Plan(D-165) · Document_Registry · Pending_Canon_Updat
 echo "    Bug Registries (SCA/Yorsie/Mini-Me) ONLY if bugs found/closed this session"
 echo
 echo "--- 4. GEORGE-ONLY status (not in git; Gemma must ASK at EOS) ---"
-echo "    Advisor outreach (Guarente / MH+son)? · Dr. K validation scheduled? · push->origin go/hold? · Drive OAuth done?"
+echo "    Dr. K validation scheduled? · push->origin go/hold?"
+echo "    [MUTED per George S6S67 — do NOT surface until George raises: Advisor outreach (Guarente / MH+son) · Drive OAuth]"
 echo "=============================================================================="

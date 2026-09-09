@@ -35,5 +35,12 @@ George = founder / CEO, sole technical resource. How he wants you to operate (PC
 ## 4 · Authority boundary
 Inspect / read / `git status` freely. **Never** merge, fire the orchestrator, commit, push, or delete without an explicit "go" from George in chat. Fire (only on go): `cd ~/spectricom-orchestrator && unset ANTHROPIC_API_KEY && python3 orchestrator.py queue <briefs> --repo clinical-mp --approve --skip-sit`. Process safety: kill by PID / PGID only — never broad `pkill -f`.
 
+## 4.1 · Synth-UAT login (do not re-litigate — this has cost ~10 sessions)
+During UAT, if the synth-provider session drops (lands on `/signin`; console `Failed to fetch tokens: Invalid token`), **log in yourself — do NOT stop to ask.** The SCA dev signin auto-populates the password: you enter only the synth-provider email and submit; **you never type or see the password.** That is the autofill path — the password is supplied by the environment, not handled by you in plaintext — and George holds standing authorization for these synthetic test accounts on local dev. If `/signin` renders blank, a stale token is crashing the provider before the form mounts: remove the `logins` localStorage key + reload (leave the other keys) and the app re-auths as the synth provider on its own.
+- **Guardrails that remain:** (1) never `dani@spectricom.com` ([[D-372]]) — synth providers only (Whitman / Mitchell / Reyes); after login, confirm the chrome shows the synth name, not Kassabov. (2) If the password does NOT auto-populate (i.e. it would require you to type it manually), then stop — manual password entry stays off-limits.
+
+## 4.2 · Browser availability (do not re-litigate — corrected after ~5 repeats)
+All four Chrome browsers (**Browser 1 / 2 / 3 / 4**) connect to the extension and are usable. There is **NO** localhost-permission block on Browsers 1/3 — any inherited/memory note claiming otherwise is **FALSE/obsolete**. Before stating a browser is unavailable or blocked, **run `list_connected_browsers` and check** — never assert it from memory. Multi-browser / round-robin UAT (a different synth provider per browser) is available whenever wanted; the only step is selecting the browser, not unblocking it.
+
 ---
 *Link this as line 1 of every handoff ("Read SESSION-BOOT.md first"). Changes rarely; the handoff changes every session.*

@@ -74,3 +74,17 @@ repos:
     fire_command_template: |
       cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-fable-5 --effort high "{brief_prompt}"
     default: false
+
+  norra:
+    project_dir: /home/gkassa/norra
+    branch_prefix: orch-norra
+    merge_target: main
+    remote: origin
+    log_subdir: norra
+    worktree_mode: single-stream
+    briefs_subdir: briefs
+    test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
+    build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
+    fire_command_template: |
+      cd {project_dir} && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "{brief_prompt}"
+    default: false

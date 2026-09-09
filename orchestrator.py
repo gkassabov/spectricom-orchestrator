@@ -926,7 +926,7 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
 
     # Playwright config uses env var NO_AUTO_SPAWN (not a CLI flag); with
     # reuseExistingServer: true, no orchestrator-side suppression needed.
-    sit_cmd = "npm run sit:smoke"
+    sit_cmd = "npm run sit:gate"  # S6S78: deterministic headless T1 (vitest); exit-code = pass/fail
     log.info(f"🧪 Running SIT post-merge: {sit_cmd}")
     started = time.time()
 
@@ -941,40 +941,18 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         # from playwright output; if every failing spec is in SIT_KNOWN_FAILING,
         # treat as pass-with-known-failures.
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
-        import re as _re
-        failing_specs = set()
-        for m in _re.finditer(r"✘\s+\d+\s+\[[^\]]*\]\s+›\s+(\S+\.spec\.ts)", raw):
-            failing_specs.add(Path(m.group(1)).stem.replace(".spec", ""))
-        new_failures = {s for s in failing_specs
-                        if not any(k in s for k in SIT_KNOWN_FAILING)}
-        # S6S72 MANY-or-SEVERE threshold.
-        new_critical = {s for s in new_failures
-                        if any(c in s for c in SIT_CRITICAL_SPECS)}
-        new_noncritical = new_failures - new_critical
-        if r.returncode == 0:
-            passed = True
-        elif not failing_specs:
-            # exit!=0 but no spec failures parsed (crash / format drift / infra) — advisory.
-            passed = True
-            log.error(f"🟠 SIT exited {r.returncode} but parsed NO failing specs — "
-                      f"ADVISORY (not blocking); surfacing for review.")
-        elif new_critical:
-            passed = False
-            log.error(f"⛔ SIT CRITICAL new failure(s) — BLOCKING: {', '.join(sorted(new_critical))}")
-        elif len(new_noncritical) >= SIT_MANY_THRESHOLD:
-            passed = False
-            log.error(f"⛔ SIT {len(new_noncritical)} new non-critical failures >= "
-                      f"{SIT_MANY_THRESHOLD} — BLOCKING: {', '.join(sorted(new_noncritical))}")
+        # S6S78: sit:gate is the deterministic headless T1 (vitest). Pass/fail is
+        # exit-code based — a nonzero exit is a real regression and BLOCKS. The old
+        # Playwright spec-name / known-failing / critical parsing does NOT apply to
+        # the vitest gate (its failure format differs); relying on it here would
+        # mis-read a real vitest failure as "no specs parsed -> advisory" and
+        # silently pass. (When T2 browser smoke lands in sit:gate, revisit whether
+        # any tier warrants a retry/known-failing carve-out.)
+        passed = (r.returncode == 0)
+        if passed:
+            log.info(f"✅ SIT gate PASSED ({sit_cmd})")
         else:
-            passed = True
-            _baseline_hit = failing_specs - new_failures
-            _bits = []
-            if _baseline_hit:
-                _bits.append(f"{len(_baseline_hit)} baseline ({', '.join(sorted(_baseline_hit))})")
-            if new_noncritical:
-                _bits.append(f"{len(new_noncritical)} new non-critical < {SIT_MANY_THRESHOLD} "
-                             f"({', '.join(sorted(new_noncritical))})")
-            log.warning(f"🟡 SIT: {'; '.join(_bits) or 'failures present'} — NOT blocking (under threshold)")
+            log.error(f"⛔ SIT gate FAILED (exit {r.returncode}) — BLOCKING.\n{raw[-800:]}")
 
         # Archive SIT report if it exists
         report_path = None

@@ -45,3 +45,20 @@ output/
 # OS
 .DS_Store
 Thumbs.db
+
+# ── S7-CORE-4 additions ──────────────────────────────────────────
+# Backup files: `*.bak` above missed `-bak` and `.bak-<suffix>` forms
+*-bak
+*.bak-*
+
+# Stale doc copies (SESSION-BOOT §2: session-docs/ = STALE copies only)
+session-docs/
+
+# Per-session run drivers + one-off fire scripts (regenerated)
+_drivers/
+fire-*.sh
+s6s*-fire-*.sh
+zadar-queue-*.sh
+
+# Queue runtime state (done/failed markers)
+queue/

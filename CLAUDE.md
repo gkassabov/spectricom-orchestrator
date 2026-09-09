@@ -11,12 +11,11 @@ Direct Anthropic API calls. No CLI subprocess driving. No frameworks (LangGraph,
 Tasks are YAML files in `queue/tasks/`. The orchestrator reads them, runs Toni in a loop, escalates questions to Gemma, and writes output + logs.
 
 ## Key Rules
-- Model: `claude-sonnet-4-20250514` for both agents
-- No PHI storage — all patient data stays in Akute Health
-- No hardcoded API keys — use `.env`
+Shared rules: `~/SPECTRICOM-SHARED-RULES.md` (product) and `Common\SHARED-RULES-v1-0.md` (universal). Not restated here.
+
+- **Model:** see product shared rules §1. **UNRATIFIED — this repo currently pins two different models**: `claude-opus-4-8` in `orchestrator.py` and `config/repos.yaml`, `claude-sonnet-4-20250514` in `agents/toni.py`, `agents/gemma.py`, `loop/executor.py`. One is unintended. Do not change either without owner instruction.
+- **Token caps:** product shared rules §2. Referenced by constant name, never inline.
 - Sync API calls, sequential task execution
-- Max 4096 tokens per Toni call, 1024 per Gemma call
-- Max 50,000 tokens per task before marking blocked
 
 ## Running
 ```bash
