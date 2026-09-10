@@ -29,6 +29,11 @@ from enum import Enum
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
+
+# HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
+PREFIRE_BYPASS = False
+
 # ═══════════════════════════════════════════════════════
 # AUTH GUARD (D-184 / memory #24) — Toni MUST run on Max OAuth, never API.
 # ═══════════════════════════════════════════════════════
@@ -1284,6 +1289,14 @@ def sit_report_aggregate(since: Optional[str] = None):
 # BATCH RUNNER
 # ═══════════════════════════════════════════════════════
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
+    # HOOK-1 / D-S7CORE4-02 — assertions checked at the moment of action.
+    if not PREFIRE_BYPASS and not prefire.report(batch_file):
+        log.error('Pre-fire assertions FAILED - not firing %s' % batch_file.name)
+        _now = datetime.now().isoformat()
+        return Result(batch_file=batch_file.name, status=Status.FAILED,
+                      started=_now, finished=_now, duration_s=0.0,
+                      exit_code=2, briefs=0,
+                      error='pre-fire assertions failed (A2/A8) — HOOK-1')
     meta_wt = None
     meta_branch = None
     is_self_mod = IS_META_FIRE and (PROJECT_ROOT.resolve() == ORCH_DIR)
@@ -1966,6 +1979,12 @@ def main():
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
+
+    # HOOK-1: --force is the single documented bypass for the assertions.
+    global PREFIRE_BYPASS
+    if getattr(a, 'force', False):
+        PREFIRE_BYPASS = True
+        log.warning('--force: pre-fire assertions (A2/A8) BYPASSED')
 
     # Apply --skip-sit globally before any command runs
     global SKIP_SIT
