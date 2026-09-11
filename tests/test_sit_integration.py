@@ -94,8 +94,13 @@ class TestRunSitPostMerge:
             assert outcome.error == "timeout-advisory"
 
     @patch('subprocess.run')
-    def test_sit_noncritical_under_threshold_advisory(self, mock_run):
-        """Fewer than SIT_MANY_THRESHOLD new non-critical failures -> advisory (passed=True)."""
+    def test_sit_noncritical_failures_block(self, mock_run):
+        """Two non-critical spec failures on a non-zero exit -> blocks (passed=False).
+
+        Rewritten under [ORCH-1] / 448e0c4: passed is exit-code based, so the old
+        "under SIT_MANY_THRESHOLD -> advisory" rule no longer applies. The input shape
+        (a few non-critical failures) is kept to pin that it now blocks.
+        """
         out = ("  \u2718  1 [chromium] \u203a 02-patient-flow.spec.ts \u203a a\n"
                "  \u2718  2 [chromium] \u203a chart-tab-scroll.spec.ts \u203a b\n")
         mock_run.return_value = MagicMock(returncode=1, stdout=out, stderr='')
@@ -106,11 +111,17 @@ class TestRunSitPostMerge:
             import orchestrator
             orchestrator.SKIP_SIT = False
             outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
-            assert outcome.passed is True
+            assert outcome.passed is False
+            assert outcome.exit_code == 1
 
     @patch('subprocess.run')
     def test_sit_many_noncritical_blocks(self, mock_run):
-        """SIT_MANY_THRESHOLD+ new non-critical failures -> blocks (passed=False)."""
+        """Three non-critical spec failures on a non-zero exit -> blocks (passed=False).
+
+        Since [ORCH-1] / 448e0c4 this blocks because exit != 0, not because a count
+        reached SIT_MANY_THRESHOLD (that threshold is no longer consulted). Kept for
+        the multi-failure input shape.
+        """
         out = ("  \u2718  1 [chromium] \u203a 02-patient-flow.spec.ts \u203a a\n"
                "  \u2718  2 [chromium] \u203a chart-tab-scroll.spec.ts \u203a b\n"
                "  \u2718  3 [chromium] \u203a inbox-data-flow.spec.ts \u203a c\n")
@@ -125,8 +136,12 @@ class TestRunSitPostMerge:
             assert outcome.passed is False
 
     @patch('subprocess.run')
-    def test_sit_baseline_only_advisory(self, mock_run):
-        """Only baseline (known-failing) specs fail -> advisory (passed=True)."""
+    def test_sit_baseline_only_failures_block(self, mock_run):
+        """Only a baseline (SIT_KNOWN_FAILING) spec fails, exit 1 -> blocks (passed=False).
+
+        Rewritten under [ORCH-1] / 448e0c4: the vitest gate is exit-code based and no
+        known-failing carve-out is applied, so a baseline-only failure still blocks.
+        """
         out = "  \u2718  1 [chromium] \u203a home-count-parity.spec.ts \u203a a\n"
         mock_run.return_value = MagicMock(returncode=1, stdout=out, stderr='')
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -136,11 +151,17 @@ class TestRunSitPostMerge:
             import orchestrator
             orchestrator.SKIP_SIT = False
             outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
-            assert outcome.passed is True
+            assert outcome.passed is False
+            assert outcome.exit_code == 1
 
     @patch('subprocess.run')
-    def test_sit_parse_miss_advisory(self, mock_run):
-        """exit!=0 but no parseable spec failures -> advisory (passed=True), not a false block."""
+    def test_sit_unparseable_failure_blocks(self, mock_run):
+        """exit!=0 with no parseable spec names -> blocks (passed=False).
+
+        Rewritten under [ORCH-1] / 448e0c4: spec-name parsing is not consulted, so
+        unparseable output cannot downgrade a real failure to advisory. This is the
+        exact silent-pass mode the exit-code contract exists to prevent.
+        """
         mock_run.return_value = MagicMock(returncode=1, stdout='FAILED: 2 specs', stderr='')
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_path = Path(tmpdir)
@@ -149,7 +170,8 @@ class TestRunSitPostMerge:
             import orchestrator
             orchestrator.SKIP_SIT = False
             outcome = orchestrator.run_sit_post_merge(repo_path, archive_path)
-            assert outcome.passed is True
+            assert outcome.passed is False
+            assert outcome.exit_code == 1
 
 
 class TestSitLogOutcome:
