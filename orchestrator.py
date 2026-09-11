@@ -202,6 +202,11 @@ SIT_BLOCKING = os.environ.get("DISABLE_SIT_BLOCKING", "") == ""
 BUILD_GATE_CMD = "npx tsc --noEmit && npm run build"
 BUILD_GATE_TIMEOUT = 600  # 10 min
 SIT_TIMEOUT = 600  # S6S47: 300 was too tight for full smoke suite w/ 4 workers
+# S7-CORE-7 [ORCH-2] / D-S7CORE6-05: the thin-gate floor is configuration, not a literal.
+# Unset ⇒ no floor, no warning; only the collected counts are reported. Zero-collection
+# blocking (§4.5) is independent of this floor and always on.
+_sit_min_raw = os.environ.get("SIT_MIN_TEST_FILES", "").strip()
+SIT_MIN_TEST_FILES: Optional[int] = int(_sit_min_raw) if _sit_min_raw.isdigit() else None
 # S6S47: SIT blocks only on NEW failures vs this known-failing baseline.
 # These are pre-existing tracked bugs (verified failing on 632b236 pre-PCFG),
 # so they must NOT cause every brief's gate to false-FAIL. Remove an ID here
@@ -309,6 +314,7 @@ class GateVerdict:
     gate: Optional[str] = None      # "build" | "sit" | "env" | None (ungated / all green)
     signal: Optional[str] = None    # F-20 signal id, or a short product reason
     detail: Optional[str] = None    # what triggered it — never a secret value
+    collection: Optional[str] = None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed; None otherwise
 
     @property
     def label(self) -> str:
@@ -341,6 +347,7 @@ class Result:
     error: Optional[str]=None; log_file: Optional[str]=None
     worktree: Optional[str]=None; no_changes: bool=False
     gate_outcome: Optional[str]=None  # [ORCH-1] PASS | BLOCKED(environment) | FAIL(product) | None (gate not run)
+    gate_collection: Optional[str]=None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed; None otherwise
 
 # ═══════════════════════════════════════════════════════
 # LOGGING
@@ -738,12 +745,19 @@ def run_playwright() -> tuple[bool, int]:
     except Exception as e:
         log.error(f"Playwright error: {e}"); return False, 0
 
+def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
+                       gate_collection: Optional[str]) -> str:
+    """[ORCH-2] `PASS (7 files/18 tests, 6.6s)` when the SIT summary parsed; the prior wording
+    (`PASS` / verdict label / `not run`) when it did not."""
+    s = gate_error or gate_outcome or "not run"
+    return f"{s} ({gate_collection})" if gate_collection else s
+
 def notify(result: Result):
     e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else "❌")
     status_label = "passed (no changes)" if result.no_changes else result.status.value
     msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
     if result.gate_outcome:
-        msg += f" | gate: {result.gate_outcome}"
+        msg += f" | gate: {_gate_status_label(None, result.gate_outcome, result.gate_collection)}"
     if result.error:
         msg += f"\n  {result.error}"
     if result.playwright_ok is not None:
@@ -1045,6 +1059,67 @@ class SitOutcome:
     error: Optional[str] = None
     duration_s: float = 0.0
     output: str = ""  # [ORCH-1] combined stdout+stderr tail for F-20 classification (never logged whole)
+    # [ORCH-2] what the gate collected, parsed from the vitest summary already in its output.
+    # None = summary not parsed. NEVER 0 for "unknown" — 0 is a real, blocking, empty collection.
+    test_files_total: Optional[int] = None
+    test_files_passed: Optional[int] = None
+    tests_total: Optional[int] = None
+    tests_passed: Optional[int] = None
+
+    @property
+    def collection(self) -> Optional[str]:
+        """`7 files/18 tests, 6.6s` for FINAL STATUS / batch summary; None when nothing parsed."""
+        if self.test_files_total is None and self.tests_total is None:
+            return None
+        f = "?" if self.test_files_total is None else self.test_files_total
+        t = "?" if self.tests_total is None else self.tests_total
+        return f"{f} files/{t} tests, {self.duration_s:.1f}s"
+
+
+# [ORCH-2] vitest summary as the SIT gate prints it (captured 2026-09-11 from clinical-mp, tests/fixtures/):
+#      Test Files  7 passed (7)
+#           Tests  18 passed (18)
+# Mixed shape: `Test Files  2 failed | 5 passed (7)`. Tolerant of ANSI colour and leading space.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_VITEST_SUMMARY_RE = {
+    "test_files": re.compile(r"^\s*Test Files\s+(.+?)\s*$", re.MULTILINE),
+    "tests": re.compile(r"^\s*Tests\s+(.+?)\s*$", re.MULTILINE),
+}
+_VITEST_TOTAL_RE = re.compile(r"\((\d+)\)\s*$")
+_VITEST_PASSED_RE = re.compile(r"(\d+) passed\b")
+_VITEST_NO_FILES_RE = re.compile(r"^\s*No test files found", re.MULTILINE)
+
+
+def _parse_vitest_summary(raw: str) -> dict:
+    """[ORCH-2] The four collection counts from the vitest summary already in `raw`. Parse,
+    never re-run. Absent / unrecognised ⇒ None, NEVER 0: a fabricated 0 would trip the
+    zero-collection block and turn a reporting gap into a false BLOCKED."""
+    out = {"test_files_total": None, "test_files_passed": None, "tests_total": None, "tests_passed": None}
+    text = _ANSI_RE.sub("", raw or "")
+    for key, rx in _VITEST_SUMMARY_RE.items():
+        for m in rx.finditer(text):  # last match wins — the summary block is at the end
+            t = _VITEST_TOTAL_RE.search(m.group(1))
+            if not t:
+                continue
+            p = _VITEST_PASSED_RE.search(m.group(1))
+            out[f"{key}_total"] = int(t.group(1))
+            out[f"{key}_passed"] = int(p.group(1)) if p else 0  # line parsed; no "passed" segment ⇒ none passed
+    if out["test_files_total"] is None and _VITEST_NO_FILES_RE.search(text):
+        # vitest's explicit empty run ("No test files found, exiting with code 0" under passWithNoTests)
+        out.update(test_files_total=0, test_files_passed=0, tests_total=0, tests_passed=0)
+    return out
+
+
+def _describe_collection(c: dict) -> str:
+    """Run-log wording: `collected 7 test files / 18 tests` or `collection unknown (summary not parsed)`."""
+    if c["test_files_total"] is None and c["tests_total"] is None:
+        return "collection unknown (summary not parsed)"
+    f = "?" if c["test_files_total"] is None else c["test_files_total"]
+    t = "?" if c["tests_total"] is None else c["tests_total"]
+    s = f"collected {f} test files / {t} tests"
+    if c["tests_passed"] is not None and c["tests_passed"] != c["tests_total"]:
+        s += f" ({c['tests_passed']} passed)"
+    return s
 
 
 def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> SitOutcome:
@@ -1090,10 +1165,25 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         # silently pass. (When T2 browser smoke lands in sit:gate, revisit whether
         # any tier warrants a retry/known-failing carve-out.)
         passed = (r.returncode == 0)
-        if passed:
-            log.info(f"✅ SIT gate PASSED ({sit_cmd})")
+        # S7-CORE-7 [ORCH-2]: declare what the gate collected. Parsed from `raw` — the summary is
+        # already in hand; nothing is re-run. (2026-09-10: a 2.3s PASS over a directory holding two
+        # unrelated files promoted three Longevity capabilities. A gate must say what it tested.)
+        counts = _parse_vitest_summary(raw)
+        collection = _describe_collection(counts)
+        error = None
+        if passed and (counts["test_files_total"] == 0 or counts["tests_total"] == 0):
+            # §4.5: green exit over an empty collection tested nothing. Environment, never product.
+            passed, error = False, "zero-collection"
+            log.error(f"⛔ SIT gate collected NOTHING — treating as BLOCKED(environment), not PASS "
+                      f"(exit 0, {collection}, {duration:.1f}s)")
+        elif passed:
+            log.info(f"🧪 SIT gate: PASS — {collection} in {duration:.1f}s")
         else:
-            log.error(f"⛔ SIT gate FAILED (exit {r.returncode}) — BLOCKING.\n{raw[-800:]}")
+            log.error(f"⛔ SIT gate FAILED (exit {r.returncode}) — {collection} — BLOCKING.\n{raw[-800:]}")
+        if (SIT_MIN_TEST_FILES is not None and counts["test_files_total"] is not None
+                and counts["test_files_total"] < SIT_MIN_TEST_FILES):
+            # §4.6: warning only, never blocking
+            log.warning(f"⚠️  SIT gate thin: {counts['test_files_total']} test files (floor {SIT_MIN_TEST_FILES})")
 
         # Archive SIT report if it exists
         report_path = None
@@ -1108,20 +1198,19 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
                 log.info(f"📋 SIT report archived: {dest.name}")
 
         error_excerpt = None
-        if passed:
-            log.info(f"✅ SIT PASSED ({duration:.1f}s)")
-        else:
-            log.warning(f"⚠️  SIT FAILED (exit {r.returncode}, {duration:.1f}s) — advisory only, not blocking merge")
+        if not passed:
+            # [ORCH-1] since 448e0c4 a red gate blocks the merge (gate-then-merge); wording fixed in [ORCH-2]
+            log.warning(f"⛔ SIT {error or 'FAILED'} (exit {r.returncode}, {duration:.1f}s) — BLOCKING merge")
             if r.stdout:
                 log.warning(f"   stdout: {r.stdout[-500:]}")
             error_excerpt = (r.stderr or r.stdout or "")[-1000:].strip() or None
 
         # Log to orchestrator-sit-log.json
         _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path,
-                         error_excerpt=error_excerpt)
+                         error=error, error_excerpt=error_excerpt, **counts)
 
         return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration,
-                          output="" if passed else raw[-20000:])
+                          error=error, output="" if passed else raw[-20000:], **counts)
 
     except subprocess.TimeoutExpired:
         duration = time.time() - started
@@ -1199,6 +1288,7 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
             log.error(f"⛔ Pre-merge gate{where}: {v.label}")
             return v
 
+    sit_collection: Optional[str] = None  # [ORCH-2]
     for gate in policy["gates"]:
         if gate == "build":
             bg = run_build_gate(repo_path)
@@ -1208,23 +1298,37 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                 return v
         elif gate == "sit":
             so = run_sit_post_merge(repo_path)
+            sit_collection = so.collection
             if not so.passed:
                 if SIT_BLOCKING:
-                    v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code)
+                    if so.error == "zero-collection":
+                        # [ORCH-2] §4.5: exit 0 over an empty collection — nothing was tested.
+                        # Environment (F-20 / §23.9d handling), never product, never a pass.
+                        v = GateVerdict(GateOutcome.BLOCKED_ENV, "sit", "zero-collection",
+                                        f"exit 0 over an empty collection ({so.collection}) — nothing was tested",
+                                        collection=sit_collection)
+                    else:
+                        v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code)
+                        v.collection = sit_collection
                     log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                     return v
                 log.warning("⚠️  SIT red but DISABLE_SIT_BLOCKING is set — advisory (pre-existing operator escape)")
         else:
             log.warning(f"⚠️  Unknown gate '{gate}' in PRE_MERGE_GATES — ignored")
-    v = GateVerdict(GateOutcome.PASS, None, None, f"{'+'.join(policy['gates'])} green{where}")
+    v = GateVerdict(GateOutcome.PASS, None, None, f"{'+'.join(policy['gates'])} green{where}",
+                    collection=sit_collection)
     log.info(f"✅ Pre-merge gate{where}: {v.label}")
     return v
 
 
 def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: int,
                      duration: float, report_path: Optional[str], error: Optional[str] = None,
-                     error_excerpt: Optional[str] = None):
-    """Append SIT outcome to orchestrator-sit-log.json."""
+                     error_excerpt: Optional[str] = None,
+                     test_files_total: Optional[int] = None, test_files_passed: Optional[int] = None,
+                     tests_total: Optional[int] = None, tests_passed: Optional[int] = None):
+    """Append SIT outcome to orchestrator-sit-log.json. [ORCH-2] carries the four collection
+    counts (null when the summary did not parse) so "was the gate ever thin?" is answerable
+    historically. Old-shape entries without them still load."""
     log_file = archive / "orchestrator-sit-log.json"
     entries = []
     if log_file.exists():
@@ -1241,6 +1345,10 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
         "duration_s": round(duration, 2),
         "report_path": report_path,
         "error": error,
+        "test_files_total": test_files_total,
+        "test_files_passed": test_files_passed,
+        "tests_total": tests_total,
+        "tests_passed": tests_passed,
     }
     if error_excerpt is not None:
         entry["error_excerpt"] = error_excerpt
@@ -1442,6 +1550,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     no_change_run = False
     gate_outcome: Optional[str] = None   # [ORCH-1] PASS | BLOCKED(environment) | FAIL(product) | None (gate not run)
     gate_error: Optional[str] = None     # [ORCH-1] human verdict line (never a secret value)
+    gate_collection: Optional[str] = None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed
     if branch_name and worktree is None:
         try:
             if status == Status.PASSED:
@@ -1490,6 +1599,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     # Gate set is per-repo via PRE_MERGE_GATES (clinical-mp: build → SIT, S6S47).
                     verdict = run_pre_merge_gates(proj, branch_name)
                     gate_outcome = verdict.outcome.value
+                    gate_collection = verdict.collection
                     if verdict.outcome is not GateOutcome.PASS:
                         gate_error = verdict.label
                         subprocess.run(
@@ -1562,18 +1672,19 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             verdict = _classify_gate_failure("build", str(e), proj, -1)
             log.error(f"⛔ Pre-merge gate raised on {meta_branch}: {e} → {verdict.label}")
         gate_outcome = verdict.outcome.value
+        gate_collection = verdict.collection
         if verdict.outcome is not GateOutcome.PASS:
             gate_error = verdict.label
             status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
 
-    log.info(f"🏁 FINAL STATUS: {status.value} | gate: {gate_error or gate_outcome or 'not run'}")
+    log.info(f"🏁 FINAL STATUS: {status.value} | gate: {_gate_status_label(gate_error, gate_outcome, gate_collection)}")
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),
         playwright_ok=pw_ok, pw_tests=pw_cnt,
         new_migrations=new_mig, log_file=out_log,
         worktree=str(worktree) if worktree else None,
-        no_changes=no_change_run, gate_outcome=gate_outcome, error=gate_error)
+        no_changes=no_change_run, gate_outcome=gate_outcome, gate_collection=gate_collection, error=gate_error)
     notify(result)
     rate_limiter.record(batch_file.name, len(briefs), dur, status.value)
 
