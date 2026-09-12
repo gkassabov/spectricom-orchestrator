@@ -21,7 +21,7 @@ Batch-level dependencies:
   Add to batch file header:  # depends_on_batches: [toni-batch-31.md, toni-batch-30.md]
 """
 
-import os, sys, re, time, json, signal, logging, hashlib, subprocess, argparse
+import os, sys, re, time, json, shlex, signal, logging, hashlib, subprocess, argparse, tempfile
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
@@ -236,6 +236,37 @@ SIT_MANY_THRESHOLD = 3  # >= this many NEW non-critical failures halts a batch (
 SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
 
 # ═══════════════════════════════════════════════════════
+# UNIT SUITE BASELINE GATE (S7-CORE-8 [ORCH-3])
+# George ruling 2026-09-12 (PCU v1-133 ruling 2): the unit suite gates a merge as a
+# BASELINE gate, not a zero gate. Halt only when the branch is WORSE than the commit it
+# forked from. A zero gate would block every merge behind pre-existing reds; a baseline
+# gate stops the NEXT red entering while known debt is repaired.
+# Root cause it addresses: eleven unit tests across six files under clinical-mp
+# src/lib/synth/ were RED through at least two merges and nothing noticed, because
+# NEITHER existing gate runs the unit suite — sit:gate covers sit/integration/** and the
+# build gate runs tsc + build. Those were the seeds T2 synth UAT runs on.
+# ═══════════════════════════════════════════════════════
+UNIT_GATE_ENABLED = os.environ.get("DISABLE_UNIT_GATE", "") == ""  # emergency bypass, mirrors DISABLE_BUILD_GATE
+UNIT_GATE_TIMEOUT = 900  # 15 min. Slowest gate; §2.6 runs it last, only if build and SIT are green.
+# §2.2: the baseline is MEASURED on the MERGE BASE — never stored, never read off main's
+# current tip. A stored number goes stale and becomes a lie; the `test_cmd` key in
+# repos.yaml that sat unconsumed through this whole incident is the cautionary precedent.
+# It is measured in a DETACHED worktree so a concurrently-running route in the target repo
+# keeps its working tree and its branch untouched (brief §4 STOP trigger 1).
+UNIT_BASELINE_WORKTREE_PREFIX = "orch-unit-baseline-"
+# A fresh detached worktree has no installed dependencies, so the baseline would fail for
+# reasons that have nothing to do with the code. These git-ignored paths are symlinked in
+# from the gated checkout so both sides run the same suite. Read-only use — a concurrent
+# route sharing them is unaffected. The repo's declared env_file (PRE_MERGE_GATES) is
+# linked too; its NAME is used, its values are never read or logged (canon §23.9d).
+UNIT_BASELINE_LINK_PATHS = ("node_modules", "venv", ".venv", "yorsie/node_modules")
+# A fully-green branch cannot be a regression against ANY baseline: 0 > n is false for
+# every n >= 0, and an empty failing-file set cannot contain a newly-failing file. So the
+# baseline run is skipped in that case and the gate costs one suite run, not two.
+# Set False to always measure both sides.
+UNIT_GATE_SKIP_BASELINE_WHEN_GREEN = True
+
+# ═══════════════════════════════════════════════════════
 # PRE-MERGE GATE POLICY (S7-CORE-4 [ORCH-1] — gate-then-merge)
 # Gates run ON THE ROUTE BRANCH, BEFORE the merge to MERGE_TARGET. A red gate leaves
 # the branch unmerged and MERGE_TARGET untouched. (2026-09-09 incident: merge-then-gate
@@ -248,6 +279,9 @@ SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
 #   env_file : dotenv sourced via GATE_ENV_SOURCE in the gate shell, cwd = repo root,
 #              values never logged (canon §23.9d). Declared-but-missing ⇒ BLOCKED(environment).
 #              None ⇒ no sourcing and no requirement.
+# The S7-CORE-8 [ORCH-3] unit baseline gate is deliberately NOT listed here: per that
+# ruling's §2.3 its eligibility is DERIVED from each repo's `test_cmd` in config/repos.yaml
+# (run_pre_merge_gates → run_unit_gate), so it covers repos with no entry in this table too.
 PRE_MERGE_GATES = {
     # S6S47 / D-S6S46-B: build (tsc+build) then SIT (npm run sit:gate). Same set as before;
     # only the execution point moved (pre-merge).
@@ -315,6 +349,7 @@ class GateVerdict:
     signal: Optional[str] = None    # F-20 signal id, or a short product reason
     detail: Optional[str] = None    # what triggered it — never a secret value
     collection: Optional[str] = None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed; None otherwise
+    unit_collection: Optional[str] = None  # [ORCH-3] both sides of the unit baseline; None when the unit gate did not run
 
     @property
     def label(self) -> str:
@@ -348,6 +383,7 @@ class Result:
     worktree: Optional[str]=None; no_changes: bool=False
     gate_outcome: Optional[str]=None  # [ORCH-1] PASS | BLOCKED(environment) | FAIL(product) | None (gate not run)
     gate_collection: Optional[str]=None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed; None otherwise
+    unit_collection: Optional[str]=None  # [ORCH-3] "baseline merge-base abc1234: ... → branch ...", None when the unit gate did not run
 
 # ═══════════════════════════════════════════════════════
 # LOGGING
@@ -746,18 +782,23 @@ def run_playwright() -> tuple[bool, int]:
         log.error(f"Playwright error: {e}"); return False, 0
 
 def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
-                       gate_collection: Optional[str]) -> str:
+                       gate_collection: Optional[str], unit_collection: Optional[str] = None) -> str:
     """[ORCH-2] `PASS (7 files/18 tests, 6.6s)` when the SIT summary parsed; the prior wording
-    (`PASS` / verdict label / `not run`) when it did not."""
+    (`PASS` / verdict label / `not run`) when it did not.
+    [ORCH-3] appends ` | unit: <baseline> → <branch>` when the unit baseline gate ran."""
     s = gate_error or gate_outcome or "not run"
-    return f"{s} ({gate_collection})" if gate_collection else s
+    if gate_collection:
+        s = f"{s} ({gate_collection})"
+    if unit_collection:
+        s = f"{s} | unit: {unit_collection}"
+    return s
 
 def notify(result: Result):
     e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else "❌")
     status_label = "passed (no changes)" if result.no_changes else result.status.value
     msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
     if result.gate_outcome:
-        msg += f" | gate: {_gate_status_label(None, result.gate_outcome, result.gate_collection)}"
+        msg += f" | gate: {_gate_status_label(None, result.gate_outcome, result.gate_collection, result.unit_collection)}"
     if result.error:
         msg += f"\n  {result.error}"
     if result.playwright_ok is not None:
@@ -1225,6 +1266,424 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
 
 
 # ═══════════════════════════════════════════════════════
+# UNIT SUITE BASELINE GATE (S7-CORE-8 [ORCH-3])
+# Runs the repo's `test_cmd` (config/repos.yaml) on the route branch AND on the merge base,
+# and halts only on a REGRESSION: more failures than the baseline, or a test FILE that is
+# failing now and was not failing at the fork point. Added ALONGSIDE run_build_gate and the
+# SIT block — neither is touched (brief §4 STOP trigger 3).
+# ═══════════════════════════════════════════════════════
+@dataclass
+class UnitSuiteRun:
+    """One execution of the unit suite, on one ref."""
+    ref: str                       # "merge-base abc1234" | branch name — what was measured
+    exit_code: int
+    duration_s: float = 0.0
+    runner: Optional[str] = None   # "vitest" | "pytest" | None (summary not recognised)
+    # None means UNKNOWN, never 0. A fabricated 0 would trip the zero-collection block
+    # (§2.4) and turn a reporting gap into a false BLOCKED — the same rule [ORCH-2] set.
+    test_files_total: Optional[int] = None
+    tests_total: Optional[int] = None
+    tests_passed: Optional[int] = None
+    failures: Optional[int] = None
+    failing_files: tuple = ()      # sorted, repo-relative; the SET half of the §2.1 comparison
+    output: str = ""               # combined stdout+stderr tail, for F-20 classification
+    error: Optional[str] = None    # "timeout" | subprocess error text
+
+    @property
+    def collection(self) -> Optional[str]:
+        """`6 files/79 tests, 3 failed` — what this run actually collected. None when nothing parsed."""
+        if self.test_files_total is None and self.tests_total is None:
+            return None
+        f = "?" if self.test_files_total is None else self.test_files_total
+        t = "?" if self.tests_total is None else self.tests_total
+        s = f"{f} files/{t} tests"
+        if self.failures is not None:
+            s += f", {self.failures} failed"
+        return s
+
+    @property
+    def describe(self) -> str:
+        return f"{self.ref}: {self.collection or 'collection unknown (summary not parsed)'} in {self.duration_s:.1f}s"
+
+
+@dataclass
+class UnitGateOutcome:
+    """Verdict of the baseline comparison. `passed` encodes merge-worthiness; `env` says
+    whether a red verdict is an environment problem (BLOCKED) rather than a product one."""
+    passed: bool
+    signal: Optional[str] = None    # "ungated" | "disabled" | "not-applicable" | "regression" | ...
+    detail: Optional[str] = None
+    env: bool = False               # True ⇒ BLOCKED(environment), never FAIL(product)
+    ran: bool = False               # did the gate actually measure the branch?
+    baseline: Optional[UnitSuiteRun] = None
+    branch: Optional[UnitSuiteRun] = None
+    baseline_note: Optional[str] = None  # why there is no baseline run, when there isn't one
+    duration_s: float = 0.0
+
+    @property
+    def collection(self) -> Optional[str]:
+        """`baseline merge-base abc1234: 6 files/79 tests, 2 failed → branch route-br:
+        6 files/81 tests, 2 failed, 24.1s` — the [ORCH-2] shape, both sides declared."""
+        if not self.ran or self.branch is None:
+            return None
+        base = self.baseline.describe if self.baseline else (self.baseline_note or "not measured")
+        return f"baseline {base} → branch {self.branch.describe}, {self.duration_s:.1f}s"
+
+
+# ── suite-output parsing ───────────────────────────────────────────────────────────────
+# vitest/jest failing FILES: ` FAIL  src/lib/synth/seed.test.ts > wipe > keeps Patients`
+# and the per-file listing ` ❯ src/lib/synth/seed.test.ts (3 tests | 2 failed)`.
+_UNIT_VITEST_FAIL_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(\S+)", re.MULTILINE)
+_UNIT_VITEST_FILE_FAILED_RE = re.compile(r"^\s*❯\s+(\S+)\s+\(\d+\s+tests?\s*\|\s*\d+\s+failed", re.MULTILINE)
+# pytest tallies: `2 failed, 1 passed in 0.01s` (-q) or `==== 2 failed, 1 passed in 0.01s ====`.
+_UNIT_PYTEST_SUMMARY_RE = re.compile(
+    r"^[=\s]*((?:\d+\s+(?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)"
+    r"(?:,\s*)?)+)\s+in\s+[\d.]+s", re.MULTILINE)
+_UNIT_PYTEST_TALLY_RE = re.compile(r"(\d+)\s+(passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)\b")
+_UNIT_PYTEST_NO_TESTS_RE = re.compile(r"^[=\s]*no tests ran in [\d.]+s", re.MULTILINE)
+_UNIT_PYTEST_COLLECTED_RE = re.compile(r"^\s*collected (\d+) items?", re.MULTILINE)
+# `FAILED tests/test_x.py::TestY::test_z - AssertionError` / `ERROR tests/test_x.py`
+_UNIT_PYTEST_FAILED_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?\.py)(?:::|\s|$)", re.MULTILINE)
+# traceback tail `tests/test_x.py:2: AssertionError` — fallback when the short summary is off
+_UNIT_PYTEST_TRACEBACK_RE = re.compile(r"^(\S+\.py):\d+:\s+\w", re.MULTILINE)
+# non-quiet per-file progress `tests/test_x.py .FF   [100%]` — the only source of a FILE count
+_UNIT_PYTEST_PROGRESS_RE = re.compile(r"^(\S+\.py)\s+[.FEsxXpPu]+\s*(?:\[\s*\d+%\])?\s*$", re.MULTILINE)
+
+
+def _norm_test_path(p: str) -> str:
+    """Repo-relative-ish normalisation so the two sides of the comparison are comparable."""
+    p = p.strip().strip('"\'')
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _parse_unit_summary(raw: str) -> dict:
+    """Collection counts + the failing-FILE set from a unit-suite run. Understands the two
+    runners this fleet declares in repos.yaml (vitest/jest and pytest). An unrecognised
+    runner yields all-None — UNKNOWN, never 0 (§2.4)."""
+    text = _ANSI_RE.sub("", raw or "")
+    out = {"runner": None, "test_files_total": None, "tests_total": None,
+           "tests_passed": None, "failures": None, "failing_files": ()}
+
+    v = _parse_vitest_summary(text)
+    if v["tests_total"] is not None or v["test_files_total"] is not None:
+        out["runner"] = "vitest"
+        out["test_files_total"] = v["test_files_total"]
+        out["tests_total"] = v["tests_total"]
+        out["tests_passed"] = v["tests_passed"]
+        if v["tests_total"] is not None and v["tests_passed"] is not None:
+            out["failures"] = v["tests_total"] - v["tests_passed"]
+        files = {_norm_test_path(m) for m in _UNIT_VITEST_FAIL_RE.findall(text)}
+        files |= {_norm_test_path(m) for m in _UNIT_VITEST_FILE_FAILED_RE.findall(text)}
+        out["failing_files"] = tuple(sorted(f for f in files if f))
+        return out
+
+    m = _UNIT_PYTEST_SUMMARY_RE.search(text)
+    collected = _UNIT_PYTEST_COLLECTED_RE.search(text)
+    if m or collected or _UNIT_PYTEST_NO_TESTS_RE.search(text):
+        out["runner"] = "pytest"
+        tally = {}
+        if m:
+            for n, kind in _UNIT_PYTEST_TALLY_RE.findall(m.group(1)):
+                tally[kind.rstrip("s") if kind.startswith("error") else kind] = \
+                    tally.get(kind.rstrip("s") if kind.startswith("error") else kind, 0) + int(n)
+        passed = tally.get("passed", 0)
+        failed = tally.get("failed", 0) + tally.get("error", 0)
+        other = sum(tally.get(k, 0) for k in ("skipped", "xfailed", "xpassed"))
+        out["failures"] = failed
+        out["tests_passed"] = passed
+        out["tests_total"] = int(collected.group(1)) if collected else passed + failed + other
+        progress = {_norm_test_path(f) for f in _UNIT_PYTEST_PROGRESS_RE.findall(text)}
+        if progress:
+            out["test_files_total"] = len(progress)
+        files = {_norm_test_path(f) for f in _UNIT_PYTEST_FAILED_RE.findall(text)}
+        if not files and failed:
+            files = {_norm_test_path(f) for f in _UNIT_PYTEST_TRACEBACK_RE.findall(text)}
+        out["failing_files"] = tuple(sorted(f for f in files if f))
+        return out
+
+    return out
+
+
+def _is_git_work_tree(p: Path) -> bool:
+    """True iff p is inside a git working tree. False ⇒ there is no route branch to baseline."""
+    if not p.is_dir():
+        return False
+    r = subprocess.run(f"git -C {shlex.quote(str(p))} rev-parse --is-inside-work-tree",
+                       shell=True, capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _unit_merge_base(repo_path: Path, branch_name: Optional[str]) -> Optional[str]:
+    """The commit the branch forked from — `git merge-base <merge_target> <branch>`.
+
+    §2.2: this is the fork point, NOT main's current tip. When main has advanced past the
+    fork point, merge-base still returns the fork commit, which is exactly the baseline the
+    ruling asks for. Falls back to HEAD when the branch ref is not resolvable here (meta-fire
+    worktrees are checked out detached in some lanes)."""
+    for rev in [r for r in (branch_name, "HEAD") if r]:
+        r = subprocess.run(
+            f"git -C {shlex.quote(str(repo_path))} merge-base "
+            f"{shlex.quote(MERGE_TARGET)} {shlex.quote(rev)}",
+            shell=True, capture_output=True, text=True)
+        sha = (r.stdout or "").strip()
+        if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{7,40}", sha):
+            return sha
+    return None
+
+
+def _link_unit_deps(src: Path, dst: Path) -> list:
+    """Symlink the git-ignored dependency paths (and the declared env_file) from the gated
+    checkout into the detached baseline worktree, so the baseline runs the same suite the
+    branch does. Returns the links created, for teardown. Never reads any file's contents."""
+    created = []
+    names = list(UNIT_BASELINE_LINK_PATHS)
+    env_name, _ = _gate_env_file(src)
+    if env_name:
+        names.append(env_name)
+    for rel in names:
+        s, d = src / rel, dst / rel
+        if not s.exists() or d.exists():
+            continue
+        try:
+            d.parent.mkdir(parents=True, exist_ok=True)
+            d.symlink_to(s.resolve(), target_is_directory=s.is_dir())
+            created.append(d)
+        except OSError as e:
+            log.warning(f"⚠️  Unit baseline: could not link {rel}: {e}")
+    return created
+
+
+def _run_unit_suite(cmd: str, cwd: Path, ref: str) -> UnitSuiteRun:
+    """Run `cmd` once and report what it collected. Never raises."""
+    started = time.time()
+    try:
+        r = subprocess.run(_gate_shell_cmd(cmd, cwd), shell=True, capture_output=True,
+                           text=True, cwd=str(cwd), timeout=UNIT_GATE_TIMEOUT)
+        raw = (r.stdout or "") + "\n" + (r.stderr or "")
+        parsed = _parse_unit_summary(raw)
+        return UnitSuiteRun(ref=ref, exit_code=r.returncode, duration_s=time.time() - started,
+                            output=raw[-20000:], **parsed)
+    except subprocess.TimeoutExpired:
+        return UnitSuiteRun(ref=ref, exit_code=-1, duration_s=time.time() - started,
+                            error="timeout", output="timeout")
+    except Exception as e:
+        return UnitSuiteRun(ref=ref, exit_code=-1, duration_s=time.time() - started,
+                            error=str(e), output=str(e))
+
+
+def _run_unit_baseline(repo_path: Path, sha: str, cmd: str) -> UnitSuiteRun:
+    """Measure the baseline on `sha` in a DETACHED worktree.
+
+    brief §4 STOP trigger 1: a clinical-mp route may be live in that repo while this runs.
+    `git worktree add --detach` touches neither the live working tree nor any branch — it
+    writes only to .git/worktrees/ — so the concurrent route is undisturbed. The worktree is
+    removed and pruned afterwards; the symlinked dependency dirs are unlinked FIRST so the
+    teardown can never reach into the live checkout."""
+    ref = f"merge-base {sha[:7]}"
+    with tempfile.TemporaryDirectory(prefix=UNIT_BASELINE_WORKTREE_PREFIX) as td:
+        wt = Path(td) / "wt"
+        add = subprocess.run(
+            f"git -C {shlex.quote(str(repo_path))} worktree add --detach "
+            f"{shlex.quote(str(wt))} {shlex.quote(sha)}",
+            shell=True, capture_output=True, text=True)
+        if add.returncode != 0:
+            log.error(f"⛔ Unit baseline: detached worktree at {sha[:7]} failed: {(add.stderr or '').strip()[-300:]}")
+            return UnitSuiteRun(ref=ref, exit_code=-1, error="baseline-worktree-failed",
+                                output=(add.stderr or "")[-2000:])
+        links = []
+        try:
+            links = _link_unit_deps(repo_path, wt)
+            log.info(f"🧬 Unit baseline: measuring {ref} in a detached worktree "
+                     f"({len(links)} dependency path(s) linked)")
+            return _run_unit_suite(cmd, wt, ref)
+        finally:
+            for d in links:
+                try:
+                    d.unlink()
+                except OSError:
+                    pass
+            subprocess.run(f"git -C {shlex.quote(str(repo_path))} worktree remove --force {shlex.quote(str(wt))}",
+                           shell=True, capture_output=True)
+            subprocess.run(f"git -C {shlex.quote(str(repo_path))} worktree prune",
+                           shell=True, capture_output=True)
+
+
+def _unit_gate_eligible_repos() -> set:
+    """§2.3 / AC-O3-01: the gated set is DERIVED from config/repos.yaml — every repo that
+    declares a non-empty `test_cmd`. No repo name is hard-coded here; a repo that has not
+    declared a command is ungated and no default is invented for it."""
+    try:
+        repos = load_repo_config()["repos"]
+    except Exception as e:
+        log.warning(f"⚠️  Unit gate: repo config unreadable ({e}) — no repo derived as eligible")
+        return set()
+    return {n for n, r in repos.items() if isinstance(r, dict) and (r.get("test_cmd") or "").strip()}
+
+
+def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
+                  archive_path: Optional[Path] = None) -> UnitGateOutcome:
+    """Baseline unit-suite gate. Halts iff the branch is WORSE than its merge base.
+
+    §2.1 — two comparisons, both must hold for a pass:
+      * `current_failures <= baseline_failures` (equal or fewer passes), and
+      * no test FILE failing on the branch that was green at the merge base — a newly-red
+        file is a regression even when the total count did not rise.
+    §2.4 — zero collection is BLOCKED(environment), never FAIL(product) and never a PASS.
+    """
+    started = time.time()
+    test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
+    if not test_cmd or ACTIVE_REPO_NAME not in _unit_gate_eligible_repos():
+        # AC-O3-02: no declared command ⇒ no unit gate, and that is a stated decision, not a
+        # silent skip. Do NOT invent a default command for a repo that has not declared one.
+        log.info(f"🚪 Unit gate: repo '{ACTIVE_REPO_NAME}' declares no test_cmd — ungated by policy")
+        return UnitGateOutcome(passed=True, signal="ungated",
+                               detail=f"{ACTIVE_REPO_NAME}: no test_cmd in repos.yaml — ungated by policy")
+    if not UNIT_GATE_ENABLED:
+        log.warning("⏭️  Unit baseline gate BYPASSED (DISABLE_UNIT_GATE) — emergency operator escape")
+        return UnitGateOutcome(passed=True, signal="disabled", detail="DISABLE_UNIT_GATE set")
+    if not _is_git_work_tree(repo_path):
+        # No git working tree ⇒ no route branch and no merge base ⇒ nothing to baseline
+        # against. The production callers always hand this a real checkout; this path exists
+        # for manual/test invocation and says so loudly rather than inventing a verdict.
+        log.warning(f"⚠️  Unit gate: {repo_path} is not a git work tree — no branch to baseline; gate not applicable")
+        return UnitGateOutcome(passed=True, signal="not-applicable",
+                               detail=f"{repo_path} is not a git work tree")
+
+    base_sha = _unit_merge_base(repo_path, branch_name)
+    if not base_sha:
+        # A baseline that cannot be measured is not a baseline. §2.2 forbids falling back to
+        # a stored number or to main's tip, so this is an environment block, not a product one.
+        detail = f"merge-base {MERGE_TARGET}..{branch_name or 'HEAD'} not resolvable in {repo_path}"
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment); baseline cannot be measured")
+        return UnitGateOutcome(passed=False, signal="baseline-unresolvable", detail=detail, env=True, ran=True)
+
+    label = branch_name or "HEAD"
+    log.info(f"🧪 Unit baseline gate [{ACTIVE_REPO_NAME}]: {test_cmd} — branch {label} vs merge-base {base_sha[:7]}")
+    branch_run = _run_unit_suite(test_cmd, repo_path, label)
+    log.info(f"🧪 Unit gate branch run — {branch_run.describe}")
+
+    baseline_run = None
+    baseline_note = None
+    if branch_run.error == "timeout":
+        detail = f"branch suite exceeded {UNIT_GATE_TIMEOUT}s — no product verdict was produced"
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment)")
+        return _unit_done(UnitGateOutcome(passed=False, signal="timeout", detail=detail, env=True,
+                                          ran=True, branch=branch_run), started, repo_path, archive_path)
+    if branch_run.tests_total == 0 or branch_run.test_files_total == 0:
+        # §2.4 / AC-O3-07: a green exit over an empty collection tested nothing.
+        detail = f"branch suite collected NOTHING ({branch_run.collection}) — nothing was tested"
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not PASS, not FAIL(product)")
+        return _unit_done(UnitGateOutcome(passed=False, signal="zero-collection", detail=detail, env=True,
+                                          ran=True, branch=branch_run), started, repo_path, archive_path)
+
+    branch_green = branch_run.exit_code == 0 and not branch_run.failing_files and (branch_run.failures or 0) == 0
+    if branch_green and UNIT_GATE_SKIP_BASELINE_WHEN_GREEN:
+        baseline_note = (f"not measured — branch is fully green (0 failures); no baseline can make "
+                         f"a green branch a regression (merge-base {base_sha[:7]})")
+        log.info(f"✅ UNIT BASELINE GATE PASSED — branch green: {branch_run.describe}; baseline {baseline_note}")
+        return _unit_done(UnitGateOutcome(passed=True, ran=True, branch=branch_run,
+                                          baseline_note=baseline_note,
+                                          detail=f"branch green ({branch_run.collection})"),
+                          started, repo_path, archive_path)
+
+    baseline_run = _run_unit_baseline(repo_path, base_sha, test_cmd)
+    log.info(f"🧬 Unit gate baseline run — {baseline_run.describe}")
+
+    def _finish(o: UnitGateOutcome) -> UnitGateOutcome:
+        return _unit_done(o, started, repo_path, archive_path)
+
+    if baseline_run.error or baseline_run.tests_total == 0 or baseline_run.test_files_total == 0:
+        detail = (f"baseline at {base_sha[:7]} did not yield a measurement "
+                  f"({baseline_run.error or baseline_run.collection}) — the comparison cannot be made")
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment)")
+        return _finish(UnitGateOutcome(passed=False, signal="baseline-unmeasurable", detail=detail, env=True,
+                                       ran=True, branch=branch_run, baseline=baseline_run))
+
+    if branch_run.failures is None or baseline_run.failures is None:
+        # Both sides red with output we cannot parse: we cannot tell a regression from
+        # pre-existing debt. Say so — a measurement failure is environment, never a silent pass.
+        detail = (f"suite output did not parse on "
+                  f"{'branch' if branch_run.failures is None else 'baseline'} "
+                  f"(runner={branch_run.runner or baseline_run.runner or 'unrecognised'}); "
+                  f"baseline comparison impossible")
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment)")
+        return _finish(UnitGateOutcome(passed=False, signal="comparison-unavailable", detail=detail, env=True,
+                                       ran=True, branch=branch_run, baseline=baseline_run))
+
+    new_files = tuple(sorted(set(branch_run.failing_files) - set(baseline_run.failing_files)))
+    worse_count = branch_run.failures > baseline_run.failures
+    if worse_count or new_files:
+        reasons = []
+        if worse_count:
+            reasons.append(f"{branch_run.failures} failures vs baseline {baseline_run.failures}")
+        if new_files:
+            reasons.append(f"newly-failing file(s): {', '.join(new_files)}")
+        detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — " + "; ".join(reasons))
+        log.error(f"⛔ UNIT BASELINE GATE FAILED — {detail}. BLOCKING: branch stays unmerged.")
+        return _finish(UnitGateOutcome(passed=False, signal="regression", detail=detail,
+                                       ran=True, branch=branch_run, baseline=baseline_run))
+
+    verdict = ("equal to" if branch_run.failures == baseline_run.failures else "below")
+    detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
+              f"{baseline_run.failures} — no new failing file")
+    log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}")
+    return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run,
+                                   baseline=baseline_run, detail=detail))
+
+
+def _unit_done(o: UnitGateOutcome, started: float, repo_path: Path,
+               archive_path: Optional[Path]) -> UnitGateOutcome:
+    """Stamp the duration and persist the run. AC-O3-06: what the gate collected on BOTH
+    sides is written down, in the shape [ORCH-2] established for the SIT gate."""
+    o.duration_s = time.time() - started
+    try:
+        _log_unit_outcome(archive_path or SIT_ARCHIVE_DIR, repo_path, o)
+    except Exception as e:
+        log.warning(f"⚠️  Unit gate: could not persist outcome: {e}")
+    return o
+
+
+def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
+    """Append the unit-gate outcome to orchestrator-unit-log.json — same archive dir and same
+    entry shape as _log_sit_outcome, carrying BOTH sides' counts so "was this branch worse than
+    where it forked from, and by how much?" stays answerable historically."""
+    archive.mkdir(parents=True, exist_ok=True)
+    log_file = archive / "orchestrator-unit-log.json"
+    entries = []
+    if log_file.exists():
+        try:
+            entries = json.loads(log_file.read_text())
+        except (json.JSONDecodeError, IOError):
+            entries = []
+
+    def _side(r: Optional[UnitSuiteRun]) -> Optional[dict]:
+        if r is None:
+            return None
+        return {"ref": r.ref, "exit_code": r.exit_code, "duration_s": round(r.duration_s, 2),
+                "runner": r.runner, "test_files_total": r.test_files_total,
+                "tests_total": r.tests_total, "tests_passed": r.tests_passed,
+                "failures": r.failures, "failing_files": list(r.failing_files),
+                "error": r.error}
+
+    entries.append({
+        "timestamp": datetime.now().isoformat(),
+        "repo": str(repo_path),
+        "repo_name": ACTIVE_REPO_NAME,
+        "passed": o.passed,
+        "signal": o.signal,
+        "detail": o.detail,
+        "environment": o.env,
+        "duration_s": round(o.duration_s, 2),
+        "baseline": _side(o.baseline),
+        "baseline_note": o.baseline_note,
+        "branch": _side(o.branch),
+    })
+    log_file.write_text(json.dumps(entries, indent=2))
+
+
+# ═══════════════════════════════════════════════════════
 # PRE-MERGE GATE RUNNER + F-20 CLASSIFIER (S7-CORE-4 [ORCH-1])
 # ═══════════════════════════════════════════════════════
 def _env_file_keys(path: Optional[Path]) -> set:
@@ -1270,14 +1729,18 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
 
 def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> GateVerdict:
     """Run the repo's PRE_MERGE_GATES on the route branch checked out at repo_path, BEFORE any
-    merge. Returns a three-way GateVerdict: PASS / BLOCKED(environment) / FAIL(product).
-    Callers merge iff outcome is PASS. The pre-existing operator escapes (DISABLE_BUILD_GATE,
-    DISABLE_SIT_BLOCKING, --skip-sit) are honoured inside the gate functions, unchanged."""
+    merge, then the S7-CORE-8 [ORCH-3] unit baseline gate. Returns a three-way GateVerdict:
+    PASS / BLOCKED(environment) / FAIL(product). Callers merge iff outcome is PASS.
+    The operator escapes (DISABLE_BUILD_GATE, DISABLE_SIT_BLOCKING, --skip-sit, and
+    [ORCH-3]'s DISABLE_UNIT_GATE) are honoured inside the gate functions, unchanged.
+
+    Order is build → SIT → unit: cheapest signal first, the slowest suite last and only if
+    the others were green."""
     policy = PRE_MERGE_GATES.get(ACTIVE_REPO_NAME)
     where = f" on {branch_name}" if branch_name else ""
-    if not policy or not policy.get("gates"):
+    gates = tuple(policy["gates"]) if policy and policy.get("gates") else ()
+    if not gates:
         log.info(f"🚪 Pre-merge gate{where}: repo '{ACTIVE_REPO_NAME}' is UNGATED by PRE_MERGE_GATES (explicit) — merge proceeds")
-        return GateVerdict(GateOutcome.PASS, None, None, f"{ACTIVE_REPO_NAME}: ungated by policy")
 
     env_name, env_path = _gate_env_file(repo_path)
     if env_name:
@@ -1289,7 +1752,7 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
             return v
 
     sit_collection: Optional[str] = None  # [ORCH-2]
-    for gate in policy["gates"]:
+    for gate in gates:
         if gate == "build":
             bg = run_build_gate(repo_path)
             if not bg.passed:
@@ -1315,8 +1778,35 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                 log.warning("⚠️  SIT red but DISABLE_SIT_BLOCKING is set — advisory (pre-existing operator escape)")
         else:
             log.warning(f"⚠️  Unknown gate '{gate}' in PRE_MERGE_GATES — ignored")
-    v = GateVerdict(GateOutcome.PASS, None, None, f"{'+'.join(policy['gates'])} green{where}",
-                    collection=sit_collection)
+
+    # S7-CORE-8 [ORCH-3]: the unit suite, LAST (§2.6 — cheapest signal first; this is the
+    # slowest gate and only runs once build and SIT are green). Its eligibility is NOT read
+    # from PRE_MERGE_GATES: §2.3 derives it from the repo's `test_cmd` in config/repos.yaml,
+    # so a repo that declares a command is gated even when it has no entry above, and a repo
+    # that declares none is reported "ungated by policy" and does not block.
+    uo = run_unit_gate(repo_path, branch_name)
+    unit_collection = uo.collection
+    if not uo.passed:
+        if uo.env:
+            v = GateVerdict(GateOutcome.BLOCKED_ENV, "unit", uo.signal, uo.detail,
+                            collection=sit_collection, unit_collection=unit_collection)
+        else:
+            # A regression is a product verdict unless the F-20 tables see an environment
+            # signal in the suite output — same classifier the build and SIT gates use.
+            v = _classify_gate_failure("unit", (uo.branch.output if uo.branch else "") or uo.detail or "",
+                                       repo_path, uo.branch.exit_code if uo.branch else -1)
+            if v.outcome is GateOutcome.FAIL_PRODUCT:
+                v.signal, v.detail = uo.signal, uo.detail
+            v.collection, v.unit_collection = sit_collection, unit_collection
+        log.error(f"⛔ Pre-merge gate{where}: {v.label}")
+        return v
+
+    ran = list(gates) + ([] if uo.signal in ("ungated", "disabled", "not-applicable") else ["unit"])
+    reason = f"{'+'.join(ran)} green{where}" if ran else f"{ACTIVE_REPO_NAME}: ungated by policy"
+    if uo.signal == "ungated" and ran:
+        reason += f" (unit: {uo.detail})"
+    v = GateVerdict(GateOutcome.PASS, None, None, reason,
+                    collection=sit_collection, unit_collection=unit_collection)
     log.info(f"✅ Pre-merge gate{where}: {v.label}")
     return v
 
@@ -1551,6 +2041,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     gate_outcome: Optional[str] = None   # [ORCH-1] PASS | BLOCKED(environment) | FAIL(product) | None (gate not run)
     gate_error: Optional[str] = None     # [ORCH-1] human verdict line (never a secret value)
     gate_collection: Optional[str] = None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed
+    unit_collection: Optional[str] = None  # [ORCH-3] both sides of the unit baseline when that gate ran
     if branch_name and worktree is None:
         try:
             if status == Status.PASSED:
@@ -1600,6 +2091,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     verdict = run_pre_merge_gates(proj, branch_name)
                     gate_outcome = verdict.outcome.value
                     gate_collection = verdict.collection
+                    unit_collection = verdict.unit_collection
                     if verdict.outcome is not GateOutcome.PASS:
                         gate_error = verdict.label
                         subprocess.run(
@@ -1673,18 +2165,21 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             log.error(f"⛔ Pre-merge gate raised on {meta_branch}: {e} → {verdict.label}")
         gate_outcome = verdict.outcome.value
         gate_collection = verdict.collection
+        unit_collection = verdict.unit_collection
         if verdict.outcome is not GateOutcome.PASS:
             gate_error = verdict.label
             status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
 
-    log.info(f"🏁 FINAL STATUS: {status.value} | gate: {_gate_status_label(gate_error, gate_outcome, gate_collection)}")
+    log.info(f"🏁 FINAL STATUS: {status.value} | gate: "
+             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection)}")
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),
         playwright_ok=pw_ok, pw_tests=pw_cnt,
         new_migrations=new_mig, log_file=out_log,
         worktree=str(worktree) if worktree else None,
-        no_changes=no_change_run, gate_outcome=gate_outcome, gate_collection=gate_collection, error=gate_error)
+        no_changes=no_change_run, gate_outcome=gate_outcome, gate_collection=gate_collection,
+        unit_collection=unit_collection, error=gate_error)
     notify(result)
     rate_limiter.record(batch_file.name, len(briefs), dur, status.value)
 
@@ -2096,6 +2591,14 @@ def main():
     if getattr(a, 'force', False):
         PREFIRE_BYPASS = True
         log.warning('--force: pre-fire assertions (A2/A8) BYPASSED')
+        # S7-CORE-8 [ORCH-3] / AC-O3-11: --force bypasses the PRE-FIRE assertions. It does not,
+        # and has never, bypassed the PRE-MERGE gates. State that in the same breath, in the
+        # same wording A2/A8 report in, so "ALL safety checks bypassed" is never read as
+        # covering the gates. The unit gate's own escape is DISABLE_UNIT_GATE, alongside
+        # DISABLE_BUILD_GATE / DISABLE_SIT_BLOCKING; each logs itself as a bypass when used.
+        log.warning('--force: pre-merge gates NOT bypassed — build, SIT and the unit baseline '
+                    'gate still run and still block the merge '
+                    '(escapes: DISABLE_BUILD_GATE / DISABLE_SIT_BLOCKING / DISABLE_UNIT_GATE)')
 
     # Apply --skip-sit globally before any command runs
     global SKIP_SIT
