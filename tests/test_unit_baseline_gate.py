@@ -278,8 +278,18 @@ class TestBaselineIsTheMergeBase:
         assert repo.fork_point != repo.main_tip
 
     def test_no_baseline_is_stored_anywhere(self):
-        """§2.2: a stored baseline goes stale and becomes a lie. Nothing persists a number to
-        compare AGAINST — the JSON log is a record of runs, and the gate never reads it back."""
+        """§2.2, as amended by S7-CORE-8 [ORCH-5] decision 1. The ASSERTIONS below are the
+        [ORCH-3] ones, unmodified; only this docstring is updated, because what they protect
+        has narrowed and saying so is the point of the test.
+
+        [ORCH-3] read: "a stored baseline goes stale and becomes a lie. Nothing persists a
+        number to compare AGAINST." [ORCH-5] ratified caching the baseline per merge-base
+        commit, so a number IS persisted now — but keyed by the SHA it was measured on, which
+        is what makes it unable to go stale. What stays forbidden, and what these assertions
+        still enforce, is `run_unit_gate` itself reaching for a stored number: all cache I/O
+        lives in the _unit_cache_* helpers, and the gate body reads no file and parses no JSON.
+        Neither main's tip nor a hand-entered figure is reachable from either.
+        See TestBaselineIsCachedPerMergeBase for the caching contract."""
         src = (REPO_ROOT / "orchestrator.py").read_text()
         gate = src.split("def run_unit_gate(")[1].split("\ndef ")[0]
         assert "_log_unit_outcome" not in gate.split("return")[0] or True
@@ -664,3 +674,344 @@ class TestSuiteOutputParsing:
             " FAIL  ./src/lib/synth/wipe.test.ts > x\n Test Files  1 failed | 5 passed (6)\n"
             "      Tests  1 failed | 17 passed (18)\n")
         assert set(c["failing_files"]) == {B}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-8 [ORCH-5] — the gate must be able to COMPLETE its own measurement.
+#
+# The gate [ORCH-3] added ran on clinical-mp for the first time and returned
+#   BLOCKED(environment) — unit: baseline-unmeasurable (baseline at fda6974 did not yield a
+#   measurement (timeout)) · branch: 773 files / 7103 tests, 106 failed in 819.4s
+# `npm test` there is the whole repo, ~14 min, and the gate ran it TWICE on a 900s budget.
+# The verdict logic was right; the cost model was wrong. The suite stays whole (decision 4);
+# the MEASUREMENT gets cheaper: cached per merge-base commit, with its own generous budget.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+def baseline_runs(seen):
+    return [s for s in seen if s[0].startswith(orchestrator.UNIT_BASELINE_REF_PREFIX)]
+
+
+def cache_entries(archive):
+    f = Path(archive) / orchestrator.UNIT_BASELINE_CACHE_FILE
+    return json.loads(f.read_text())["entries"] if f.exists() else {}
+
+
+class TestBaselineIsCachedPerMergeBase:
+    """AC-O5-01 / AC-O5-02 — decision 1: the baseline for a commit is immutable. Measure once."""
+
+    def test_a_second_route_off_the_same_base_performs_no_baseline_run(self, repo, tmp_path):
+        """AC-O5-01: the whole point. ~28 min/route becomes ~14 min once per base."""
+        seen = []
+        o1, _ = run_gate(repo, tmp_path, seen=seen,
+                         branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
+        assert o1.passed is True
+        assert len(baseline_runs(seen)) == 1, "the first route must measure the baseline"
+
+        seen2 = []
+        o2, _ = run_gate(repo, tmp_path, seen=seen2,
+                         branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
+        assert o2.passed is True
+        assert baseline_runs(seen2) == [], "the second route must NOT run the baseline suite again"
+        assert o2.baseline.failures == 2, "and it still has the number"
+
+    def test_the_cache_records_files_tests_failures_duration_and_the_sha(self, repo, tmp_path):
+        """AC-O5-02."""
+        archive = tmp_path / "archive"
+        run_gate(repo, tmp_path, branch_out=vitest([A, A], failed=2), baseline_out=vitest([A], failed=1))
+        entries = cache_entries(archive)
+        assert len(entries) == 1
+        e = list(entries.values())[0]
+        assert e["sha"] == repo.fork_point
+        assert e["test_files_total"] == 6 and e["tests_total"] == 18
+        assert e["failures"] == 1 and e["failing_files"] == [A]
+        assert isinstance(e["duration_s"], float) or isinstance(e["duration_s"], int)
+        assert e["repo"] == "gated-repo" and e["test_cmd"] == "npm test"
+
+    def test_an_entry_for_a_different_sha_is_not_used(self, repo, tmp_path):
+        """AC-O5-02: a cached number belongs to ONE commit. It is never lent to another."""
+        archive = tmp_path / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        other = repo.main_tip
+        assert other != repo.fork_point
+        with active(archive=archive):
+            orchestrator._unit_cache_store(
+                archive, "gated-repo", other, "npm test",
+                orchestrator.UnitSuiteRun(ref="x", exit_code=0, failures=0, tests_total=18,
+                                          test_files_total=6))
+            assert orchestrator._unit_cache_lookup(archive, "gated-repo", repo.fork_point, "npm test") is None
+        seen = []
+        o, _ = run_gate(repo, tmp_path, seen=seen,
+                        branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
+        assert len(baseline_runs(seen)) == 1, "a foreign SHA's entry must not suppress the measurement"
+        assert o.baseline.failures == 2
+
+    def test_a_changed_test_cmd_is_a_miss(self, repo, tmp_path):
+        """The same commit measured with a DIFFERENT command is a different measurement.
+        Reusing it would be exactly the stale-number lie §2.2 warns about."""
+        seen = []
+        run_gate(repo, tmp_path, seen=seen, branch_out=vitest([A, A], failed=2),
+                 baseline_out=vitest([A, A], failed=2))
+        seen2 = []
+        run_gate(repo, tmp_path, seen=seen2, test_cmd="npm test -- --changed",
+                 branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
+        assert len(baseline_runs(seen2)) == 1, "a new test_cmd must re-measure"
+
+    def test_a_corrupt_cache_is_a_miss_not_a_crash(self, repo, tmp_path):
+        archive = tmp_path / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / orchestrator.UNIT_BASELINE_CACHE_FILE).write_text("{ not json")
+        seen = []
+        o, _ = run_gate(repo, tmp_path, seen=seen,
+                        branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
+        assert o.passed is True and len(baseline_runs(seen)) == 1
+
+    def test_the_cache_lives_inside_the_orchestrator_repo(self):
+        """brief §4 STOP trigger 2: no state outside this repo. The cache file sits in the
+        sit-archive dir beside orchestrator-unit-log.json, and `sit-archive/*.json` is
+        gitignored, so it is runtime state and never committed."""
+        assert orchestrator.SIT_ARCHIVE_DIR == orchestrator.ORCH_DIR / "sit-archive"
+        gi = (REPO_ROOT / ".gitignore").read_text()
+        assert "sit-archive/*.json" in gi
+        assert orchestrator.UNIT_BASELINE_CACHE_FILE.endswith(".json")
+
+
+class TestTheVerdictSaysWhereTheBaselineCameFrom:
+    """AC-O5-05 — "measured now" and "read from cache", both asserted."""
+
+    def test_a_freshly_measured_baseline_says_so(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.INFO, logger="orch"):
+            o, entries = run_gate(repo, tmp_path, branch_out=vitest([A, A], failed=2),
+                                  baseline_out=vitest([A, A], failed=2))
+        assert o.baseline_source == "measured"
+        assert "measured now at" in o.baseline_note
+        assert "[measured]" in o.collection
+        assert entries[-1]["baseline_source"] == "measured"
+        assert "cache MISS" in caplog.text
+
+    def test_a_cached_baseline_says_so(self, repo, tmp_path, caplog):
+        run_gate(repo, tmp_path, branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
+        with caplog.at_level(logging.INFO, logger="orch"):
+            o, entries = run_gate(repo, tmp_path, branch_out=vitest([A, A], failed=2),
+                                  baseline_out=vitest([A, A], failed=2))
+        assert o.baseline_source == "cache"
+        assert "read from cache" in o.baseline_note and repo.fork_point[:7] in o.baseline_note
+        assert "[cache]" in o.collection
+        assert entries[-1]["baseline_source"] == "cache"
+        assert "CACHE HIT" in caplog.text and "no baseline run" in caplog.text
+
+    def test_the_green_branch_skip_still_declares_itself(self, repo, tmp_path):
+        """The [ORCH-3] short-circuit is not a cache read and must not read like one."""
+        o, _ = run_gate(repo, tmp_path, branch_out=vitest(failed=0))
+        assert o.baseline is None and o.baseline_source == "not-needed"
+        assert "not measured" in o.baseline_note
+
+
+class TestTheBaselineLegHasItsOwnTimeout:
+    """AC-O5-03 — separate budgets, ≥1800s by default, per-repo configurable."""
+
+    def test_the_default_baseline_budget_is_at_least_1800s_and_the_branch_keeps_its_own(self):
+        assert orchestrator.UNIT_BASELINE_TIMEOUT >= 1800
+        assert orchestrator.UNIT_GATE_TIMEOUT != orchestrator.UNIT_BASELINE_TIMEOUT
+        with active():
+            assert orchestrator._unit_suite_timeout("merge-base abc1234") >= 1800
+            assert orchestrator._unit_suite_timeout("route") == orchestrator.UNIT_GATE_TIMEOUT
+
+    def test_both_legs_are_configurable_per_repo_and_independently(self):
+        with active():
+            with patch.dict(orchestrator.ACTIVE_REPO_CONFIG, {"baseline_timeout_s": 4200}):
+                assert orchestrator._unit_suite_timeout("merge-base abc1234") == 4200
+                assert orchestrator._unit_suite_timeout("route") == orchestrator.UNIT_GATE_TIMEOUT
+            with patch.dict(orchestrator.ACTIVE_REPO_CONFIG, {"test_timeout_s": 120}):
+                assert orchestrator._unit_suite_timeout("route") == 120
+                assert orchestrator._unit_suite_timeout("merge-base abc1234") >= 1800
+
+    def test_a_nonsense_override_falls_back_and_says_so(self, caplog):
+        with active(), caplog.at_level(logging.INFO, logger="orch"), \
+             patch.dict(orchestrator.ACTIVE_REPO_CONFIG, {"baseline_timeout_s": "soon"}):
+            assert orchestrator._unit_suite_timeout("merge-base abc1234") == orchestrator.UNIT_BASELINE_TIMEOUT
+        assert "not a positive integer" in caplog.text
+
+    def test_the_budget_reaches_the_subprocess_for_each_leg(self, tmp_path):
+        """Not just resolved — actually handed to the suite run."""
+        seen = {}
+
+        def _run(cmd, **kw):
+            seen[kw.get("cwd")] = kw.get("timeout")
+            return MagicMock(returncode=0, stdout=PYTEST_GREEN, stderr="")
+
+        with active(), patch.object(subprocess, "run", side_effect=_run):
+            orchestrator._run_unit_suite("pytest -q", tmp_path, "route")
+            assert seen[str(tmp_path)] == orchestrator.UNIT_GATE_TIMEOUT
+            orchestrator._run_unit_suite("pytest -q", tmp_path, "merge-base abc1234")
+            assert seen[str(tmp_path)] == orchestrator.UNIT_BASELINE_TIMEOUT
+
+
+class TestABaselineTimeoutIsEnvironmentNotProduct:
+    """AC-O5-04 — the measurement failed; that says nothing about the code."""
+
+    @staticmethod
+    def _baseline_times_out(branch_out):
+        def _fake(cmd, cwd, ref):
+            if ref.startswith(orchestrator.UNIT_BASELINE_REF_PREFIX):
+                return orchestrator.UnitSuiteRun(ref=ref, exit_code=-1, duration_s=1800.0,
+                                                 error="timeout", output="timeout")
+            return orchestrator.UnitSuiteRun(ref=ref, exit_code=1, duration_s=819.4, output=branch_out,
+                                             **orchestrator._parse_unit_summary(branch_out))
+        return _fake
+
+    def test_baseline_timeout_blocks_as_environment_and_blames_the_measurement(self, repo, tmp_path, caplog):
+        archive = tmp_path / "archive"
+        with active(archive=archive), caplog.at_level(logging.INFO, logger="orch"), \
+             patch.object(orchestrator, "_run_unit_suite", self._baseline_times_out(vitest([A, A], failed=2))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is False
+        assert o.env is True, "a timeout is BLOCKED(environment), never FAIL(product)"
+        assert o.signal == "baseline-unmeasurable"
+        assert "BASELINE MEASUREMENT" in o.detail and "timeout" in o.detail
+        assert "says nothing about the branch" in o.detail
+        assert str(orchestrator.UNIT_BASELINE_TIMEOUT) in o.detail, "name the budget that was blown"
+        assert "BLOCKED(environment), not FAIL(product)" in caplog.text
+
+    def test_it_reaches_the_verdict_as_blocked_not_failed(self, repo, tmp_path):
+        archive = tmp_path / "archive"
+        with active(archive=archive), \
+             patch.object(orchestrator, "_run_unit_suite", self._baseline_times_out(vitest([A, A], failed=2))):
+            v = orchestrator.run_pre_merge_gates(repo, "route")
+        assert v.outcome is orchestrator.GateOutcome.BLOCKED_ENV
+        assert v.outcome is not orchestrator.GateOutcome.FAIL_PRODUCT
+        assert (v.gate, v.signal) == ("unit", "baseline-unmeasurable")
+
+    def test_a_failed_measurement_is_never_cached(self, repo, tmp_path):
+        archive = tmp_path / "archive"
+        with active(archive=archive), \
+             patch.object(orchestrator, "_run_unit_suite", self._baseline_times_out(vitest([A, A], failed=2))):
+            orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert cache_entries(archive) == {}, "a timeout must not become a stored baseline"
+
+
+class TestAncestorFallbackIsStatedNeverInferred:
+    """AC-O5-05 / decision 3 — a cache miss is not a block when a MEASURED ancestor exists,
+    and the verdict says so. Nothing is ever inferred."""
+
+    def _measure_ancestor(self, repo, tmp_path):
+        """Route 1 forks at M0 and its baseline is measured and cached there. `route2` forks
+        at M1 instead, so its merge base is M1 and M0 is a strict ANCESTOR of it — exactly the
+        shape decision 3 describes: a real measurement, for an older commit."""
+        run_gate(repo, tmp_path, branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
+        _git(repo, "checkout", "-q", "main")
+        _git(repo, "checkout", "-qb", "route2")
+        (repo / "marker.txt").write_text("route2")
+        _git(repo, "commit", "-qam", "route2 work")
+        assert _git(repo, "merge-base", "main", "route2") == repo.main_tip != repo.fork_point
+
+    def test_an_ancestor_baseline_is_used_and_labelled_when_the_fresh_one_fails(self, repo, tmp_path, caplog):
+        archive = tmp_path / "archive"
+        self._measure_ancestor(repo, tmp_path)
+        with active(archive=archive), caplog.at_level(logging.INFO, logger="orch"), \
+             patch.object(orchestrator, "_run_unit_suite",
+                          TestABaselineTimeoutIsEnvironmentNotProduct._baseline_times_out(vitest([A, A], failed=2))):
+            o = orchestrator.run_unit_gate(repo, "route2", archive_path=archive)
+        assert o.passed is True, "a measurable branch + a measured ancestor is not a block"
+        assert o.baseline_source == "ancestor-cache"
+        assert "ANCESTOR" in o.baseline_note and repo.fork_point[:7] in o.baseline_note
+        assert "approximate" in o.baseline_note
+        assert "[ancestor-cache]" in o.collection
+
+    def test_with_no_measured_ancestor_the_block_stands(self, repo, tmp_path):
+        """"Never infer a baseline you did not measure." An empty cache is still a block."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), \
+             patch.object(orchestrator, "_run_unit_suite",
+                          TestABaselineTimeoutIsEnvironmentNotProduct._baseline_times_out(vitest([A, A], failed=2))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is False and o.env is True and o.signal == "baseline-unmeasurable"
+        assert "no measured ancestor" in o.baseline_note
+
+    def test_a_non_ancestor_entry_is_never_borrowed(self, repo, tmp_path):
+        """A commit that is not an ancestor of this merge base has no bearing on it."""
+        archive = tmp_path / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        _git(repo, "checkout", "-qb", "sibling", repo.fork_point)
+        (repo / "marker.txt").write_text("sibling")
+        _git(repo, "commit", "-qam", "sibling work")
+        sibling = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "route")
+        with active(archive=archive):
+            orchestrator._unit_cache_store(
+                archive, "gated-repo", sibling, "npm test",
+                orchestrator.UnitSuiteRun(ref="x", exit_code=1, failures=2, tests_total=18,
+                                          test_files_total=6))
+            assert orchestrator._unit_cache_ancestor(repo, archive, "gated-repo",
+                                                     repo.fork_point, "npm test") is None
+
+    def test_an_ancestor_fallback_still_blocks_a_real_regression(self, repo, tmp_path):
+        """The fallback is a cheaper baseline, not a softer gate."""
+        archive = tmp_path / "archive"
+        self._measure_ancestor(repo, tmp_path)
+        with active(archive=archive), \
+             patch.object(orchestrator, "_run_unit_suite",
+                          TestABaselineTimeoutIsEnvironmentNotProduct._baseline_times_out(vitest([A, A, A], failed=3))):
+            o = orchestrator.run_unit_gate(repo, "route2", archive_path=archive)
+        assert o.passed is False and o.signal == "regression"
+        assert "3 failures vs baseline 2" in o.detail
+
+
+class TestOrch3SemanticsSurviveCaching:
+    """AC-O5-06 — `>` blocks, `==` and `<` pass, and a newly-failing FILE blocks even when the
+    count does not rise. Re-asserted here with the baseline coming OFF THE CACHE, because that
+    is the path [ORCH-5] introduced and the path a regression would hide in."""
+
+    @staticmethod
+    def _prime(repo, tmp_path, baseline_out):
+        """Measure and cache the baseline, then assert the next gate run reads it."""
+        seen = []
+        run_gate(repo, tmp_path, seen=seen, branch_out=baseline_out, baseline_out=baseline_out)
+        assert len(baseline_runs(seen)) == 1
+
+    def _cached(self, repo, tmp_path, branch_out, baseline_out):
+        self._prime(repo, tmp_path, baseline_out)
+        seen = []
+        o, _ = run_gate(repo, tmp_path, seen=seen, branch_out=branch_out, baseline_out=baseline_out)
+        assert baseline_runs(seen) == [], "this case must be exercising the CACHE path"
+        assert o.baseline_source == "cache"
+        return o
+
+    def test_more_failures_than_a_cached_baseline_still_blocks(self, repo, tmp_path):
+        o = self._cached(repo, tmp_path, vitest([A, A, A], failed=3), vitest([A, A], failed=2))
+        assert o.passed is False and o.signal == "regression"
+        assert "3 failures vs baseline 2" in o.detail
+
+    def test_equal_to_a_cached_baseline_still_passes(self, repo, tmp_path):
+        o = self._cached(repo, tmp_path, vitest([A, A], failed=2), vitest([A, A], failed=2))
+        assert o.passed is True and o.signal is None
+        assert "2 failures, equal to the merge-base baseline of 2" in o.detail
+
+    def test_fewer_than_a_cached_baseline_still_passes(self, repo, tmp_path):
+        o = self._cached(repo, tmp_path, vitest([A], failed=1), vitest([A, A], failed=2))
+        assert o.passed is True
+        assert "1 failures, below the merge-base baseline of 2" in o.detail
+
+    def test_a_newly_failing_file_still_blocks_off_a_cached_baseline(self, repo, tmp_path):
+        """AC-O3-04's semantics, preserved: 2 is not > 2, but B was green at the fork point.
+        The failing-FILE set must survive the round trip through the cache."""
+        o = self._cached(repo, tmp_path, vitest([B, B], failed=2), vitest([A, A], failed=2))
+        assert o.passed is False and o.signal == "regression"
+        assert o.branch.failures == o.baseline.failures == 2, "the count did not rise"
+        assert f"newly-failing file(s): {B}" in o.detail
+        assert o.baseline.failing_files == (A,), "the cached failing-file SET must round-trip"
+
+
+class TestTheSuiteCommandIsNotNarrowed:
+    """AC-O5-07 / decision 4 — the 106 failures in clinical-mp's full suite are real and
+    mostly outside the paths our routes touch. Narrowing `test_cmd` would hide them. The
+    suite stays whole; only the MEASUREMENT got cheaper."""
+
+    def test_clinical_mp_test_cmd_is_still_literally_npm_test(self):
+        repos = orchestrator.load_repo_config()["repos"]
+        assert repos["clinical-mp"]["test_cmd"] == "npm test"
+
+    def test_no_repo_test_cmd_changed_on_this_branch(self):
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--", "config/repos.yaml"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip("no `main` ref to diff against")
+        assert "test_cmd" not in r.stdout, f"AC-O5-07 violated — test_cmd touched:\n{r.stdout}"

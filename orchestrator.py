@@ -247,7 +247,28 @@ SIT_ARCHIVE_DIR = ORCH_DIR / "sit-archive"
 # build gate runs tsc + build. Those were the seeds T2 synth UAT runs on.
 # ═══════════════════════════════════════════════════════
 UNIT_GATE_ENABLED = os.environ.get("DISABLE_UNIT_GATE", "") == ""  # emergency bypass, mirrors DISABLE_BUILD_GATE
-UNIT_GATE_TIMEOUT = 900  # 15 min. Slowest gate; §2.6 runs it last, only if build and SIT are green.
+UNIT_GATE_TIMEOUT = 900  # 15 min. The BRANCH leg's budget. §2.6 runs the gate last.
+# S7-CORE-8 [ORCH-5]: the two legs get SEPARATE budgets, because they are not the same cost.
+# Measured 2026-09-13 on clinical-mp: `npm test` is the whole repo — 773 files / 7103 tests /
+# ~14 min. The branch leg fits in 900s on a warm checkout; the baseline leg runs in a fresh
+# detached worktree and blew straight through it, so the very first live route returned
+# `baseline-unmeasurable (timeout)` and was blocked with nothing measured. The verdict logic
+# was right and the cost model was wrong. A timeout on EITHER leg is BLOCKED(environment) —
+# the measurement failed, not the product.
+UNIT_BASELINE_TIMEOUT = 1800  # 30 min. Per-repo override: `baseline_timeout_s` in repos.yaml.
+UNIT_BASELINE_REF_PREFIX = "merge-base"  # the ref prefix that identifies the baseline leg
+# Per-repo override keys read out of config/repos.yaml (ACTIVE_REPO_CONFIG). Absent ⇒ the
+# defaults above. Never inline a number at a call site (CLAUDE.md).
+UNIT_TIMEOUT_KEY = "test_timeout_s"
+UNIT_BASELINE_TIMEOUT_KEY = "baseline_timeout_s"
+# [ORCH-5] decision 1: the baseline for a given commit is IMMUTABLE, so measure it once and
+# keep it, keyed by that commit's SHA. This is what turns ~28 min per route into ~14 min once
+# per merge base. It does NOT weaken §2.2 below: the number is still MEASURED on the merge
+# base, by us, from a real suite run — it is simply not re-measured for a commit that has not
+# changed. What §2.2 forbids is a baseline that was never measured for the commit in hand:
+# main's current tip, or a hand-entered figure. Neither is reachable from here.
+UNIT_BASELINE_CACHE_FILE = "unit-baseline-cache.json"   # in the sit-archive dir, gitignored
+UNIT_BASELINE_CACHE_VERSION = 1
 # §2.2: the baseline is MEASURED on the MERGE BASE — never stored, never read off main's
 # current tip. A stored number goes stale and becomes a lie; the `test_cmd` key in
 # repos.yaml that sat unconsumed through this whole incident is the cautionary precedent.
@@ -1466,7 +1487,10 @@ class UnitGateOutcome:
     ran: bool = False               # did the gate actually measure the branch?
     baseline: Optional[UnitSuiteRun] = None
     branch: Optional[UnitSuiteRun] = None
-    baseline_note: Optional[str] = None  # why there is no baseline run, when there isn't one
+    baseline_note: Optional[str] = None  # how the baseline was obtained, or why there isn't one
+    # [ORCH-5] AC-O5-05: "measured" | "cache" | "ancestor-cache" | "unmeasurable" | None.
+    # The verdict must never leave "was this measured now, or read off disk?" unanswered.
+    baseline_source: Optional[str] = None
     duration_s: float = 0.0
 
     @property
@@ -1476,6 +1500,8 @@ class UnitGateOutcome:
         if not self.ran or self.branch is None:
             return None
         base = self.baseline.describe if self.baseline else (self.baseline_note or "not measured")
+        if self.baseline is not None and self.baseline_source:
+            base += f" [{self.baseline_source}]"
         return f"baseline {base} → branch {self.branch.describe}, {self.duration_s:.1f}s"
 
 
@@ -1604,12 +1630,44 @@ def _link_unit_deps(src: Path, dst: Path) -> list:
     return created
 
 
-def _run_unit_suite(cmd: str, cwd: Path, ref: str) -> UnitSuiteRun:
-    """Run `cmd` once and report what it collected. Never raises."""
+def _unit_repo_timeout(key: str, default: int) -> int:
+    """A per-repo timeout override from config/repos.yaml, or the module default. A value that
+    is not a positive integer is ignored loudly rather than silently becoming 0."""
+    raw = ACTIVE_REPO_CONFIG.get(key)
+    if raw in (None, ""):
+        return default
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        v = 0
+    if v <= 0:
+        log.warning(f"⚠️  Unit gate: repos.yaml {key}={raw!r} is not a positive integer — using {default}s")
+        return default
+    return v
+
+
+def _unit_suite_timeout(ref: str) -> int:
+    """[ORCH-5] AC-O5-03 — the two legs have SEPARATE budgets, and `ref` is already the leg
+    identifier this function's caller receives, so no call site has to carry a number.
+
+    The baseline leg's default is deliberately the generous one (30 min vs 15): it runs in a
+    fresh detached worktree, and on clinical-mp the same `npm test` that fits in 900s on the
+    warm checkout did not fit there. Both are per-repo configurable."""
+    if str(ref or "").startswith(UNIT_BASELINE_REF_PREFIX):
+        return _unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT)
+    return _unit_repo_timeout(UNIT_TIMEOUT_KEY, UNIT_GATE_TIMEOUT)
+
+
+def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None) -> UnitSuiteRun:
+    """Run `cmd` once and report what it collected. Never raises.
+
+    `timeout` defaults to the budget for this leg (see _unit_suite_timeout); the parameter
+    exists so a caller can be explicit, not so the derivation can be bypassed."""
     started = time.time()
+    budget = timeout or _unit_suite_timeout(ref)
     try:
         r = subprocess.run(_gate_shell_cmd(cmd, cwd), shell=True, capture_output=True,
-                           text=True, cwd=str(cwd), timeout=UNIT_GATE_TIMEOUT)
+                           text=True, cwd=str(cwd), timeout=budget)
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         parsed = _parse_unit_summary(raw)
         return UnitSuiteRun(ref=ref, exit_code=r.returncode, duration_s=time.time() - started,
@@ -1657,6 +1715,181 @@ def _run_unit_baseline(repo_path: Path, sha: str, cmd: str) -> UnitSuiteRun:
                            shell=True, capture_output=True)
             subprocess.run(f"git -C {shlex.quote(str(repo_path))} worktree prune",
                            shell=True, capture_output=True)
+
+
+# ── the baseline cache (S7-CORE-8 [ORCH-5]) ───────────────────────────────────────────
+# The baseline for a commit is immutable, so it is measured ONCE and kept, keyed by that
+# commit's SHA. Lives in the sit-archive dir — inside this repo, gitignored (`sit-archive/
+# *.json`), alongside orchestrator-unit-log.json. No state leaves the orchestrator repo.
+#
+# What the key covers, and why: (repo, merge-base SHA, test_cmd). The SHA alone is not
+# enough — the same commit measured with a DIFFERENT command is a different measurement, and
+# reusing it would be exactly the stale-number lie §2.2 warns about. Change `test_cmd` in
+# repos.yaml and every entry for it is a miss, which is correct.
+def _unit_is_measurement(run: Optional[UnitSuiteRun]) -> bool:
+    """Did this run yield a measurement at all? The [ORCH-3] predicate, unchanged and now
+    named: an error (timeout, worktree failure) or a demonstrably EMPTY collection is not a
+    measurement. `None` counts stay UNKNOWN and fall through to the parse check below — a
+    pytest `-q` green summary reports no file count, and treating that as zero would turn a
+    reporting gap into a false block, which is precisely what [ORCH-2] ruled against."""
+    if run is None or run.error:
+        return False
+    return run.tests_total != 0 and run.test_files_total != 0
+
+
+def _unit_is_cacheable(run: UnitSuiteRun) -> bool:
+    """A baseline with no failure COUNT cannot serve as a baseline — the comparison needs a
+    number. Caching one would freeze an unusable entry in place for every later route off
+    this base, so it is measured again instead."""
+    return _unit_is_measurement(run) and run.failures is not None
+
+
+def _unit_cache_file(archive: Path) -> Path:
+    return archive / UNIT_BASELINE_CACHE_FILE
+
+
+def _unit_cache_load(archive: Path) -> dict:
+    f = _unit_cache_file(archive)
+    if not f.exists():
+        return {}
+    try:
+        data = json.loads(f.read_text())
+    except (json.JSONDecodeError, IOError, OSError):
+        log.warning(f"⚠️  Unit baseline cache unreadable at {f} — treated as empty (it will be rewritten)")
+        return {}
+    if not isinstance(data, dict) or data.get("version") != UNIT_BASELINE_CACHE_VERSION:
+        return {}
+    entries = data.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _unit_cache_key(repo_name: str, sha: str, cmd: str) -> str:
+    return f"{repo_name}@{sha}@{hashlib.md5(cmd.encode()).hexdigest()[:8]}"
+
+
+def _unit_cache_entry_matches(e: dict, repo_name: str, sha: str, cmd: str) -> bool:
+    """AC-O5-02: an entry is usable only for the SHA, repo and command it was measured under.
+    Checked on the entry itself, not just on the key, so a hand-edited or renamed key cannot
+    smuggle a measurement onto the wrong commit."""
+    return (isinstance(e, dict) and e.get("sha") == sha
+            and e.get("repo") == repo_name and e.get("test_cmd") == cmd)
+
+
+def _unit_cache_lookup(archive: Path, repo_name: str, sha: str, cmd: str) -> Optional[dict]:
+    e = _unit_cache_load(archive).get(_unit_cache_key(repo_name, sha, cmd))
+    return e if _unit_cache_entry_matches(e, repo_name, sha, cmd) else None
+
+
+def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: UnitSuiteRun):
+    """Persist a MEASURED baseline. AC-O5-02: files, tests, failures, duration and the SHA.
+    The suite output is deliberately NOT stored — it is only ever used to F-20-classify the
+    BRANCH leg, and keeping 20KB per commit forever buys nothing."""
+    archive.mkdir(parents=True, exist_ok=True)
+    entries = _unit_cache_load(archive)
+    entries[_unit_cache_key(repo_name, sha, cmd)] = {
+        "sha": sha, "repo": repo_name, "test_cmd": cmd,
+        "measured_at": datetime.now().isoformat(),
+        "ref": run.ref, "exit_code": run.exit_code, "duration_s": round(run.duration_s, 2),
+        "runner": run.runner, "test_files_total": run.test_files_total,
+        "tests_total": run.tests_total, "tests_passed": run.tests_passed,
+        "failures": run.failures, "failing_files": list(run.failing_files),
+    }
+    try:
+        _unit_cache_file(archive).write_text(
+            json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
+    except OSError as e:
+        log.warning(f"⚠️  Unit baseline cache not written ({e}) — the next route will re-measure")
+
+
+def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
+    """Rehydrate a stored measurement. `error` stays None and `output` empty: this is a real
+    measurement that completed, and it has no output to classify."""
+    return UnitSuiteRun(ref=ref, exit_code=e.get("exit_code", -1),
+                        duration_s=float(e.get("duration_s") or 0.0), runner=e.get("runner"),
+                        test_files_total=e.get("test_files_total"), tests_total=e.get("tests_total"),
+                        tests_passed=e.get("tests_passed"), failures=e.get("failures"),
+                        failing_files=tuple(e.get("failing_files") or ()))
+
+
+def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sha: str,
+                         cmd: str) -> Optional[dict]:
+    """[ORCH-5] decision 3 — the LAST resort, used only after a fresh measurement has already
+    failed. The nearest ANCESTOR of the merge base that we have a real measurement for.
+
+    This is still a baseline we measured; it is not one we inferred. But it is a baseline for
+    an OLDER commit, so the comparison it supports is approximate in both directions, and
+    every caller of this is required to say so in the verdict. Nothing here invents a number,
+    and nothing here reads main's tip."""
+    best, best_distance = None, None
+    for e in _unit_cache_load(archive).values():
+        if not isinstance(e, dict) or e.get("repo") != repo_name or e.get("test_cmd") != cmd:
+            continue
+        sha = e.get("sha")
+        if not sha or sha == base_sha:
+            continue
+        anc = subprocess.run(
+            f"git -C {shlex.quote(str(repo_path))} merge-base --is-ancestor "
+            f"{shlex.quote(sha)} {shlex.quote(base_sha)}",
+            shell=True, capture_output=True)
+        if anc.returncode != 0:
+            continue
+        d = subprocess.run(
+            f"git -C {shlex.quote(str(repo_path))} rev-list --count "
+            f"{shlex.quote(sha)}..{shlex.quote(base_sha)}",
+            shell=True, capture_output=True, text=True)
+        try:
+            distance = int((d.stdout or "").strip())
+        except ValueError:
+            continue
+        if best_distance is None or distance < best_distance:
+            best, best_distance = e, distance
+    if best is not None:
+        best = dict(best, ancestor_distance=best_distance)
+    return best
+
+
+def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, archive: Path,
+                                    repo_name: str) -> tuple:
+    """Get the baseline for `base_sha`. Returns (UnitSuiteRun|None, source, note).
+
+    `source` is one of "cache" | "measured" | "ancestor-cache" | "unmeasurable" and reaches
+    the verdict verbatim (AC-O5-05) — the operator is never left guessing whether a number
+    was measured just now or read off disk."""
+    hit = _unit_cache_lookup(archive, repo_name, base_sha, cmd)
+    if hit:
+        run = _unit_run_from_cache(hit, f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]}")
+        note = (f"read from cache — measured {hit.get('measured_at', '?')[:19]} at "
+                f"{base_sha[:7]}, {run.collection or 'collection unknown'} in {run.duration_s:.1f}s; "
+                f"not re-run (the baseline for a commit does not change)")
+        log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} — {run.collection}; no baseline run")
+        return run, "cache", note
+
+    log.info(f"🧬 Unit baseline: cache MISS for {base_sha[:7]} — measuring "
+             f"(budget {_unit_suite_timeout(UNIT_BASELINE_REF_PREFIX)}s)")
+    run = _run_unit_baseline(repo_path, base_sha, cmd)
+    log.info(f"🧬 Unit gate baseline run — {run.describe}")
+    if _unit_is_cacheable(run):
+        _unit_cache_store(archive, repo_name, base_sha, cmd, run)
+        return run, "measured", f"measured now at {base_sha[:7]} and cached for later routes off this base"
+    if _unit_is_measurement(run):
+        # It ran and collected something, but the summary gave no failure count. That is the
+        # [ORCH-3] `comparison-unavailable` path — let it reach its own verdict, uncached.
+        return run, "measured", (f"measured now at {base_sha[:7]}; NOT cached — the summary "
+                                 f"yielded no failure count")
+
+    # The fresh measurement failed outright. Decision 3: an ancestor we DID measure is usable
+    # — said out loud — and if there is none, the block stands.
+    why = run.error or run.collection or "no measurement"
+    anc = _unit_cache_ancestor(repo_path, archive, repo_name, base_sha, cmd)
+    if anc:
+        anc_run = _unit_run_from_cache(anc, f"{UNIT_BASELINE_REF_PREFIX} {anc['sha'][:7]} (ancestor)")
+        note = (f"NOT measured at the merge base {base_sha[:7]} ({why}); compared instead against "
+                f"the nearest measured ANCESTOR {anc['sha'][:7]}, {anc.get('ancestor_distance', '?')} "
+                f"commit(s) back, measured {anc.get('measured_at', '?')[:19]} — an approximate "
+                f"baseline, stated as such")
+        log.warning(f"⚠️  Unit baseline: {note}")
+        return anc_run, "ancestor-cache", note
+    return run, "unmeasurable", f"no measurement at {base_sha[:7]} ({why}) and no measured ancestor in the cache"
 
 
 def _unit_gate_eligible_repos() -> set:
@@ -1731,24 +1964,38 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     if branch_green and UNIT_GATE_SKIP_BASELINE_WHEN_GREEN:
         baseline_note = (f"not measured — branch is fully green (0 failures); no baseline can make "
                          f"a green branch a regression (merge-base {base_sha[:7]})")
+        # AC-O5-05: even the skip declares its provenance, so the verdict never reads as if a
+        # measurement happened.
+        baseline_source = "not-needed"
         log.info(f"✅ UNIT BASELINE GATE PASSED — branch green: {branch_run.describe}; baseline {baseline_note}")
         return _unit_done(UnitGateOutcome(passed=True, ran=True, branch=branch_run,
-                                          baseline_note=baseline_note,
+                                          baseline_note=baseline_note, baseline_source=baseline_source,
                                           detail=f"branch green ({branch_run.collection})"),
                           started, repo_path, archive_path)
 
-    baseline_run = _run_unit_baseline(repo_path, base_sha, test_cmd)
-    log.info(f"🧬 Unit gate baseline run — {baseline_run.describe}")
+    # [ORCH-5]: measured once per merge base, then reused. The measurement is still OURS and
+    # still on the merge base — it is simply not repeated for a commit that has not changed.
+    baseline_run, baseline_source, baseline_note = _unit_baseline_measure_or_reuse(
+        repo_path, base_sha, test_cmd, archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME)
 
     def _finish(o: UnitGateOutcome) -> UnitGateOutcome:
         return _unit_done(o, started, repo_path, archive_path)
 
-    if baseline_run.error or baseline_run.tests_total == 0 or baseline_run.test_files_total == 0:
-        detail = (f"baseline at {base_sha[:7]} did not yield a measurement "
-                  f"({baseline_run.error or baseline_run.collection}) — the comparison cannot be made")
-        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment)")
+    if baseline_source == "unmeasurable" or baseline_run is None or not _unit_is_measurement(baseline_run):
+        # AC-O5-04: a timeout here means the MEASUREMENT failed, not the product. Say that in
+        # those words — the first live run of this gate reported `baseline-unmeasurable
+        # (timeout)` and the branch was correctly preserved; the wording must keep making
+        # clear that nothing was learned about the code.
+        why = (baseline_run.error if baseline_run else None) or (baseline_run.collection if baseline_run else None) or "no measurement"
+        if why == "timeout":
+            why = (f"timeout — the baseline suite exceeded its "
+                   f"{_unit_suite_timeout(UNIT_BASELINE_REF_PREFIX)}s budget")
+        detail = (f"the BASELINE MEASUREMENT at {base_sha[:7]} failed ({why}) — this says nothing "
+                  f"about the branch; the comparison simply cannot be made")
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not FAIL(product)")
         return _finish(UnitGateOutcome(passed=False, signal="baseline-unmeasurable", detail=detail, env=True,
-                                       ran=True, branch=branch_run, baseline=baseline_run))
+                                       ran=True, branch=branch_run, baseline=baseline_run,
+                                       baseline_note=baseline_note, baseline_source=baseline_source))
 
     if branch_run.failures is None or baseline_run.failures is None:
         # Both sides red with output we cannot parse: we cannot tell a regression from
@@ -1759,7 +2006,8 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                   f"baseline comparison impossible")
         log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment)")
         return _finish(UnitGateOutcome(passed=False, signal="comparison-unavailable", detail=detail, env=True,
-                                       ran=True, branch=branch_run, baseline=baseline_run))
+                                       ran=True, branch=branch_run, baseline=baseline_run,
+                                       baseline_note=baseline_note, baseline_source=baseline_source))
 
     new_files = tuple(sorted(set(branch_run.failing_files) - set(baseline_run.failing_files)))
     worse_count = branch_run.failures > baseline_run.failures
@@ -1769,17 +2017,20 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
             reasons.append(f"{branch_run.failures} failures vs baseline {baseline_run.failures}")
         if new_files:
             reasons.append(f"newly-failing file(s): {', '.join(new_files)}")
-        detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — " + "; ".join(reasons))
+        detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — " + "; ".join(reasons)
+                  + f" (baseline {baseline_source})")
         log.error(f"⛔ UNIT BASELINE GATE FAILED — {detail}. BLOCKING: branch stays unmerged.")
         return _finish(UnitGateOutcome(passed=False, signal="regression", detail=detail,
-                                       ran=True, branch=branch_run, baseline=baseline_run))
+                                       ran=True, branch=branch_run, baseline=baseline_run,
+                                       baseline_note=baseline_note, baseline_source=baseline_source))
 
     verdict = ("equal to" if branch_run.failures == baseline_run.failures else "below")
     detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
-              f"{baseline_run.failures} — no new failing file")
-    log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}")
-    return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run,
-                                   baseline=baseline_run, detail=detail))
+              f"{baseline_run.failures} — no new failing file (baseline {baseline_source})")
+    log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}; baseline {baseline_note}")
+    return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run, baseline=baseline_run,
+                                   baseline_note=baseline_note, baseline_source=baseline_source,
+                                   detail=detail))
 
 
 def _unit_done(o: UnitGateOutcome, started: float, repo_path: Path,
@@ -1827,6 +2078,7 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
         "duration_s": round(o.duration_s, 2),
         "baseline": _side(o.baseline),
         "baseline_note": o.baseline_note,
+        "baseline_source": o.baseline_source,   # [ORCH-5] AC-O5-05 / decision 5
         "branch": _side(o.branch),
     })
     log_file.write_text(json.dumps(entries, indent=2))
