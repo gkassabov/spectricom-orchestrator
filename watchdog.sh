@@ -51,6 +51,17 @@ queue_alive() {
 cleanup_orphan_state() {
   log "Cleaning orphan running.json"
   rm -f "$STATE"
+  # S7-CORE-8 [ORCH-4]: the lock is per repo — state/running-<repo>.json — and $STATE is now
+  # a derived mirror of it. Drop only the locks whose PID is gone; a live fire in ANOTHER
+  # repo keeps its lock, which is the whole point of making the lock per-repo.
+  for lock in "$ORCH"/state/running-*.json; do
+    [[ -e "$lock" ]] || continue
+    lpid=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['pid'])" "$lock" 2>/dev/null)
+    if [[ -z "$lpid" ]] || ! kill -0 "$lpid" 2>/dev/null; then
+      log "Cleaning orphan lock $(basename "$lock") (pid=${lpid:-unreadable})"
+      rm -f "$lock"
+    fi
+  done
   cd "$REPO" || return
   for branch in $(git branch | grep -oE 'orch-mp-toni-brief-(1-5a|1-5b|2-0|3-0)-[0-9]+-[a-z-]+'); do
     if git diff main.."$branch" --quiet 2>/dev/null; then

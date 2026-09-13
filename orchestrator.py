@@ -865,14 +865,115 @@ def clear_running():
         pass
 
 
+# ── the fire lock (S7-CORE-8 [ORCH-4]) ────────────────────────────────────────────────
+# The lock is PER REPO. System Prompt §5.19.1 holds that cross-repo parallel fires are safe —
+# different worktrees, different merge targets, no collision — and that was true of the design
+# and false of this implementation: one global `state/running.json` refused a clinical-mp route
+# while an orchestrator meta-fire held it (observed 2026-09-12). Within a repo the lock is
+# still serial; across repos it no longer refuses.
+#
+# Two files, deliberately:
+#   state/running-<repo>.json  — the LOCK. One per repo. This is what is taken and released.
+#   state/running.json         — a MIRROR of the newest live lock, maintained for the readers
+#                                that predate per-repo locking and know only this path:
+#                                qstat.sh, watchdog.sh, and show_status() below. A migration
+#                                that orphans a reader is worse than the bug it fixes
+#                                (brief decision 2), so the old path keeps working.
+# The mirror is derived, never authoritative: every write and every clear rebuilds it from the
+# per-repo locks, so it can go stale only for as long as one call takes.
+_RUNNING_MARKER_GLOB = "running-*.json"
+
+
+def _marker_repo_slug(repo_name: str) -> str:
+    """Repo name → a filename component. Never empty, never a path traversal."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", (repo_name or "").strip()).strip("-.")
+    return slug or "unknown"
+
+
+def _running_marker_dir() -> Path:
+    # Resolved per call, not at import: ORCH_DIR is patched in tests and the marker must
+    # follow it.
+    return ORCH_DIR / "state"
+
+
+def _legacy_running_marker() -> Path:
+    """state/running.json — the pre-[ORCH-4] path. Kept as a mirror, see above."""
+    return _running_marker_dir() / "running.json"
+
+
+def _running_marker_path(repo_name: Optional[str] = None) -> Path:
+    """The lock file for `repo_name`. With no repo, the legacy path — that is the shape the
+    pre-[ORCH-4] callers and tests use, and it still means "the fire", globally."""
+    if not repo_name:
+        return _legacy_running_marker()
+    return _running_marker_dir() / f"running-{_marker_repo_slug(repo_name)}.json"
+
+
+def _pid_alive(pid) -> Optional[bool]:
+    """True / False / None where None is "exists but is not ours to signal" (PermissionError).
+    None is treated as ALIVE by the lock — refusing a live fire we cannot prove is dead is the
+    safe direction."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+
+
+def _read_marker(path: Path) -> Optional[dict]:
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, IOError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _refresh_legacy_running_mirror():
+    """Rebuild state/running.json from the per-repo locks: the newest one, or nothing at all.
+
+    Called after every write and every clear. A stale per-repo lock is NOT cleaned here —
+    cleanup is the lock check's job and is scoped to one repo (brief decision 3); the mirror
+    only reflects what the lock files say."""
+    legacy = _legacy_running_marker()
+    # A LIVE lock always wins over a dead one, whatever the timestamps say: the single-file
+    # readers ask "is a fire running?", and answering with a corpse while a real fire burns
+    # would be the [ORCH-4] bug again in miniature. With only dead locks left, the newest of
+    # those is mirrored — qstat.sh's "stale PID" branch is a real, reachable report.
+    newest = None
+    newest_live = False
+    for p in sorted(_running_marker_dir().glob(_RUNNING_MARKER_GLOB)):
+        data = _read_marker(p)
+        if data is None:
+            continue
+        live = _pid_alive(data.get("pid", 0)) is not False
+        if newest is None or (live, str(data.get("started_at", ""))) > \
+                (newest_live, str(newest.get("started_at", ""))):
+            newest, newest_live = data, live
+    try:
+        if newest is None:
+            legacy.unlink(missing_ok=True)
+        else:
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text(json.dumps(newest, indent=2))
+    except OSError:
+        pass
+
+
 def _write_running_marker(batch_file: Path, repo_name: str, repo_path: Path,
                           branch: str, meta_fire_worktree: Optional[Path],
                           is_self_mod: bool):
-    """Write state/running.json marker for in-flight fire visibility."""
-    marker_dir = ORCH_DIR / "state"
+    """Take the fire lock for `repo_name`: state/running-<repo>.json, plus the mirror."""
+    marker_dir = _running_marker_dir()
     marker_dir.mkdir(parents=True, exist_ok=True)
-    marker = marker_dir / "running.json"
-    marker.write_text(json.dumps({
+    payload = json.dumps({
         "pid": os.getpid(),
         "batch_id": batch_file.stem,
         "repo": repo_name,
@@ -881,54 +982,102 @@ def _write_running_marker(batch_file: Path, repo_name: str, repo_path: Path,
         "started_at": datetime.now().astimezone().isoformat(),
         "meta_fire_worktree": str(meta_fire_worktree) if meta_fire_worktree else None,
         "is_self_mod": is_self_mod,
-    }, indent=2))
+    }, indent=2)
+    _running_marker_path(repo_name).write_text(payload)
+    _refresh_legacy_running_mirror()
 
 
-def _clear_running_marker():
-    """Remove state/running.json marker."""
-    marker = ORCH_DIR / "state" / "running.json"
-    try:
-        marker.unlink(missing_ok=True)
-    except Exception:
-        pass
+def _clear_running_marker(repo_name: Optional[str] = None):
+    """Release the fire lock.
+
+    With a repo: release THAT repo's lock only — another repo's live fire is untouched.
+    Without one (the pre-[ORCH-4] call shape): release every lock this process owns, plus the
+    mirror. Either way the mirror is rebuilt afterwards, so a still-live fire in another repo
+    reappears in state/running.json immediately."""
+    if repo_name:
+        try:
+            _running_marker_path(repo_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    else:
+        me = os.getpid()
+        for p in list(_running_marker_dir().glob(_RUNNING_MARKER_GLOB)):
+            data = _read_marker(p)
+            if data is None or data.get("pid") == me:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        try:
+            _legacy_running_marker().unlink(missing_ok=True)
+        except OSError:
+            pass
+    _refresh_legacy_running_mirror()
 
 
-def _check_stale_marker() -> bool:
-    """Check for stale or active running.json marker at startup.
+def _lock_candidates(repo_name: Optional[str]) -> list:
+    """The marker files the lock check must consider for `repo_name`.
 
-    Returns True if safe to proceed. Exits with code 4 if another fire is active.
+    Scoped deliberately (brief decision 3): with a repo, only that repo's lock — and, when it
+    has none yet, a pre-[ORCH-4] mirror that names it (or names nobody), so a marker written by
+    the old code is still honoured and still cleaned. Repo B's lock is never in repo A's list,
+    so a dead PID under A can never clear B."""
+    if not repo_name:
+        # Legacy/global shape: any live fire anywhere refuses.
+        paths = sorted(_running_marker_dir().glob(_RUNNING_MARKER_GLOB))
+        legacy = _legacy_running_marker()
+        if legacy.exists():
+            paths.append(legacy)
+        return paths
+    own = _running_marker_path(repo_name)
+    if own.exists():
+        return [own]
+    legacy = _legacy_running_marker()
+    if legacy.exists():
+        data = _read_marker(legacy)
+        if data is None or data.get("repo") in (None, "", repo_name):
+            return [legacy]
+    return []
+
+
+def _check_stale_marker(repo_name: Optional[str] = None) -> bool:
+    """Take-or-refuse the fire lock at startup, for `repo_name`.
+
+    Returns True if safe to proceed. Exits with code 4 if a fire is already live FOR THIS REPO.
+    A fire in a different repo is not this repo's business and does not refuse it (AC-O4-01).
     """
-    marker = ORCH_DIR / "state" / "running.json"
-    if not marker.exists():
-        return True
+    for marker in _lock_candidates(repo_name):
+        data = _read_marker(marker)
+        if data is None:
+            marker.unlink(missing_ok=True)
+            continue
 
-    try:
-        data = json.loads(marker.read_text())
-    except (json.JSONDecodeError, IOError):
-        marker.unlink(missing_ok=True)
-        return True
+        pid = data.get("pid", 0)
+        alive = _pid_alive(pid)
+        if alive is False:
+            log.warning(
+                f"⚠️  Stale running.json from {data.get('started_at', '?')} "
+                f"(pid {pid} no longer alive); cleaned up."
+            )
+            marker.unlink(missing_ok=True)
+            continue
 
-    pid = data.get("pid", 0)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        log.warning(
-            f"⚠️  Stale running.json from {data.get('started_at', '?')} "
-            f"(pid {pid} no longer alive); cleaned up."
+        # Alive, or alive-but-not-ours-to-signal. Refuse, and NAME THE REPO (AC-O4-02) —
+        # "another fire" on line 2 of a log whose line 1 says `Executor: …` reads as progress.
+        who = data.get("repo") or repo_name or "?"
+        _refresh_legacy_running_mirror()
+        print(
+            f"❌ A fire is already in progress for repo '{who}' "
+            f"(pid {pid}, batch {data.get('batch_id', '?')}, "
+            f"started {data.get('started_at', '?')}). "
+            f"Wait or kill the existing process. "
+            f"Fires for OTHER repos are not blocked by this lock.",
+            file=sys.stderr,
         )
-        marker.unlink(missing_ok=True)
-        return True
-    except PermissionError:
-        pass
+        sys.exit(4)
 
-    print(
-        f"❌ Another orchestrator fire is in progress "
-        f"(pid {pid}, batch {data.get('batch_id', '?')}, "
-        f"started {data.get('started_at', '?')}). "
-        f"Wait or kill the existing process.",
-        file=sys.stderr,
-    )
-    sys.exit(4)
+    _refresh_legacy_running_mirror()
+    return True
 
 
 # ═══════════════════════════════════════════════════════
@@ -1934,7 +2083,8 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
         result = _run_batch_inner(batch_file, proj, started, worktree)
     finally:
         clear_running()
-        _clear_running_marker()
+        # [ORCH-4]: release THIS repo's lock. Another repo's concurrent fire keeps its own.
+        _clear_running_marker(ACTIVE_REPO_NAME)
         if meta_wt:
             if is_self_mod and meta_branch:
                 if result is not None and result.exit_code == 0 and result.status == Status.PASSED:
@@ -2316,17 +2466,19 @@ def show_status():
     s = load_state()
     print(f"\n{'═'*60}\nSPECTRICOM ORCHESTRATOR v3.1 STATUS\n{'═'*60}")
 
-    marker = ORCH_DIR / "state" / "running.json"
-    if marker.exists():
+    # [ORCH-4] AC-O4-03: `status` reads the per-repo locks now, and falls back to the legacy
+    # state/running.json when there are none — so a marker written by the pre-[ORCH-4] code,
+    # or by a still-running old process, is still shown rather than silently dropped.
+    markers = sorted((ORCH_DIR / "state").glob(_RUNNING_MARKER_GLOB))
+    if not markers and _legacy_running_marker().exists():
+        markers = [_legacy_running_marker()]
+    if not markers:
+        print(f"\n  No active fire.")
+    for marker in markers:
         try:
             data = json.loads(marker.read_text())
             pid = data.get("pid", 0)
-            pid_alive = False
-            try:
-                os.kill(pid, 0)
-                pid_alive = True
-            except (ProcessLookupError, PermissionError):
-                pass
+            pid_alive = _pid_alive(pid) is not False
 
             if pid_alive:
                 started_str = data.get("started_at", "?")
@@ -2346,15 +2498,15 @@ def show_status():
                 if data.get("meta_fire_worktree"):
                     print(f"    Worktree: {data['meta_fire_worktree']}")
             else:
-                print(f"\n  ⚠️  Stale running.json from {data.get('started_at', '?')} "
+                print(f"\n  ⚠️  Stale {marker.name} from {data.get('started_at', '?')} "
                       f"(pid {pid} no longer alive)")
                 print(f"    Cleaning up stale marker...")
                 marker.unlink(missing_ok=True)
         except (json.JSONDecodeError, IOError):
-            print(f"\n  ⚠️  Corrupt running.json — cleaning up")
+            print(f"\n  ⚠️  Corrupt {marker.name} — cleaning up")
             marker.unlink(missing_ok=True)
-    else:
-        print(f"\n  No active fire.")
+    if markers:
+        _refresh_legacy_running_mirror()
 
     print(f"  Project:    {PROJECT_ROOT}")
     c, f = s.get("completed",[]), s.get("failed",[])
@@ -2614,7 +2766,9 @@ def main():
     log.info(f"Executor: model={TONI_MODEL} effort={TONI_EFFORT}")
 
     if a.cmd == "run":
-        _check_stale_marker()
+        # [ORCH-4]: the lock is per repo — a live fire in a DIFFERENT repo does not refuse
+        # this one. set_active_repo() ran above, so ACTIVE_REPO_NAME is resolved by here.
+        _check_stale_marker(ACTIVE_REPO_NAME)
         bf = resolve(a.batch_file)
         briefs = parse_batch(bf)
         if not approval_gate(bf, briefs, approve=a.approve, force=a.force,
