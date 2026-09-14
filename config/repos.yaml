@@ -37,6 +37,12 @@ repos:
     worktree_mode: single-stream
     briefs_subdir: briefs
     test_cmd: "npm test"
+    # S7-CORE-9: the 900s default is NOT enough for this repo's branch leg. Measured
+    # 2026-09-13 on the RM-I-021 route: the warm-checkout branch run reached 898.3s and was
+    # killed at 900 with no summary parsed — BLOCKED(environment), nothing merged. `npm test`
+    # here is the whole repo (773 files / 7103 tests). The [ORCH-5] comment claiming the
+    # branch leg "fits in 900s on a warm checkout" was measured once, optimistically.
+    test_timeout_s: 1800
     default: false
 
   orchestrator:
