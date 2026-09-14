@@ -1266,3 +1266,124 @@ class TestCountIsEvidenceNotAVerdict:
             "worse_count must no longer gate the verdict on its own"
         assert "if regressions:" in src, "the verdict must key on the confirmed-regression set alone"
         assert "worse_count" in src, "the count is still measured and logged, just not a verdict"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-9 [ORCH-7] — a `flaky` report over the accumulated confirmation data.
+#
+# ORCH-6 persists the files the confirmation pass classifies as flakes; ORCH-6b settled what
+# fails a route. Nothing surfaces the accumulated set — the only way to see it was to read
+# the cache JSON by hand. This report is read-only and changes no verdict.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+def _write_cache(archive, entries):
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / orchestrator.UNIT_BASELINE_CACHE_FILE).write_text(
+        json.dumps({"version": orchestrator.UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
+
+
+class TestFlakyReport:
+    """AC-O7-01 … AC-O7-08."""
+
+    def test_ac_o7_02_an_old_shape_entry_is_read_as_count_unknown(self, tmp_path):
+        """AC-O7-02: an ORCH-6-shape entry (flaky_files only, no flaky_seen) must not crash
+        the new command — read as count-unknown instead."""
+        archive = tmp_path / "archive"
+        _write_cache(archive, {
+            "gated-repo@abc@11111111": {
+                "sha": "abc", "repo": "gated-repo", "test_cmd": "npm test",
+                "flaky_files": [B],
+            },
+        })
+        report = orchestrator._flaky_collect(archive)
+        assert report["gated-repo"][B]["count"] is None
+        assert report["gated-repo"][B]["last_seen"] is None
+
+    def test_ac_o7_05_an_empty_cache_prints_cleanly_and_does_not_raise(self, tmp_path, capsys):
+        archive = tmp_path / "archive"
+        _write_cache(archive, {})
+        with patch.object(orchestrator, "SIT_ARCHIVE_DIR", archive):
+            orchestrator.flaky_report()
+        assert "no flakes recorded" in capsys.readouterr().out.lower()
+
+    def test_ac_o7_05_a_missing_cache_file_also_prints_cleanly(self, tmp_path, capsys):
+        archive = tmp_path / "does-not-exist"
+        with patch.object(orchestrator, "SIT_ARCHIVE_DIR", archive):
+            orchestrator.flaky_report()
+        assert "no flakes recorded" in capsys.readouterr().out.lower()
+
+    def test_ac_o7_01_a_single_occurrence_file_is_reported_with_its_count(self, tmp_path, capsys):
+        archive = tmp_path / "archive"
+        _write_cache(archive, {
+            "gated-repo@abc@11111111": {
+                "sha": "abc", "repo": "gated-repo", "test_cmd": "npm test",
+                "flaky_files": [B],
+                "flaky_seen": {B: {"count": 1, "last_seen": "2026-09-13T12:00:00"}},
+            },
+        })
+        with patch.object(orchestrator, "SIT_ARCHIVE_DIR", archive):
+            orchestrator.flaky_report()
+        out = capsys.readouterr().out
+        assert B in out and "1x" in out
+        assert "quarantine" not in out
+
+    def test_ac_o7_04_a_file_named_at_the_threshold_is_a_quarantine_candidate(self, tmp_path, capsys):
+        """AC-O7-04: 2+ sightings ⇒ marked. The threshold itself is a named constant."""
+        archive = tmp_path / "archive"
+        _write_cache(archive, {
+            "gated-repo@abc@11111111": {
+                "sha": "abc", "repo": "gated-repo", "test_cmd": "npm test",
+                "flaky_files": [B],
+                "flaky_seen": {B: {"count": orchestrator.UNIT_FLAKY_QUARANTINE_THRESHOLD,
+                                   "last_seen": "2026-09-13T12:00:00"}},
+            },
+        })
+        with patch.object(orchestrator, "SIT_ARCHIVE_DIR", archive):
+            orchestrator.flaky_report()
+        assert "quarantine candidate" in capsys.readouterr().out
+
+    def test_ac_o7_03_repo_filter_narrows_the_report_to_one_repo(self, tmp_path, capsys):
+        archive = tmp_path / "archive"
+        _write_cache(archive, {
+            "gated-repo@abc@11111111": {
+                "sha": "abc", "repo": "gated-repo", "test_cmd": "npm test",
+                "flaky_files": [B], "flaky_seen": {B: {"count": 1, "last_seen": "t"}},
+            },
+            "other-repo@def@22222222": {
+                "sha": "def", "repo": "other-repo", "test_cmd": "npm test",
+                "flaky_files": [C], "flaky_seen": {C: {"count": 1, "last_seen": "t"}},
+            },
+        })
+        with patch.object(orchestrator, "SIT_ARCHIVE_DIR", archive):
+            orchestrator.flaky_report(repo_filter="gated-repo")
+        out = capsys.readouterr().out
+        assert "gated-repo" in out and B in out
+        assert "other-repo" not in out and C not in out
+
+    def test_ac_o7_06_the_report_performs_no_writes(self, tmp_path):
+        archive = tmp_path / "archive"
+        _write_cache(archive, {
+            "gated-repo@abc@11111111": {
+                "sha": "abc", "repo": "gated-repo", "test_cmd": "npm test",
+                "flaky_files": [B], "flaky_seen": {B: {"count": 1, "last_seen": "t"}},
+            },
+        })
+        cache_file = archive / orchestrator.UNIT_BASELINE_CACHE_FILE
+        before = cache_file.read_bytes()
+        with patch.object(orchestrator, "SIT_ARCHIVE_DIR", archive):
+            orchestrator.flaky_report()
+        assert cache_file.read_bytes() == before
+
+    def test_the_flaky_report_end_to_end_from_a_real_confirmed_flake(self, repo, tmp_path, capsys):
+        """Wires ORCH-6's confirmation pass to the ORCH-7 report: a real confirmed flake shows
+        up with count 1, and the underlying verdict is untouched (o.passed still True)."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, B], failed=2), vitest([A, A], failed=2),
+                            confirm_out=vitest(failed=0, total_tests=1, total_files=1))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is True
+        with patch.object(orchestrator, "SIT_ARCHIVE_DIR", archive):
+            orchestrator.flaky_report()
+        out = capsys.readouterr().out
+        assert B in out and "1x" in out

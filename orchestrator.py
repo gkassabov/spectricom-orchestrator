@@ -291,6 +291,9 @@ UNIT_BASELINE_LINK_PATHS = ("node_modules", "venv", ".venv", "yorsie/node_module
 # baseline run is skipped in that case and the gate costs one suite run, not two.
 # Set False to always measure both sides.
 UNIT_GATE_SKIP_BASELINE_WHEN_GREEN = True
+# S7-CORE-9 [ORCH-7] AC-O7-04: named once is noise; named this many times is a file to
+# quarantine. Never inline a number at a call site (CLAUDE.md).
+UNIT_FLAKY_QUARANTINE_THRESHOLD = 2
 
 # ═══════════════════════════════════════════════════════
 # PRE-MERGE GATE POLICY (S7-CORE-4 [ORCH-1] — gate-then-merge)
@@ -1867,7 +1870,11 @@ def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str,
     baseline entry for `sha` — every existing field (brief §4 STOP trigger 3) is untouched.
     Two routes off the same base naming the same file is exactly the recurrence signal the
     brief asks to make visible, so this ACCUMULATES rather than overwrites. A no-op when
-    there is no matching entry to attach to — nothing here invents one."""
+    there is no matching entry to attach to — nothing here invents one.
+
+    [ORCH-7] AC-O7-02: also accumulates a per-file `flaky_seen` count and last-seen
+    timestamp, ADDITIVE alongside `flaky_files` — a second, ADDITIVE field, not a
+    replacement for it. Entries written before this existed simply lack `flaky_seen`."""
     if not flakes:
         return
     entries = _unit_cache_load(archive)
@@ -1876,11 +1883,74 @@ def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str,
     if not _unit_cache_entry_matches(entry, repo_name, sha, cmd):
         return
     entry["flaky_files"] = sorted(set(entry.get("flaky_files") or ()) | set(flakes))
+    now = datetime.now().isoformat()
+    seen = entry.get("flaky_seen") or {}
+    for f in flakes:
+        prior = seen.get(f) or {}
+        seen[f] = {"count": prior.get("count", 0) + 1, "last_seen": now}
+    entry["flaky_seen"] = seen
     try:
         _unit_cache_file(archive).write_text(
             json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
     except OSError as e:
         log.warning(f"⚠️  Unit gate: flaky-file set not persisted ({e})")
+
+
+def _flaky_collect(archive: Path, repo_filter: str = "") -> dict:
+    """[ORCH-7] AC-O7-01/02/03: read-only aggregation of every cache entry's flaky data,
+    grouped by repo. Never writes. An entry written before `flaky_seen` existed (ORCH-6
+    shape) still contributes its files, with `count`/`last_seen` left None — read without
+    error rather than crashing (AC-O7-02)."""
+    report: dict = {}
+    for entry in _unit_cache_load(archive).values():
+        if not isinstance(entry, dict):
+            continue
+        repo_name = entry.get("repo")
+        if not repo_name or (repo_filter and repo_name != repo_filter):
+            continue
+        repo_report = report.setdefault(repo_name, {})
+        seen = entry.get("flaky_seen") or {}
+        for f in (entry.get("flaky_files") or ()):
+            row = repo_report.setdefault(f, {"count": None, "last_seen": None})
+            stat = seen.get(f)
+            if not stat:
+                continue
+            c = stat.get("count")
+            row["count"] = c if row["count"] is None else row["count"] + (c or 0)
+            last_seen = stat.get("last_seen")
+            if last_seen and (row["last_seen"] is None or last_seen > row["last_seen"]):
+                row["last_seen"] = last_seen
+    return report
+
+
+def flaky_report(repo_filter: str = ""):
+    """[ORCH-7] the `flaky` subcommand: per repo, every file the confirmation pass has ever
+    classified as a flake, how many times, and when it was last seen — most-frequent first.
+    AC-O7-01/03/04/05. Read-only: only ever calls `_unit_cache_load` (AC-O7-06)."""
+    report = _flaky_collect(SIT_ARCHIVE_DIR, repo_filter)
+    if not any(report.values()):
+        print("No flakes recorded.")
+        return
+
+    print(f"\n{'═'*60}")
+    print(f"FLAKY FILES{f' — {repo_filter}' if repo_filter else ''}")
+    print(f"{'═'*60}")
+    for repo_name in sorted(report):
+        files = report[repo_name]
+        if not files:
+            continue
+        print(f"\n  {repo_name}:")
+        ranked = sorted(
+            files.items(),
+            key=lambda kv: (-(kv[1]["count"] if kv[1]["count"] is not None else -1), kv[0]))
+        for f, stat in ranked:
+            count = stat["count"]
+            count_str = f"{count}x" if count is not None else "?x"
+            last_seen = (stat["last_seen"] or "unknown")[:19]
+            quarantine = (count is not None and count >= UNIT_FLAKY_QUARANTINE_THRESHOLD)
+            tag = "  ⚠️  quarantine candidate" if quarantine else ""
+            print(f"    {count_str:>4}  last seen {last_seen:<19}  {f}{tag}")
+    print(f"{'═'*60}\n")
 
 
 def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
@@ -3104,6 +3174,9 @@ def main():
     bp.add_argument("--pattern", default="orch-*", help="Branch glob pattern (default: orch-*)")
     bp.add_argument("--force", action="store_true", help="Delete unmerged branches too")
 
+    fkp = sp.add_parser("flaky", help="Report the accumulated flaky-file tail (read-only)")
+    fkp.add_argument("--repo", default="", help="Narrow the report to one repo (from config/repos.yaml)")
+
     a = ap.parse_args()
 
     # OI-026 A3: resolve repo — --repo CLI > ## Repo: header > default
@@ -3193,6 +3266,9 @@ def main():
             list_branches(repo_path, a.pattern)
         elif a.action == "clean":
             clean_branches(repo_path, a.pattern, force=a.force)
+
+    elif a.cmd == "flaky":
+        flaky_report(getattr(a, "repo", "") or "")
 
     else:
         ap.print_help()
