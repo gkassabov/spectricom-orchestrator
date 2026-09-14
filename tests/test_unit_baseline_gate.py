@@ -196,15 +196,18 @@ class TestEligibleSetIsDerivedFromConfig:
 
 
 class TestBaselineComparison:
-    """AC-O3-03 / AC-O3-04 — §2.1: count AND failing-file set, both compared."""
+    """AC-O3-03 / AC-O3-04, superseded for the count half by [ORCH-6b] AC-O6b-03/05: the
+    failing-FILE set decides the verdict; the count is evidence only (see
+    TestFlakeVsRegressionConfirmation and TestCountIsEvidenceNotAVerdict below)."""
 
-    def test_more_failures_than_baseline_blocks(self, repo, tmp_path):
-        """AC-O3-03: current > baseline ⇒ HALT."""
+    def test_more_failures_with_no_newly_failing_file_passes_and_logs_the_delta(self, repo, tmp_path):
+        """AC-O6b-03: current > baseline but the same file set on both sides ⇒ PASS; the
+        count rise is logged as a named observation, not a verdict."""
         o, _ = run_gate(repo, tmp_path,
                         branch_out=vitest([A, A, A], failed=3),
                         baseline_out=vitest([A, A], failed=2))
-        assert o.passed is False and o.signal == "regression"
-        assert "3 failures vs baseline 2" in o.detail
+        assert o.passed is True and o.signal is None
+        assert "count rose from 2 to 3 with no newly-failing file" in o.detail
 
     def test_equal_failures_passes(self, repo, tmp_path):
         """AC-O3-03: current == baseline ⇒ pass. A zero gate would block here; this is not one."""
@@ -412,11 +415,13 @@ class TestGateDeclaresAndPersistsWhatItCollected:
         assert f"Unit gate baseline run — merge-base {repo.fork_point[:7]}: 6 files/18 tests, 2 failed in " in caplog.text
 
     def test_counts_are_persisted_with_the_run(self, repo, tmp_path):
+        """A genuinely new file (B, absent from the baseline's {A}) so this is a confirmed
+        regression under [ORCH-6b] AC-O6b-01, not just a count rise."""
         o, entries = run_gate(repo, tmp_path,
-                              branch_out=vitest([A, A], failed=2), baseline_out=vitest([A], failed=1))
+                              branch_out=vitest([B, B], failed=2), baseline_out=vitest([A], failed=1))
         e = entries[-1]
         assert e["branch"]["tests_total"] == 18 and e["branch"]["test_files_total"] == 6
-        assert e["branch"]["failures"] == 2 and e["branch"]["failing_files"] == [A]
+        assert e["branch"]["failures"] == 2 and e["branch"]["failing_files"] == [B]
         assert e["baseline"]["failures"] == 1 and e["baseline"]["ref"] == f"merge-base {repo.fork_point[:7]}"
         assert e["repo_name"] == "gated-repo" and e["passed"] is False
         assert e["signal"] == "regression"
@@ -522,7 +527,7 @@ class TestRedUnitGateLeavesTheBranchUnmerged:
         archive = tmp_path / "archive"
         with active(archive=archive), \
              patch.object(orchestrator, "_run_unit_suite",
-                          fake_suite(vitest([A, A, A], failed=3), vitest([A], failed=1))):
+                          fake_suite(vitest([B, B, B], failed=3), vitest([A], failed=1))):
             v = orchestrator.run_pre_merge_gates(repo, "route")
         assert v.outcome is not orchestrator.GateOutcome.PASS
         # The self-mod lane's merge guard is shared with build/SIT and keys off the verdict.
@@ -947,14 +952,16 @@ class TestAncestorFallbackIsStatedNeverInferred:
                                                      repo.fork_point, "npm test") is None
 
     def test_an_ancestor_fallback_still_blocks_a_real_regression(self, repo, tmp_path):
-        """The fallback is a cheaper baseline, not a softer gate."""
+        """The fallback is a cheaper baseline, not a softer gate. B is a genuinely new file
+        (absent from the ancestor baseline's {A}), so [ORCH-6b] still calls this a regression."""
         archive = tmp_path / "archive"
         self._measure_ancestor(repo, tmp_path)
         with active(archive=archive), \
              patch.object(orchestrator, "_run_unit_suite",
-                          TestABaselineTimeoutIsEnvironmentNotProduct._baseline_times_out(vitest([A, A, A], failed=3))):
+                          TestABaselineTimeoutIsEnvironmentNotProduct._baseline_times_out(vitest([B, B, B], failed=3))):
             o = orchestrator.run_unit_gate(repo, "route2", archive_path=archive)
         assert o.passed is False and o.signal == "regression"
+        assert f"newly-failing file(s): {B}" in o.detail
         assert "3 failures vs baseline 2" in o.detail
 
 
@@ -979,8 +986,12 @@ class TestOrch3SemanticsSurviveCaching:
         return o
 
     def test_more_failures_than_a_cached_baseline_still_blocks(self, repo, tmp_path):
-        o = self._cached(repo, tmp_path, vitest([A, A, A], failed=3), vitest([A, A], failed=2))
+        """B is a genuinely new file (absent from the cached baseline's {A}), so [ORCH-6b]
+        still calls this a regression — a count rise alone would not (see
+        TestCountIsEvidenceNotAVerdict)."""
+        o = self._cached(repo, tmp_path, vitest([B, B, B], failed=3), vitest([A, A], failed=2))
         assert o.passed is False and o.signal == "regression"
+        assert f"newly-failing file(s): {B}" in o.detail
         assert "3 failures vs baseline 2" in o.detail
 
     def test_equal_to_a_cached_baseline_still_passes(self, repo, tmp_path):
@@ -1188,3 +1199,70 @@ class TestFlakeVsRegressionConfirmation:
         added = "\n".join(l for l in r.stdout.splitlines() if l.startswith("+") and not l.startswith("+++"))
         assert not re.search(r'os\.environ\.get\(\s*["\'](DISABLE|SKIP)_', added), \
             "AC-O6-08 violated — a new DISABLE_/SKIP_ environment read was introduced:\n" + added
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-9 [ORCH-6b] — a failure COUNT is not a verdict.
+#
+# ORCH-6's confirmation pass worked on its first live route and correctly called two
+# newly-failing files flakes — and the route was blocked anyway, because `worse_count`
+# survived as an independent trigger. The same tree measures 68/104/106/118 failures across
+# runs on one commit; a count delta carries no signal. A named file that fails alone does.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+class TestCountIsEvidenceNotAVerdict:
+    """AC-O6b-01…05 — the verdict keys on confirmed files, never on the count alone."""
+
+    def test_ac_o6b_01_all_confirmed_flakes_pass_regardless_of_the_count_delta(self, repo, tmp_path):
+        """AC-O6b-01: every newly-failing file confirmed a FLAKE ⇒ PASS even though the count
+        also rose (1 → 2) — the count delta must not override the confirmed flake set."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, C], failed=2, total_tests=20, total_files=8),
+                            vitest([A], failed=1, total_tests=20, total_files=8),
+                            confirm_out=vitest(failed=0, total_tests=2, total_files=2))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is True and o.signal is None
+        assert o.flaky_files == tuple(sorted((B, C)))
+        assert "confirmed FLAKY in isolation" in o.detail and B in o.detail and C in o.detail
+        assert B in o.collection and C in o.collection, "the flaky set still reaches FINAL STATUS"
+
+    def test_ac_o6b_02_a_confirmed_regression_fails_even_as_the_count_falls(self, repo, tmp_path):
+        """AC-O6b-02: a confirmed regression fails the route even though the branch has FEWER
+        total failures than the baseline — the count cannot excuse a named regression either
+        direction."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B], failed=1, total_tests=20, total_files=8),
+                            vitest([A, A, A, A], failed=4, total_tests=20, total_files=8),
+                            confirm_out=vitest([B], failed=1, total_tests=1, total_files=1))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is False and o.signal == "regression"
+        assert f"newly-failing file(s): {B}" in o.detail
+        assert "failures vs baseline" not in o.detail, "the count fell — it must not appear as a reason"
+
+    def test_ac_o6b_03_count_rose_with_no_newly_failing_file_passes_and_names_the_delta(self, repo, tmp_path):
+        """AC-O6b-03: no newly-failing file, count rose ⇒ PASS, with the delta logged as an
+        explicit, named observation so the noise stays visible without blocking."""
+        o, _ = run_gate(repo, tmp_path,
+                        branch_out=vitest([A, A, A], failed=3), baseline_out=vitest([A, A], failed=2))
+        assert o.passed is True and o.signal is None
+        assert "count rose from 2 to 3 with no newly-failing file" in o.detail
+
+    def test_ac_o6b_04_count_fell_with_no_newly_failing_file_passes_as_today(self, repo, tmp_path):
+        """AC-O6b-04: no newly-failing file, count fell ⇒ PASS, unchanged from before."""
+        o, _ = run_gate(repo, tmp_path,
+                        branch_out=vitest([A], failed=1), baseline_out=vitest([A, A], failed=2))
+        assert o.passed is True and o.signal is None
+        assert "1 failures, below the merge-base baseline of 2" in o.detail
+        assert "count rose" not in o.detail
+
+    def test_ac_o6b_05_worse_count_never_appears_in_the_verdict_boolean(self):
+        """AC-O6b-05: `worse_count` is measured and used for logging/observation only — it
+        must never appear in the boolean that decides the return."""
+        src = (REPO_ROOT / "orchestrator.py").read_text()
+        assert "if worse_count or regressions" not in src, \
+            "worse_count must no longer gate the verdict on its own"
+        assert "if regressions:" in src, "the verdict must key on the confirmed-regression set alone"
+        assert "worse_count" in src, "the count is still measured and logged, just not a verdict"

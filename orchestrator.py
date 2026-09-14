@@ -1988,12 +1988,13 @@ def _unit_gate_eligible_repos() -> set:
 
 def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                   archive_path: Optional[Path] = None) -> UnitGateOutcome:
-    """Baseline unit-suite gate. Halts iff the branch is WORSE than its merge base.
+    """Baseline unit-suite gate. Halts iff the branch has a confirmed regression.
 
-    §2.1 — two comparisons, both must hold for a pass:
-      * `current_failures <= baseline_failures` (equal or fewer passes), and
-      * no test FILE failing on the branch that was green at the merge base — a newly-red
-        file is a regression even when the total count did not rise.
+    [ORCH-6b] decision 1 — a regression is a named test FILE that fails in isolation on the
+    branch and did not fail at the merge base. That, and only that, produces FAIL(product).
+    The failure-COUNT delta is measured, logged and cached as evidence, but never appears in
+    the boolean that decides the verdict — the same tree measures too noisily run to run for
+    a count alone to carry signal.
     §2.4 — zero collection is BLOCKED(environment), never FAIL(product) and never a PASS.
     """
     started = time.time()
@@ -2092,6 +2093,9 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                                        baseline_note=baseline_note, baseline_source=baseline_source))
 
     new_files = tuple(sorted(set(branch_run.failing_files) - set(baseline_run.failing_files)))
+    # S7-CORE-9 [ORCH-6b] decision 1/2: the same tree measures 68/104/106/118 failures across
+    # runs on one commit — a count delta carries no signal on its own. It is still measured,
+    # logged and cached below, but it never appears in the boolean that decides the verdict.
     worse_count = branch_run.failures > baseline_run.failures
 
     flakes, regressions = (), ()
@@ -2121,15 +2125,13 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
             _unit_cache_record_flakes(archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME, base_sha,
                                       test_cmd, flakes)
 
-    if worse_count or regressions:
-        # AC-O6-04: a regression is never excused by a flake alongside it, and both sets are
-        # named separately — this wording is unchanged from before ORCH-6 when there are no
-        # flakes, so it still reads exactly as `newly-failing file(s): <file>`.
-        reasons = []
+    if regressions:
+        # AC-O6b-01/02: a regression is a named file confirmed still failing in isolation that
+        # did not fail at the merge base — that, and only that, produces FAIL(product). The
+        # count is carried along as evidence, never as an independent trigger (AC-O6b-05).
+        reasons = [f"newly-failing file(s): {', '.join(regressions)}"]
         if worse_count:
             reasons.append(f"{branch_run.failures} failures vs baseline {baseline_run.failures}")
-        if regressions:
-            reasons.append(f"newly-failing file(s): {', '.join(regressions)}")
         if flakes:
             reasons.append(f"flaky in isolation, not blocking: {', '.join(flakes)}")
         detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — " + "; ".join(reasons)
@@ -2144,11 +2146,17 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
               f"{baseline_run.failures} — no new failing file (baseline {baseline_source})")
     if flakes:
-        # AC-O6-02: flakes alone never fail the route, but they are still reported, never
+        # AC-O6b-01: every newly-failing file confirmed a FLAKE ⇒ PASS regardless of the
+        # count delta. Flakes alone never fail the route, but they are still reported, never
         # silently swallowed.
         detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
                   f"{baseline_run.failures} — newly-failing file(s) confirmed FLAKY in isolation "
                   f"(passed alone, not blocking): {', '.join(flakes)} (baseline {baseline_source})")
+    elif worse_count:
+        # AC-O6b-03: the count rose with no newly-failing file — logged as an explicit, named
+        # observation so the noise stays visible without blocking.
+        detail = (f"count rose from {baseline_run.failures} to {branch_run.failures} with no "
+                  f"newly-failing file — not blocking (baseline {baseline_source})")
     log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}; baseline {baseline_note}")
     return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run, baseline=baseline_run,
                                    baseline_note=baseline_note, baseline_source=baseline_source,
