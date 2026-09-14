@@ -10,6 +10,8 @@ Patterns follow tests/test_gate_collection.py.
 """
 import json
 import logging
+import re
+import shlex
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -48,6 +50,7 @@ PYTEST_GREEN = "79 passed in 0.82s\n"
 
 A = "src/lib/synth/seed-patients.test.ts"
 B = "src/lib/synth/wipe.test.ts"
+C = "src/lib/synth/tasks-queue.test.ts"
 
 
 class _RepoPath(type(Path())):
@@ -1015,3 +1018,173 @@ class TestTheSuiteCommandIsNotNarrowed:
         if r.returncode != 0:
             pytest.skip("no `main` ref to diff against")
         assert "test_cmd" not in r.stdout, f"AC-O5-07 violated — test_cmd touched:\n{r.stdout}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-9 [ORCH-6] — the gate must tell a flake from a regression.
+#
+# cad4753 measured 68 failures in one run and 106 in another; three files "newly failing"
+# at 2449a52 passed all 56 of their tests re-run in isolation. A single pair of whole-suite
+# runs is not enough evidence for FAIL(product). Newly-failing files are now confirmed
+# ALONE, on the branch, before the verdict is reached.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+def confirm_fake(branch_out, baseline_out, confirm_out=None, confirm_error=None,
+                 branch_code=None, baseline_code=None, confirm_code=None, confirm_calls=None):
+    """Like `fake_suite`, plus a third leg: the CONFIRMATION pass (ref prefix `confirm`)."""
+    def _fake(cmd, cwd, ref):
+        if ref.startswith(orchestrator.UNIT_BASELINE_REF_PREFIX):
+            raw, code = baseline_out, baseline_code
+        elif ref.startswith(orchestrator.UNIT_CONFIRM_REF_PREFIX):
+            if confirm_calls is not None:
+                confirm_calls.append(cmd)
+            if confirm_error:
+                return orchestrator.UnitSuiteRun(ref=ref, exit_code=-1, duration_s=0.05,
+                                                 error=confirm_error, output=confirm_error)
+            raw, code = confirm_out, confirm_code
+        else:
+            raw, code = branch_out, branch_code
+        if code is None:
+            code = 0 if ("failed" not in raw and "FAIL" not in raw) else 1
+        return orchestrator.UnitSuiteRun(ref=ref, exit_code=code, duration_s=0.1, output=raw,
+                                         **orchestrator._parse_unit_summary(raw))
+    return _fake
+
+
+class TestConfirmationCommandIsNarrowed:
+    """AC-O6-01 — the runner is invoked again on EXACTLY the suspect files, no other file."""
+
+    def test_bare_npm_test_gets_dash_dash_and_the_files(self):
+        cmd = orchestrator._unit_confirm_cmd("npm test", ("a.test.ts", "b.test.ts"))
+        assert cmd == "npm test -- a.test.ts b.test.ts"
+
+    def test_a_trailing_pytest_directory_is_replaced_not_joined(self):
+        """The whole-suite `tests/` argument must not survive alongside the file — that would
+        collect the bulk directory too, which is not isolation."""
+        cmd = orchestrator._unit_confirm_cmd("pytest -q tests/", ("tests/test_x.py",))
+        assert cmd == "pytest -q tests/test_x.py"
+        assert cmd.count("tests/") == 1
+
+    def test_a_bare_pytest_command_appends_the_files_directly(self):
+        cmd = orchestrator._unit_confirm_cmd(
+            "source venv/bin/activate && PYTHONPATH=. pytest", ("tests/test_x.py",))
+        assert cmd == "source venv/bin/activate && PYTHONPATH=. pytest tests/test_x.py"
+
+    def test_a_cd_prefixed_npm_command_still_gets_dash_dash(self):
+        cmd = orchestrator._unit_confirm_cmd("cd yorsie && npm test", ("a.test.ts",))
+        assert cmd == "cd yorsie && npm test -- a.test.ts"
+
+    def test_files_with_spaces_are_shell_quoted(self):
+        cmd = orchestrator._unit_confirm_cmd("npm test", ("a b.test.ts",))
+        assert shlex.split(cmd)[-1] == "a b.test.ts"
+
+
+class TestFlakeVsRegressionConfirmation:
+    """AC-O6-02 / AC-O6-03 / AC-O6-04 — the four verdicts, driven by a stubbed runner."""
+
+    def test_a_confirmed_flake_passes_the_route_and_is_named(self, repo, tmp_path):
+        """AC-O6-02: passes alone in isolation ⇒ FLAKE. Flakes alone never FAIL(product)."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, B], failed=2), vitest([A, A], failed=2),
+                            confirm_out=vitest(failed=0, total_tests=1, total_files=1))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is True
+        assert o.flaky_files == (B,)
+        assert "confirmed FLAKY in isolation" in o.detail and B in o.detail
+        assert B in o.collection, "AC-O6-06: named in what reaches FINAL STATUS"
+
+    def test_a_confirmed_regression_still_blocks_and_is_named(self, repo, tmp_path):
+        """AC-O6-03: fails alone in isolation ⇒ REGRESSION, still FAIL(product), file named."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, B], failed=2), vitest([A, A], failed=2),
+                            confirm_out=vitest([B], failed=1, total_tests=1, total_files=1))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is False and o.signal == "regression"
+        assert f"newly-failing file(s): {B}" in o.detail
+        assert o.flaky_files == ()
+
+    def test_a_mixed_result_fails_and_names_both_sets_separately(self, repo, tmp_path):
+        """AC-O6-04: mixed ⇒ FAIL(product); a regression is never excused by a flake beside it,
+        and the two sets are named separately."""
+        archive = tmp_path / "archive"
+        mixed_branch = vitest([B, C], failed=2, total_tests=20, total_files=8)
+        mixed_baseline = vitest([A, A], failed=2, total_tests=20, total_files=8)
+        confirm_out = vitest([B], failed=1, total_tests=2, total_files=2)  # B still red, C not ⇒ passed
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(mixed_branch, mixed_baseline, confirm_out=confirm_out)):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is False and o.signal == "regression"
+        assert f"newly-failing file(s): {B}" in o.detail
+        assert f"flaky in isolation, not blocking: {C}" in o.detail
+        assert o.flaky_files == (C,)
+
+    def test_an_unmeasurable_confirmation_blocks_as_environment(self, repo, tmp_path):
+        """AC-O6-05: fail closed — a confirmation pass that cannot complete is
+        BLOCKED(environment), never PASS and never FAIL(product)."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, B], failed=2), vitest([A, A], failed=2), confirm_error="timeout")):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is False and o.env is True
+        assert o.signal == "confirmation-unmeasurable"
+        assert "could not be confirmed in isolation" in o.detail
+
+    def test_an_unparseable_confirmation_summary_also_blocks_as_environment(self, repo, tmp_path):
+        """AC-O6-05: "no parseable summary", not just a timeout."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, B], failed=2), vitest([A, A], failed=2),
+                            confirm_out="make: *** [test] Error 1", confirm_code=2)):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.passed is False and o.env is True and o.signal == "confirmation-unmeasurable"
+
+    def test_confirmation_runs_exactly_the_suspect_set_no_other_file(self, repo, tmp_path):
+        """AC-O6-01, end to end: the command handed to the runner targets only `new_files`."""
+        archive = tmp_path / "archive"
+        calls = []
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, B], failed=2), vitest([A, A], failed=2),
+                            confirm_out=vitest(failed=0, total_tests=1, total_files=1),
+                            confirm_calls=calls)):
+            orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert calls == [orchestrator._unit_confirm_cmd("npm test", (B,))]
+
+    def test_the_flaky_set_is_persisted_on_the_baseline_cache_entry(self, repo, tmp_path):
+        """AC-O6-06: an ADDITIVE field on the cache entry; every existing field intact."""
+        archive = tmp_path / "archive"
+        with active(archive=archive), patch.object(
+                orchestrator, "_run_unit_suite",
+                confirm_fake(vitest([B, B], failed=2), vitest([A, A], failed=2),
+                            confirm_out=vitest(failed=0, total_tests=1, total_files=1))):
+            orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        entries = cache_entries(archive)
+        assert len(entries) == 1
+        e = list(entries.values())[0]
+        assert e["flaky_files"] == [B]
+        assert e["sha"] == repo.fork_point and e["failures"] == 2 and e["failing_files"] == [A]
+
+    def test_the_confirmation_leg_has_its_own_timeout(self):
+        """AC-O6-07: a named default, per-repo overridable, never inlined at the call site."""
+        with active():
+            assert orchestrator._unit_suite_timeout("confirm route") == orchestrator.UNIT_CONFIRM_TIMEOUT
+            with patch.dict(orchestrator.ACTIVE_REPO_CONFIG, {"confirm_timeout_s": 60}):
+                assert orchestrator._unit_suite_timeout("confirm route") == 60
+                assert orchestrator._unit_suite_timeout("route") == orchestrator.UNIT_GATE_TIMEOUT
+                assert orchestrator._unit_suite_timeout("merge-base abc1234") == orchestrator.UNIT_BASELINE_TIMEOUT
+
+    def test_no_new_disable_or_skip_environment_read_was_introduced(self):
+        """AC-O6-08: grep the diff for a new DISABLE_/SKIP_ environment read — 0 matches."""
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--", "orchestrator.py"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip("no `main` ref to diff against")
+        added = "\n".join(l for l in r.stdout.splitlines() if l.startswith("+") and not l.startswith("+++"))
+        assert not re.search(r'os\.environ\.get\(\s*["\'](DISABLE|SKIP)_', added), \
+            "AC-O6-08 violated — a new DISABLE_/SKIP_ environment read was introduced:\n" + added

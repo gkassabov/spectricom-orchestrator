@@ -261,6 +261,11 @@ UNIT_BASELINE_REF_PREFIX = "merge-base"  # the ref prefix that identifies the ba
 # defaults above. Never inline a number at a call site (CLAUDE.md).
 UNIT_TIMEOUT_KEY = "test_timeout_s"
 UNIT_BASELINE_TIMEOUT_KEY = "baseline_timeout_s"
+# S7-CORE-9 [ORCH-6] AC-O6-07: the CONFIRMATION leg (a handful of files, not the whole
+# suite) gets its own, smaller budget — generous relative to that, not to the full suite.
+UNIT_CONFIRM_TIMEOUT = 300  # 5 min. Per-repo override: `confirm_timeout_s` in repos.yaml.
+UNIT_CONFIRM_TIMEOUT_KEY = "confirm_timeout_s"
+UNIT_CONFIRM_REF_PREFIX = "confirm"  # the ref prefix that identifies the confirmation leg
 # [ORCH-5] decision 1: the baseline for a given commit is IMMUTABLE, so measure it once and
 # keep it, keyed by that commit's SHA. This is what turns ~28 min per route into ~14 min once
 # per merge base. It does NOT weaken §2.2 below: the number is still MEASURED on the merge
@@ -1492,17 +1497,25 @@ class UnitGateOutcome:
     # The verdict must never leave "was this measured now, or read off disk?" unanswered.
     baseline_source: Optional[str] = None
     duration_s: float = 0.0
+    # [ORCH-6] AC-O6-02/06: newly-failing files that PASSED the isolation confirmation —
+    # order/load-dependent, not a regression. Never empty on a FAIL(product) verdict alone.
+    flaky_files: tuple = ()
 
     @property
     def collection(self) -> Optional[str]:
         """`baseline merge-base abc1234: 6 files/79 tests, 2 failed → branch route-br:
-        6 files/81 tests, 2 failed, 24.1s` — the [ORCH-2] shape, both sides declared."""
+        6 files/81 tests, 2 failed, 24.1s` — the [ORCH-2] shape, both sides declared.
+        [ORCH-6] AC-O6-06: a confirmed flake is named here too, so it reaches FINAL STATUS
+        on the PASS path (where flakes alone land) as well as the FAIL path."""
         if not self.ran or self.branch is None:
             return None
         base = self.baseline.describe if self.baseline else (self.baseline_note or "not measured")
         if self.baseline is not None and self.baseline_source:
             base += f" [{self.baseline_source}]"
-        return f"baseline {base} → branch {self.branch.describe}, {self.duration_s:.1f}s"
+        s = f"baseline {base} → branch {self.branch.describe}, {self.duration_s:.1f}s"
+        if self.flaky_files:
+            s += f" | flaky, confirmed in isolation (not blocking): {', '.join(self.flaky_files)}"
+        return s
 
 
 # ── suite-output parsing ───────────────────────────────────────────────────────────────
@@ -1655,6 +1668,8 @@ def _unit_suite_timeout(ref: str) -> int:
     warm checkout did not fit there. Both are per-repo configurable."""
     if str(ref or "").startswith(UNIT_BASELINE_REF_PREFIX):
         return _unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT)
+    if str(ref or "").startswith(UNIT_CONFIRM_REF_PREFIX):
+        return _unit_repo_timeout(UNIT_CONFIRM_TIMEOUT_KEY, UNIT_CONFIRM_TIMEOUT)
     return _unit_repo_timeout(UNIT_TIMEOUT_KEY, UNIT_GATE_TIMEOUT)
 
 
@@ -1715,6 +1730,52 @@ def _run_unit_baseline(repo_path: Path, sha: str, cmd: str) -> UnitSuiteRun:
                            shell=True, capture_output=True)
             subprocess.run(f"git -C {shlex.quote(str(repo_path))} worktree prune",
                            shell=True, capture_output=True)
+
+
+# ── flake-vs-regression confirmation (S7-CORE-9 [ORCH-6]) ─────────────────────────────
+# decision 1/2: a verdict is only as good as its evidence, and isolation is the
+# discriminator — a newly-failing file that passes ALONE was order/load-dependent on the
+# whole-suite run, not broken by this branch. This does not touch `test_cmd` itself (that
+# stays whole, [ORCH-5] decision 4) — only the CONFIRMATION leg is narrowed, and only to
+# the exact suspect set.
+def _unit_confirm_cmd(test_cmd: str, files: tuple) -> str:
+    """[ORCH-6] AC-O6-01: the runner invoked on EXACTLY `files` — no other file.
+
+    Appending the files naively is not enough when `test_cmd` itself already carries a
+    trailing directory argument (this repo's own `pytest -q tests/`): that argument would
+    keep collecting the whole suite alongside the files we asked for, which is not
+    isolation. A trailing bare-directory token (one that ends in `/`) is dropped before the
+    files are appended; anything else is left alone, which is exactly right for the fleet's
+    other declared shape — a bare `npm test` / `pytest` with no path argument.
+
+    `npm`/`yarn`/`pnpm` need `--` to forward args through the package-script layer to the
+    underlying runner (vitest/jest); a direct runner invocation does not.
+    """
+    quoted = " ".join(shlex.quote(f) for f in files)
+    stripped = re.sub(r"\s+\S*/\s*$", "", test_cmd)
+    last_segment = re.split(r"&&|;|\|\|", stripped)[-1].strip()
+    sep = " -- " if re.match(r"(npm|yarn|pnpm)\b", last_segment) else " "
+    return f"{stripped}{sep}{quoted}"
+
+
+def _unit_confirm_new_files(repo_path: Path, test_cmd: str, ref_label: str,
+                            new_files: tuple) -> tuple:
+    """[ORCH-6] decisions 2 & 4 — re-run exactly `new_files`, alone, on the branch checkout.
+
+    Returns (flakes, regressions, confirm_run). `flakes` is None iff the confirmation pass
+    itself could not be performed (timeout, runner error, no parseable summary) — that is
+    BLOCKED(environment), never a verdict about the files; the caller tells the two apart by
+    checking `flakes is None`, not by inspecting `confirm_run`.
+    """
+    cmd = _unit_confirm_cmd(test_cmd, new_files)
+    ref = f"{UNIT_CONFIRM_REF_PREFIX} {ref_label}"
+    run = _run_unit_suite(cmd, repo_path, ref)
+    if run.error or run.runner is None or run.failures is None:
+        return None, None, run
+    still_failing = set(run.failing_files) & set(new_files)
+    flakes = tuple(sorted(set(new_files) - still_failing))
+    regressions = tuple(sorted(still_failing))
+    return flakes, regressions, run
 
 
 # ── the baseline cache (S7-CORE-8 [ORCH-5]) ───────────────────────────────────────────
@@ -1799,6 +1860,27 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
             json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
     except OSError as e:
         log.warning(f"⚠️  Unit baseline cache not written ({e}) — the next route will re-measure")
+
+
+def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str, flakes: tuple):
+    """[ORCH-6] AC-O6-06: union `flakes` into the ADDITIVE `flaky_files` field on the cached
+    baseline entry for `sha` — every existing field (brief §4 STOP trigger 3) is untouched.
+    Two routes off the same base naming the same file is exactly the recurrence signal the
+    brief asks to make visible, so this ACCUMULATES rather than overwrites. A no-op when
+    there is no matching entry to attach to — nothing here invents one."""
+    if not flakes:
+        return
+    entries = _unit_cache_load(archive)
+    key = _unit_cache_key(repo_name, sha, cmd)
+    entry = entries.get(key)
+    if not _unit_cache_entry_matches(entry, repo_name, sha, cmd):
+        return
+    entry["flaky_files"] = sorted(set(entry.get("flaky_files") or ()) | set(flakes))
+    try:
+        _unit_cache_file(archive).write_text(
+            json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
+    except OSError as e:
+        log.warning(f"⚠️  Unit gate: flaky-file set not persisted ({e})")
 
 
 def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
@@ -2011,26 +2093,66 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
 
     new_files = tuple(sorted(set(branch_run.failing_files) - set(baseline_run.failing_files)))
     worse_count = branch_run.failures > baseline_run.failures
-    if worse_count or new_files:
+
+    flakes, regressions = (), ()
+    if new_files:
+        # S7-CORE-9 [ORCH-6] decisions 1/2: a single pair of whole-suite runs is not enough
+        # evidence for FAIL(product) — confirm the suspect set in isolation before deciding.
+        log.info(f"🔬 Unit gate: {len(new_files)} newly-failing file(s) — confirming in "
+                 f"isolation before verdict: {', '.join(new_files)}")
+        flakes, regressions, confirm_run = _unit_confirm_new_files(repo_path, test_cmd, label, new_files)
+        if flakes is None:
+            # decision 4: fail closed. A confirmation pass that did not complete is not
+            # evidence of health — never PASS, never FAIL(product).
+            why = (confirm_run.error if confirm_run else None) or \
+                (confirm_run.collection if confirm_run else None) or "no measurement"
+            if why == "timeout":
+                why = (f"timeout — the confirmation pass exceeded its "
+                       f"{_unit_suite_timeout(UNIT_CONFIRM_REF_PREFIX)}s budget")
+            detail = (f"newly-failing file(s) {', '.join(new_files)} could not be confirmed in "
+                      f"isolation ({why}) — the flake/regression distinction cannot be made")
+            log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not FAIL(product)")
+            return _finish(UnitGateOutcome(passed=False, signal="confirmation-unmeasurable", detail=detail,
+                                           env=True, ran=True, branch=branch_run, baseline=baseline_run,
+                                           baseline_note=baseline_note, baseline_source=baseline_source))
+        log.info(f"🔬 Unit gate confirmation — {confirm_run.describe}; "
+                 f"flake: {', '.join(flakes) or '(none)'}; regression: {', '.join(regressions) or '(none)'}")
+        if flakes and baseline_source in ("cache", "measured"):
+            _unit_cache_record_flakes(archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME, base_sha,
+                                      test_cmd, flakes)
+
+    if worse_count or regressions:
+        # AC-O6-04: a regression is never excused by a flake alongside it, and both sets are
+        # named separately — this wording is unchanged from before ORCH-6 when there are no
+        # flakes, so it still reads exactly as `newly-failing file(s): <file>`.
         reasons = []
         if worse_count:
             reasons.append(f"{branch_run.failures} failures vs baseline {baseline_run.failures}")
-        if new_files:
-            reasons.append(f"newly-failing file(s): {', '.join(new_files)}")
+        if regressions:
+            reasons.append(f"newly-failing file(s): {', '.join(regressions)}")
+        if flakes:
+            reasons.append(f"flaky in isolation, not blocking: {', '.join(flakes)}")
         detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — " + "; ".join(reasons)
                   + f" (baseline {baseline_source})")
         log.error(f"⛔ UNIT BASELINE GATE FAILED — {detail}. BLOCKING: branch stays unmerged.")
         return _finish(UnitGateOutcome(passed=False, signal="regression", detail=detail,
                                        ran=True, branch=branch_run, baseline=baseline_run,
-                                       baseline_note=baseline_note, baseline_source=baseline_source))
+                                       baseline_note=baseline_note, baseline_source=baseline_source,
+                                       flaky_files=flakes))
 
     verdict = ("equal to" if branch_run.failures == baseline_run.failures else "below")
     detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
               f"{baseline_run.failures} — no new failing file (baseline {baseline_source})")
+    if flakes:
+        # AC-O6-02: flakes alone never fail the route, but they are still reported, never
+        # silently swallowed.
+        detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
+                  f"{baseline_run.failures} — newly-failing file(s) confirmed FLAKY in isolation "
+                  f"(passed alone, not blocking): {', '.join(flakes)} (baseline {baseline_source})")
     log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}; baseline {baseline_note}")
     return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run, baseline=baseline_run,
                                    baseline_note=baseline_note, baseline_source=baseline_source,
-                                   detail=detail))
+                                   detail=detail, flaky_files=flakes))
 
 
 def _unit_done(o: UnitGateOutcome, started: float, repo_path: Path,
@@ -2080,6 +2202,7 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
         "baseline_note": o.baseline_note,
         "baseline_source": o.baseline_source,   # [ORCH-5] AC-O5-05 / decision 5
         "branch": _side(o.branch),
+        "flaky_files": list(o.flaky_files),     # [ORCH-6] AC-O6-06
     })
     log_file.write_text(json.dumps(entries, indent=2))
 
