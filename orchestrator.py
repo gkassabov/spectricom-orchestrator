@@ -398,6 +398,9 @@ PROTECTED_BRANCHES = {"main", "master", "develop", "staging"}
 class Status(str, Enum):
     PENDING="pending"; RUNNING="running"; PASSED="passed"
     FAILED="failed"; SKIPPED="skipped"; BLOCKED="blocked"
+    # [ORCH-10] Neither `passed` nor `failed`: the route's own git state moved under it,
+    # so nothing the run observed about the product can be trusted. See TAMPER_VERDICT.
+    TAMPERED="tampered"
 
 @dataclass
 class Brief:
@@ -414,6 +417,7 @@ class Result:
     gate_outcome: Optional[str]=None  # [ORCH-1] PASS | BLOCKED(environment) | FAIL(product) | None (gate not run)
     gate_collection: Optional[str]=None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed; None otherwise
     unit_collection: Optional[str]=None  # [ORCH-3] "baseline merge-base abc1234: ... → branch ...", None when the unit gate did not run
+    tampered: Optional[str]=None  # [ORCH-10] one-line tamper label when the route's ref moved; None on every honest run
 
 # ═══════════════════════════════════════════════════════
 # LOGGING
@@ -811,11 +815,190 @@ def run_playwright() -> tuple[bool, int]:
     except Exception as e:
         log.error(f"Playwright error: {e}"); return False, 0
 
+# ═══════════════════════════════════════════════════════
+# [ORCH-10] ROUTE REF INTEGRITY — detect, never repair
+# ═══════════════════════════════════════════════════════
+# 2026-09-15: a `git checkout main` run by a human in a live route's working
+# directory, 84s after the fire, sent the executor's commit onto `main` instead of
+# onto the route branch. The orchestrator looked at its branch, correctly found no
+# changes, and returned `passed | gate: not run` — so a commit reached `main` with
+# no build gate, no SIT gate and no unit baseline gate.
+#
+# [ORCH-1] gate-then-merge was not violated; it was bypassed from outside, and the
+# orchestrator could not tell. Two states must never look alike:
+#   "I ran, and chose to change nothing."  -> passed (no changes), a good outcome
+#   "My branch is not where I left it."    -> not passed at all
+#
+# This code makes the system NOTICE. It deliberately does not prevent (the operating
+# rule — never run git in a repo with a live route — lives in LESSONS.md) and it
+# deliberately does not repair: a wrong automatic reset on `main` is far worse than a
+# loud stop. Every git command below is read-only.
+
+TAMPER_VERDICT = "TAMPERED"  # greppable in the FINAL STATUS line and in orchestrator-unit-log.json
+
+
+def _git_read(cmd: str, cwd: Path) -> str:
+    """stdout of a read-only git command, stripped; "" on any failure."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(cwd))
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _snapshot_heads(proj: Path) -> dict:
+    """Every local branch -> its SHA. The S3 baseline: anything that moves here and is
+    not the route's own branch is a commit the route did not own."""
+    out = _git_read("git show-ref --heads", proj)
+    heads = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            heads[parts[1]] = parts[0]
+    return heads
+
+
+@dataclass
+class RouteHandoff:
+    """[ORCH-10] S1 — the route's expected git state at the moment control passes to the
+    executor. Captured once, immediately before fire_toni()."""
+    branch: Optional[str]              # branch name the orchestrator resolved, or None
+    branch_sha: Optional[str]          # that branch's SHA at hand-off
+    head_ref: Optional[str]            # 'refs/heads/<x>'; None when HEAD was already detached
+    head_sha: Optional[str]
+    heads: dict = field(default_factory=dict)  # ref -> sha for every local branch
+
+
+@dataclass
+class TamperReport:
+    """[ORCH-10] S2/S3 — a description of what moved. Never a repair instruction."""
+    expected_ref: Optional[str]
+    found_ref: Optional[str]
+    branch: Optional[str]
+    branch_sha_at_handoff: Optional[str]
+    branch_sha_now: Optional[str]
+    stray: list = field(default_factory=list)  # [{"ref","was","now","commits":[sha,...]}]
+
+    @property
+    def label(self) -> str:
+        """One line for FINAL STATUS / notify / Result.tampered. Names both refs (AC-O10-01)."""
+        s = (f"{TAMPER_VERDICT} — route ref moved: expected {self.expected_ref or '(none)'}, "
+             f"found {self.found_ref or '(detached HEAD)'}")
+        if self.stray:
+            n = sum(len(x["commits"]) for x in self.stray)
+            s += f"; {n} commit(s) on {len(self.stray)} ref(s) the route did not own"
+        return s
+
+    def log_lines(self) -> list:
+        """The loud log. A human reading only this knows exactly what to look at."""
+        out = [
+            f"🚨 {TAMPER_VERDICT}: the route's git state moved between hand-off and return.",
+            f"   expected HEAD on : {self.expected_ref or '(none — HEAD was detached at hand-off)'}",
+            f"   found HEAD on    : {self.found_ref or '(detached HEAD)'}",
+            f"   route branch     : {self.branch or '(none)'} "
+            f"— was {(self.branch_sha_at_handoff or '(absent)')[:7]}, "
+            f"now {(self.branch_sha_now or '(absent)')[:7]}",
+        ]
+        for x in self.stray:
+            out.append(f"   ⚠️  commits on a ref this route did not own: {x['ref']} "
+                       f"{x['was'][:7] if x['was'] else '(new)'} → {x['now'][:7]}")
+            for sha in x["commits"]:
+                out.append(f"        {sha}")
+        out += [
+            "   NO gate was run. NO merge was performed. NO ref was modified by the orchestrator.",
+            "   This is neither `passed` nor `failed(product)` — the run observed a repo that is",
+            "   not the one it was handed. Inspect by hand before trusting anything above.",
+        ]
+        return out
+
+
+def capture_handoff(proj: Path, branch_name: Optional[str]) -> RouteHandoff:
+    """[ORCH-10] S1. Called immediately before fire_toni(), in the route's working dir."""
+    head_ref = _git_read("git symbolic-ref --quiet HEAD", proj) or None
+    return RouteHandoff(
+        branch=branch_name,
+        branch_sha=_git_read(f"git rev-parse --verify {branch_name}", proj) or None if branch_name else None,
+        head_ref=head_ref,
+        head_sha=_git_read("git rev-parse HEAD", proj) or None,
+        heads=_snapshot_heads(proj),
+    )
+
+
+def check_route_integrity(proj: Path, h: RouteHandoff) -> Optional[TamperReport]:
+    """[ORCH-10] S2. Re-check name, SHA and HEAD ref on return — BEFORE the no-changes
+    decision. Returns None on an honest run (S4: that path must stay byte-identical),
+    a TamperReport when HEAD is no longer on the ref the route was handed.
+
+    S3: the report also names commits that landed on refs the route did not own, with
+    their SHAs. It does not move, reset, revert or delete anything."""
+    head_ref_now = _git_read("git symbolic-ref --quiet HEAD", proj) or None
+    if head_ref_now == h.head_ref:
+        return None  # honest run — including the legitimate no-changes case
+
+    branch_ref = f"refs/heads/{h.branch}" if h.branch else None
+    report = TamperReport(
+        expected_ref=h.head_ref,
+        found_ref=head_ref_now,
+        branch=h.branch,
+        branch_sha_at_handoff=h.branch_sha,
+        branch_sha_now=_git_read(f"git rev-parse --verify {h.branch}", proj) or None if h.branch else None,
+    )
+
+    # S3 — damage detection. Any local head other than the route's own that advanced.
+    for ref, now in _snapshot_heads(proj).items():
+        if ref == branch_ref:
+            continue
+        was = h.heads.get(ref)
+        if was == now:
+            continue
+        rng = f"{was}..{now}" if was else now
+        commits = _git_read(f"git log --oneline --no-decorate {rng}", proj).splitlines()
+        report.stray.append({"ref": ref, "was": was, "now": now, "commits": commits})
+    return report
+
+
+def _log_tamper_outcome(archive: Path, repo_path: Path, report: TamperReport):
+    """[ORCH-10] AC-O10-05 — the tampered verdict is persisted alongside the unit-gate
+    entries, in the same file, carrying `verdict: TAMPERED`. Grep the archive for
+    TAMPERED and every such run surfaces; no honest entry ever carries that key."""
+    archive.mkdir(parents=True, exist_ok=True)
+    log_file = archive / "orchestrator-unit-log.json"
+    entries = []
+    if log_file.exists():
+        try:
+            entries = json.loads(log_file.read_text())
+        except (json.JSONDecodeError, IOError):
+            entries = []
+    entries.append({
+        "timestamp": datetime.now().isoformat(),
+        "repo": str(repo_path),
+        "repo_name": ACTIVE_REPO_NAME,
+        "verdict": TAMPER_VERDICT,
+        "passed": False,
+        "signal": "route-ref-moved",
+        "detail": report.label,
+        "expected_ref": report.expected_ref,
+        "found_ref": report.found_ref,
+        "branch": report.branch,
+        "branch_sha_at_handoff": report.branch_sha_at_handoff,
+        "branch_sha_now": report.branch_sha_now,
+        "stray_commits": report.stray,
+        "baseline": None,
+        "branch_run": None,
+    })
+    log_file.write_text(json.dumps(entries, indent=2))
+
+
 def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
-                       gate_collection: Optional[str], unit_collection: Optional[str] = None) -> str:
+                       gate_collection: Optional[str], unit_collection: Optional[str] = None,
+                       tampered: Optional[str] = None) -> str:
     """[ORCH-2] `PASS (7 files/18 tests, 6.6s)` when the SIT summary parsed; the prior wording
     (`PASS` / verdict label / `not run`) when it did not.
-    [ORCH-3] appends ` | unit: <baseline> → <branch>` when the unit baseline gate ran."""
+    [ORCH-3] appends ` | unit: <baseline> → <branch>` when the unit baseline gate ran.
+    [ORCH-10] a tampered run never ran a gate, and says so in a way that cannot be misread
+    as the ordinary ungated `not run`."""
+    if tampered:
+        return f"not run ({TAMPER_VERDICT} — route ref moved)"
     s = gate_error or gate_outcome or "not run"
     if gate_collection:
         s = f"{s} ({gate_collection})"
@@ -824,10 +1007,15 @@ def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
     return s
 
 def notify(result: Result):
-    e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else "❌")
+    e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else
+        ("🚨" if result.status == Status.TAMPERED else "❌"))
     status_label = "passed (no changes)" if result.no_changes else result.status.value
     msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
-    if result.gate_outcome:
+    if result.tampered:
+        # [ORCH-10] the gate is named even though none ran — silence here is what made the
+        # 2026-09-15 incident read as an ordinary halt-and-report.
+        msg += f" | gate: {_gate_status_label(None, None, None, None, result.tampered)}"
+    elif result.gate_outcome:
         msg += f" | gate: {_gate_status_label(None, result.gate_outcome, result.gate_collection, result.unit_collection)}"
     if result.error:
         msg += f"\n  {result.error}"
@@ -2758,9 +2946,17 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             branch_name = None
 
     mig_before = get_migrations()
+    # [ORCH-10] S1: record the route's expected state at the hand-off point — the branch
+    # name, its SHA, and the repo's HEAD ref — at the moment control passes to the executor.
+    # Meta-fire lane excluded on purpose: S5 is report-only for this route.
+    handoff = capture_handoff(proj, branch_name) if worktree is None else None
     ec, out_log = fire_toni(target, proj)
     finished = datetime.now()
     dur = (finished - started).total_seconds()
+    # [ORCH-10] S2: re-check all three BEFORE the no-changes decision is made. `has_changes`
+    # below is computed from MERGE_TARGET..HEAD, which is meaningless once HEAD has moved —
+    # that is precisely how the incident's commit-on-main read as "produced no changes".
+    tamper = check_route_integrity(proj, handoff) if handoff is not None else None
     # S6S49 fix: claude-code 2.1.123 returns a NON-ZERO exit even on a fully
     # successful run (thinking-block teardown regression). Trusting ec alone
     # made the orchestrator discard good work (006/007 produced correct,
@@ -2769,7 +2965,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # staged/unstaged changes in the tree). The post-merge BUILD GATE remains
     # the quality arbiter, so this cannot merge broken code — it only stops a
     # bad exit code from throwing away good code. ec is still recorded.
-    if worktree is None and branch_name:
+    if tamper is not None:
+        # [ORCH-10] S2: the work-produced signals all read the wrong ref now. Do not compute them.
+        _produced_work = False
+    elif worktree is None and branch_name:
         _staged = subprocess.run("git status --porcelain", shell=True,
             capture_output=True, text=True, cwd=str(proj)).stdout.strip()
         _ahead = subprocess.run(f"git rev-list --count {MERGE_TARGET}..HEAD",
@@ -2780,6 +2979,16 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     else:
         _produced_work = (ec == 0)
     status = Status.PASSED if (ec == 0 or _produced_work) else Status.FAILED
+    if tamper is not None:
+        # [ORCH-10] S2: not `passed`, and not `failed(product)` either — the run was handed a
+        # repo it no longer recognises, so it has no opinion about the product at all.
+        status = Status.TAMPERED
+        for line in tamper.log_lines():
+            log.error(line)
+        try:
+            _log_tamper_outcome(SIT_ARCHIVE_DIR, proj, tamper)
+        except Exception as e:
+            log.warning(f"⚠️  {TAMPER_VERDICT}: could not persist outcome: {e}")
     if ec != 0 and _produced_work:
         log.warning(f"⚠️  Toni exited non-zero (ec={ec}) but produced work "
                     f"(staged/ahead) — treating as PASSED; build gate will verify. "
@@ -2791,7 +3000,9 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         for m in new_mig:
             log.warning(f"  npx supabase db query --linked -f supabase/migrations/{m}")
     pw_ok, pw_cnt = (None, 0)
-    if RUN_PLAYWRIGHT and ec == 0 and worktree is None:
+    # [ORCH-10] S2: a tampered run runs no gate — Playwright included. Its result would
+    # describe a tree the route does not own, and a red one would overwrite the verdict.
+    if RUN_PLAYWRIGHT and ec == 0 and worktree is None and tamper is None:
         pw_ok, pw_cnt = run_playwright()
         if not pw_ok: status = Status.FAILED
 
@@ -2801,7 +3012,16 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     gate_error: Optional[str] = None     # [ORCH-1] human verdict line (never a secret value)
     gate_collection: Optional[str] = None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed
     unit_collection: Optional[str] = None  # [ORCH-3] both sides of the unit baseline when that gate ran
-    if branch_name and worktree is None:
+    if tamper is not None:
+        # [ORCH-10] S2/S3: no gate, no commit, no merge, no checkout, no branch delete.
+        # Detect and report only — the ordinary path below both gates AND moves refs
+        # (`git checkout MERGE_TARGET`, `git branch -D`), and a wrong automatic move on a
+        # repo somebody else is standing in is worse than a loud stop. AC-O10-04 asserts
+        # that every ref is byte-identical after a tampered run.
+        gate_error = tamper.label
+        log.error(f"⛔ {TAMPER_VERDICT} — no gate run, nothing merged, no ref touched. "
+                  f"Branch preserved: {branch_name or '(none)'}.")
+    elif branch_name and worktree is None:
         try:
             if status == Status.PASSED:
                 # Commit all changes on feature branch
@@ -2929,8 +3149,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             gate_error = verdict.label
             status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
 
+    # [ORCH-10] AC-O10-05: `tampered` in the status field and `TAMPERED` in the gate field —
+    # distinct from `passed` and from `FAIL(product)`, and greppable either way.
     log.info(f"🏁 FINAL STATUS: {status.value} | gate: "
-             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection)}")
+             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label)}")
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),
@@ -2938,7 +3160,8 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         new_migrations=new_mig, log_file=out_log,
         worktree=str(worktree) if worktree else None,
         no_changes=no_change_run, gate_outcome=gate_outcome, gate_collection=gate_collection,
-        unit_collection=unit_collection, error=gate_error)
+        unit_collection=unit_collection, error=gate_error,
+        tampered=(tamper.label if tamper is not None else None))  # [ORCH-10]
     notify(result)
     rate_limiter.record(batch_file.name, len(briefs), dur, status.value)
 
@@ -2972,7 +3195,9 @@ def run_queue(files: list[Path], force: bool = False, skip_deps: bool = False):
         r = run_batch(bf); results.append(r)
         state["completed" if r.status==Status.PASSED else "failed"].append(asdict(r))
         save_state(state)
-        if r.status in (Status.FAILED, Status.BLOCKED):
+        # [ORCH-10] TAMPERED halts too: the working directory is not the one the route was
+        # handed, so firing the next batch in it would compound the damage, not survive it.
+        if r.status in (Status.FAILED, Status.BLOCKED, Status.TAMPERED):
             rem = len(files)-i-1
             if rem: log.error(f"⛔ Queue HALTED ({r.gate_outcome or r.status.value}) — {rem} batches skipped")
             break
