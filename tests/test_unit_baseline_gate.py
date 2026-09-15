@@ -411,8 +411,11 @@ class TestGateDeclaresAndPersistsWhatItCollected:
         with caplog.at_level(logging.INFO, logger="orch"):
             o, _ = run_gate(repo, tmp_path,
                             branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
-        assert "Unit gate branch run — route: 6 files/18 tests, 2 failed in " in caplog.text
-        assert f"Unit gate baseline run — merge-base {repo.fork_point[:7]}: 6 files/18 tests, 2 failed in " in caplog.text
+        # [ORCH-8] AC-O8-05: the line now carries the `passed` tally too, so failed + passed
+        # adds up to the stated total by inspection.
+        assert "Unit gate branch run — route: 6 files/18 tests, 2 failed, 16 passed in " in caplog.text
+        assert (f"Unit gate baseline run — merge-base {repo.fork_point[:7]}: "
+                f"6 files/18 tests, 2 failed, 16 passed in ") in caplog.text
 
     def test_counts_are_persisted_with_the_run(self, repo, tmp_path):
         """A genuinely new file (B, absent from the baseline's {A}) so this is a confirmed
@@ -429,8 +432,9 @@ class TestGateDeclaresAndPersistsWhatItCollected:
     def test_collection_string_carries_both_sides(self, repo, tmp_path):
         o, _ = run_gate(repo, tmp_path,
                         branch_out=vitest([A, A], failed=2), baseline_out=vitest([A, A], failed=2))
-        assert o.collection.startswith(f"baseline merge-base {repo.fork_point[:7]}: 6 files/18 tests, 2 failed in ")
-        assert "→ branch route: 6 files/18 tests, 2 failed in " in o.collection
+        assert o.collection.startswith(
+            f"baseline merge-base {repo.fork_point[:7]}: 6 files/18 tests, 2 failed, 16 passed in ")
+        assert "→ branch route: 6 files/18 tests, 2 failed, 16 passed in " in o.collection
 
     def test_it_reaches_the_verdict_and_the_run_record(self, repo, tmp_path):
         archive = tmp_path / "archive"
@@ -1387,3 +1391,204 @@ class TestFlakyReport:
             orchestrator.flaky_report()
         out = capsys.readouterr().out
         assert B in out and "1x" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-9 [ORCH-8] — the failure count is the one the RUNNER states.
+#
+# `total - passed` counts skipped and todo as failures. clinical-mp's own vitest summary
+#   Tests  9 failed | 7267 passed | 8 skipped | 4 todo (7288)
+# reads 21 that way, not 9 — a constant +12 on every unit-gate number since [ORCH-3]
+# shipped, on both legs of every comparison. The verdicts mostly survived (a constant
+# offset cancels in a delta); the published NUMBERS did not.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# The literal clinical-mp summary line, as vitest printed it (RED-5b, 2026-09-15).
+CMP_TESTS_LINE = "      Tests  9 failed | 7267 passed | 8 skipped | 4 todo (7288)"
+CMP_FIXTURE = (" Test Files  9 failed | 780 passed (789)\n"
+               + CMP_TESTS_LINE + "\n   Duration  307.10s\n")
+# The same repo with nothing genuinely failing — the shape the green fast path needs.
+CMP_GREEN = (" Test Files  789 passed (789)\n"
+             "      Tests  7276 passed | 8 skipped | 4 todo (7288)\n"
+             "   Duration  286.00s\n")
+
+
+class TestFailureCountComesFromTheRunner:
+    """AC-O8-01 / AC-O8-02 — parse the `N failed` segment vitest itself prints."""
+
+    def test_ac_o8_01_the_literal_clinical_mp_summary(self):
+        c = orchestrator._parse_unit_summary(CMP_FIXTURE)
+        assert c["failures"] == 9, "the count vitest states, not 7288 - 7267 = 21"
+        assert (c["tests_total"], c["tests_passed"]) == (7288, 7267)
+        assert (c["tests_skipped"], c["tests_todo"]) == (8, 4)
+        assert c["failures_source"] == "reported"
+        # The tallies reconcile against vitest's own parenthesised total, by addition.
+        assert c["failures"] + c["tests_passed"] + c["tests_skipped"] + c["tests_todo"] == c["tests_total"]
+
+    @pytest.mark.parametrize("line,expected", [
+        ("      Tests  9 failed | 7267 passed | 8 skipped | 4 todo (7288)", 9),
+        ("      Tests  3 failed | 7273 passed | 8 skipped | 4 todo (7288)", 3),
+        ("      Tests  7288 passed (7288)", 0),
+        ("      Tests  2 failed | 5 passed (7)", 2),
+        ("      Tests  2 failed | 5 passed | 1 todo (8)", 2),      # todo, no skipped
+        ("      Tests  2 failed | 5 passed | 1 skipped (8)", 2),   # skipped, no todo
+    ])
+    def test_ac_o8_02_each_shape_yields_the_count_vitest_states(self, line, expected):
+        c = orchestrator._parse_unit_summary(line + "\n")
+        assert c["failures"] == expected, line
+
+    def test_ansi_coloured_tallies_still_parse(self):
+        coloured = CMP_FIXTURE.replace("9 failed", "\x1b[1;31m9 failed\x1b[0m") \
+                              .replace("8 skipped", "\x1b[2m8 skipped\x1b[22m")
+        c = orchestrator._parse_unit_summary(coloured)
+        assert (c["failures"], c["tests_skipped"]) == (9, 8)
+
+    def test_the_last_summary_block_wins(self):
+        """A watch-mode / retry run prints more than one summary; the final one is the run."""
+        c = orchestrator._parse_unit_summary(
+            "      Tests  5 failed | 13 passed (18)\n      Tests  1 failed | 17 passed (18)\n")
+        assert c["failures"] == 1
+
+    def test_a_tally_the_runner_did_not_state_is_none_not_zero(self):
+        c = orchestrator._parse_unit_summary("      Tests  2 failed | 5 passed (7)\n")
+        assert c["tests_skipped"] is None and c["tests_todo"] is None
+
+
+class TestDerivationIsOnlyTheFallback:
+    """AC-O8-03 / AC-O8-04 — derive only when there is no `failed` segment; never fabricate."""
+
+    def test_ac_o8_03_no_failed_segment_still_yields_a_number_via_the_fallback(self):
+        c = orchestrator._parse_unit_summary("      Tests  15 passed (18)\n")
+        assert c["failures"] == 3
+        assert c["failures_source"] == "derived", "AC-O8-03: the fallback is what produced it"
+
+    def test_the_fallback_does_not_count_skipped_or_todo_as_failures(self):
+        """A fully-green clinical-mp run states no `failed` segment at all. Deriving
+        7288 - 7276 there would resurrect the very +12 this route removes."""
+        c = orchestrator._parse_unit_summary(CMP_GREEN)
+        assert c["failures"] == 0 and c["failures_source"] == "derived"
+        assert (c["tests_skipped"], c["tests_todo"]) == (8, 4)
+
+    def test_the_fallback_never_goes_negative(self):
+        c = orchestrator._parse_unit_summary("      Tests  5 passed | 4 skipped (7)\n")
+        assert c["failures"] == 0
+
+    def test_a_reported_zero_beats_the_fallback(self):
+        c = orchestrator._parse_unit_summary("      Tests  0 failed | 18 passed (18)\n")
+        assert c["failures"] == 0 and c["failures_source"] == "reported"
+
+    @pytest.mark.parametrize("raw", ["", "some tool printed nothing recognisable",
+                                     "npm ERR! missing script: test"])
+    def test_ac_o8_04_unrecognised_output_is_none_never_zero(self, raw):
+        c = orchestrator._parse_unit_summary(raw)
+        assert c["failures"] is None, "§2.4: absent ⇒ UNKNOWN ⇒ BLOCKED(environment), never 0"
+        assert c["failures_source"] is None
+        assert c["tests_skipped"] is None and c["tests_todo"] is None
+
+    def test_ac_o8_04_holds_through_the_gate_as_comparison_unavailable(self, repo, tmp_path):
+        o, _ = run_gate(repo, tmp_path, branch_out="npm ERR! nothing parseable\n",
+                        baseline_out=vitest([A], failed=1), branch_code=1)
+        assert o.passed is False and o.env is True, "unparseable is environment, never product"
+
+
+class TestTheGateLineReconciles:
+    """AC-O8-05 — a reader can check the gate's number against vitest's summary by eye."""
+
+    def test_ac_o8_05_every_stated_tally_reaches_the_log_line(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.INFO, logger="orch"):
+            o, _ = run_gate(repo, tmp_path, branch_out=CMP_FIXTURE, baseline_out=CMP_FIXTURE)
+        assert ("Unit gate branch run — route: 789 files/7288 tests, 9 failed, "
+                "7267 passed, 8 skipped, 4 todo in ") in caplog.text
+        assert "9 failed, 7267 passed, 8 skipped, 4 todo" in o.collection
+
+    def test_a_derived_count_says_so_in_the_line(self, repo, tmp_path):
+        o, _ = run_gate(repo, tmp_path, branch_out=vitest([A], failed=0, total_tests=18),
+                        baseline_out=vitest([A], failed=1))
+        assert "0 failed (derived)" in o.branch.collection
+
+    def test_the_tallies_are_persisted_with_the_run(self, repo, tmp_path):
+        o, entries = run_gate(repo, tmp_path, branch_out=CMP_FIXTURE, baseline_out=CMP_FIXTURE)
+        b = entries[-1]["branch"]
+        assert (b["failures"], b["tests_skipped"], b["tests_todo"]) == (9, 8, 4)
+        assert b["failures_source"] == "reported"
+
+    def test_a_cached_baseline_reconciles_the_same_way_a_measured_one_does(self, repo, tmp_path):
+        """[ORCH-5]'s cache must not launder the tallies back out of the line."""
+        archive = tmp_path / "archive"
+        for _ in range(2):
+            with active(archive=archive), patch.object(
+                    orchestrator, "_run_unit_suite",
+                    fake_suite(vitest([B, B], failed=2), CMP_FIXTURE)):
+                o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.baseline_source == "cache"
+        assert "9 failed, 7267 passed, 8 skipped, 4 todo" in o.baseline.collection
+
+
+class TestTheGreenFastPathBecomesReachable:
+    """AC-O8-06 — [ORCH-5]'s green-branch fast path is the one ABSOLUTE threshold, and the
+    only consumer whose behaviour the corrected count changes."""
+
+    def test_ac_o8_06_a_green_clinical_mp_branch_now_skips_the_baseline_leg(self, repo, tmp_path):
+        seen = []
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_GREEN, seen=seen)
+        assert o.passed is True and o.baseline_source == "not-needed"
+        assert baseline_runs(seen) == [], "the baseline leg must not run for a green branch"
+        # Before [ORCH-8] this branch reported 7288 - 7276 = 12 failures and could NOT take
+        # this path — it paid for a second whole-repo leg on every route.
+        assert o.branch.tests_total - o.branch.tests_passed == 12
+        assert o.branch.failures == 0
+
+    def test_a_branch_with_real_failures_still_measures_the_baseline(self, repo, tmp_path):
+        seen = []
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_FIXTURE, baseline_out=CMP_FIXTURE, seen=seen)
+        assert len(baseline_runs(seen)) == 1, "9 real failures is not green — the baseline is needed"
+
+    def test_the_offset_cancelled_in_the_delta_so_verdicts_are_unchanged(self, repo, tmp_path):
+        """§2 — the damage was to the numbers, not the verdicts. Same tree both sides, and
+        the branch is neither worse nor carrying a new failing file, before or after."""
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_FIXTURE, baseline_out=CMP_FIXTURE)
+        assert o.passed is True
+        assert o.branch.failures == o.baseline.failures == 9
+        assert "9 failures, equal to the merge-base baseline of 9" in o.detail
+
+
+class TestPytestPathWasAlreadyCorrect:
+    """AC-O8-07 — pytest reports NAMED tallies, so the defect never existed on that path."""
+
+    def test_ac_o8_07_skipped_was_never_counted_as_a_failure(self):
+        c = orchestrator._parse_unit_summary("2 failed, 1 passed, 8 skipped, 4 xfailed in 0.5s\n")
+        assert c["failures"] == 2, "failed + error only — the line that decides it"
+        assert c["tests_total"] == 15, "skipped/xfailed belong to the TOTAL, never the failures"
+        assert c["tests_skipped"] == 8 and c["tests_todo"] is None
+        assert c["failures_source"] == "reported"
+
+    def test_a_green_pytest_run_reports_no_skipped_tally_rather_than_zero(self):
+        c = orchestrator._parse_unit_summary(PYTEST_GREEN)
+        assert c["failures"] == 0 and c["tests_skipped"] is None
+
+
+class TestOrch8ChangedNoVerdictSemantics:
+    """AC-O8-09 / AC-O8-10 — the correction moves numbers, not policy."""
+
+    def test_ac_o8_10_no_timeout_pool_or_parallelism_knob_moved_on_this_branch(self):
+        """§4 is report-only: nothing about how the suite is SCHEDULED changed here. Scoped
+        to this branch's diff, in the shape AC-O8-10 asks for, not to the file forever."""
+        assert orchestrator.UNIT_GATE_TIMEOUT == 900
+        assert orchestrator.UNIT_BASELINE_TIMEOUT == 1800
+        assert orchestrator.UNIT_CONFIRM_TIMEOUT == 300
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--unified=0"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip("no `main` ref to diff against")
+        touched = [l for l in r.stdout.splitlines() if l.startswith(("+", "-"))
+                   and not l.startswith(("+++", "---"))]
+        for knob in ("--pool", "maxWorkers", "poolOptions", "testTimeout", "availableParallelism",
+                     "TIMEOUT =", "TIMEOUT="):
+            assert not [l for l in touched if knob in l], f"{knob} moved — §4 is a report, not a fix"
+
+    def test_ac_o8_09_the_verdict_still_keys_on_confirmed_files_not_on_the_count(self, repo, tmp_path):
+        """[ORCH-6b]: a count that rose with no newly-failing file is reported, not blocking —
+        and that stays true with the corrected count."""
+        o, _ = run_gate(repo, tmp_path,
+                        branch_out=vitest([A, A, A], failed=3), baseline_out=vitest([A], failed=1))
+        assert o.passed is True
+        assert "count rose from 1 to 3 with no newly-failing file" in o.detail

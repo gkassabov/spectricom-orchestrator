@@ -1307,6 +1307,16 @@ _VITEST_SUMMARY_RE = {
 _VITEST_TOTAL_RE = re.compile(r"\((\d+)\)\s*$")
 _VITEST_PASSED_RE = re.compile(r"(\d+) passed\b")
 _VITEST_NO_FILES_RE = re.compile(r"^\s*No test files found", re.MULTILINE)
+# S7-CORE-9 [ORCH-8]: vitest's `Tests` line carries FOUR named tallies, not two —
+#      Tests  9 failed | 7267 passed | 8 skipped | 4 todo (7288)
+# `total - passed` reads 21 there, not 9. Skipped and todo are not failures; on clinical-mp
+# that was a constant +12 on every unit-gate number since [ORCH-3] shipped. Parse the count
+# vitest itself states, in the same style as the two segments above.
+_VITEST_FAILED_RE = re.compile(r"(\d+) failed\b")
+_VITEST_SKIPPED_RE = re.compile(r"(\d+) skipped\b")
+_VITEST_TODO_RE = re.compile(r"(\d+) todo\b")
+_VITEST_TALLY_RES = {"failed": _VITEST_FAILED_RE, "skipped": _VITEST_SKIPPED_RE,
+                     "todo": _VITEST_TODO_RE}
 
 
 def _parse_vitest_summary(raw: str) -> dict:
@@ -1326,6 +1336,25 @@ def _parse_vitest_summary(raw: str) -> dict:
     if out["test_files_total"] is None and _VITEST_NO_FILES_RE.search(text):
         # vitest's explicit empty run ("No test files found, exiting with code 0" under passWithNoTests)
         out.update(test_files_total=0, test_files_passed=0, tests_total=0, tests_passed=0)
+    return out
+
+
+def _parse_vitest_tallies(raw: str) -> dict:
+    """[ORCH-8] The NAMED tallies on vitest's `Tests` line: failed / skipped / todo.
+
+    Kept separate from _parse_vitest_summary so [ORCH-2]'s four-key contract — which the SIT
+    gate and its tests depend on — is untouched. A segment the summary does not carry is
+    None, not 0: `Tests  7288 passed (7288)` states nothing about failures, and the caller
+    (not this parser) decides what to make of that absence (§2.4)."""
+    out = {"failed": None, "skipped": None, "todo": None}
+    text = _ANSI_RE.sub("", raw or "")
+    for m in _VITEST_SUMMARY_RE["tests"].finditer(text):  # last match wins, as above
+        seg = m.group(1)
+        if not _VITEST_TOTAL_RE.search(seg):
+            continue
+        for key, rx in _VITEST_TALLY_RES.items():
+            hit = rx.search(seg)
+            out[key] = int(hit.group(1)) if hit else None
     return out
 
 
@@ -1463,13 +1492,28 @@ class UnitSuiteRun:
     tests_total: Optional[int] = None
     tests_passed: Optional[int] = None
     failures: Optional[int] = None
+    # [ORCH-8] the other two tallies the runner states. None ⇒ the summary carried no such
+    # segment, which is NOT the same as zero and is rendered as an omission, never as a 0.
+    tests_skipped: Optional[int] = None
+    tests_todo: Optional[int] = None
+    # [ORCH-8] AC-O8-03: "reported" ⇒ the runner stated the failure count and we read it;
+    # "derived" ⇒ there was no `failed` segment and it came from the fallback subtraction.
+    # A reader of the log must never have to guess which of the two produced the number.
+    failures_source: Optional[str] = None
     failing_files: tuple = ()      # sorted, repo-relative; the SET half of the §2.1 comparison
     output: str = ""               # combined stdout+stderr tail, for F-20 classification
     error: Optional[str] = None    # "timeout" | subprocess error text
 
     @property
     def collection(self) -> Optional[str]:
-        """`6 files/79 tests, 3 failed` — what this run actually collected. None when nothing parsed."""
+        """`789 files/7288 tests, 9 failed, 7267 passed, 8 skipped, 4 todo` — what this run
+        actually collected. None when nothing parsed.
+
+        [ORCH-8] AC-O8-05: every tally the runner STATED is repeated here, so the reader can
+        add them up against the runner's own summary line without re-running anything — the
+        reconciliation that `total - passed` made impossible. A tally the runner did not
+        state is omitted rather than printed as 0, and a failure count that came from the
+        fallback says so."""
         if self.test_files_total is None and self.tests_total is None:
             return None
         f = "?" if self.test_files_total is None else self.test_files_total
@@ -1477,6 +1521,12 @@ class UnitSuiteRun:
         s = f"{f} files/{t} tests"
         if self.failures is not None:
             s += f", {self.failures} failed"
+            if self.failures_source == "derived":
+                s += " (derived)"
+        for n, label in ((self.tests_passed, "passed"), (self.tests_skipped, "skipped"),
+                         (self.tests_todo, "todo")):
+            if n is not None:
+                s += f", {n} {label}"
         return s
 
     @property
@@ -1555,7 +1605,8 @@ def _parse_unit_summary(raw: str) -> dict:
     runner yields all-None — UNKNOWN, never 0 (§2.4)."""
     text = _ANSI_RE.sub("", raw or "")
     out = {"runner": None, "test_files_total": None, "tests_total": None,
-           "tests_passed": None, "failures": None, "failing_files": ()}
+           "tests_passed": None, "failures": None, "tests_skipped": None,
+           "tests_todo": None, "failures_source": None, "failing_files": ()}
 
     v = _parse_vitest_summary(text)
     if v["tests_total"] is not None or v["test_files_total"] is not None:
@@ -1563,8 +1614,20 @@ def _parse_unit_summary(raw: str) -> dict:
         out["test_files_total"] = v["test_files_total"]
         out["tests_total"] = v["tests_total"]
         out["tests_passed"] = v["tests_passed"]
-        if v["tests_total"] is not None and v["tests_passed"] is not None:
-            out["failures"] = v["tests_total"] - v["tests_passed"]
+        # [ORCH-8] S1/S2: the failure count is the one vitest STATES. `total - passed` counts
+        # skipped and todo as failures — 7288-7267 reads 21 where vitest says 9 — so it is the
+        # fallback, used only when there is no `failed` segment to read, and it subtracts the
+        # named tallies that are demonstrably not failures.
+        t = _parse_vitest_tallies(text)
+        out["tests_skipped"] = t["skipped"]
+        out["tests_todo"] = t["todo"]
+        if t["failed"] is not None:
+            out["failures"] = t["failed"]
+            out["failures_source"] = "reported"
+        elif v["tests_total"] is not None and v["tests_passed"] is not None:
+            out["failures"] = max(0, v["tests_total"] - v["tests_passed"]
+                                  - (t["skipped"] or 0) - (t["todo"] or 0))
+            out["failures_source"] = "derived"
         files = {_norm_test_path(m) for m in _UNIT_VITEST_FAIL_RE.findall(text)}
         files |= {_norm_test_path(m) for m in _UNIT_VITEST_FILE_FAILED_RE.findall(text)}
         out["failing_files"] = tuple(sorted(f for f in files if f))
@@ -1580,9 +1643,15 @@ def _parse_unit_summary(raw: str) -> dict:
                 tally[kind.rstrip("s") if kind.startswith("error") else kind] = \
                     tally.get(kind.rstrip("s") if kind.startswith("error") else kind, 0) + int(n)
         passed = tally.get("passed", 0)
+        # [ORCH-8] S5/AC-O8-07: THIS is the line that decides it — pytest's failure count has
+        # always come from its own NAMED tallies, and `other` (skipped/xfailed/xpassed) is
+        # folded into the total, never into the failures. The vitest defect does not exist
+        # here, so nothing on this path changes but the reporting fields below.
         failed = tally.get("failed", 0) + tally.get("error", 0)
         other = sum(tally.get(k, 0) for k in ("skipped", "xfailed", "xpassed"))
         out["failures"] = failed
+        out["failures_source"] = "reported" if m else "derived"
+        out["tests_skipped"] = tally.get("skipped") if m else None
         out["tests_passed"] = passed
         out["tests_total"] = int(collected.group(1)) if collected else passed + failed + other
         progress = {_norm_test_path(f) for f in _UNIT_PYTEST_PROGRESS_RE.findall(text)}
@@ -1857,6 +1926,10 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         "runner": run.runner, "test_files_total": run.test_files_total,
         "tests_total": run.tests_total, "tests_passed": run.tests_passed,
         "failures": run.failures, "failing_files": list(run.failing_files),
+        # [ORCH-8] ADDITIVE: a reused baseline must reconcile the same way a measured one
+        # does. Entries written before this existed simply lack these keys and read as None.
+        "tests_skipped": run.tests_skipped, "tests_todo": run.tests_todo,
+        "failures_source": run.failures_source,
     }
     try:
         _unit_cache_file(archive).write_text(
@@ -1960,6 +2033,8 @@ def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
                         duration_s=float(e.get("duration_s") or 0.0), runner=e.get("runner"),
                         test_files_total=e.get("test_files_total"), tests_total=e.get("tests_total"),
                         tests_passed=e.get("tests_passed"), failures=e.get("failures"),
+                        tests_skipped=e.get("tests_skipped"), tests_todo=e.get("tests_todo"),
+                        failures_source=e.get("failures_source"),
                         failing_files=tuple(e.get("failing_files") or ()))
 
 
@@ -2113,6 +2188,14 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         return _unit_done(UnitGateOutcome(passed=False, signal="zero-collection", detail=detail, env=True,
                                           ran=True, branch=branch_run), started, repo_path, archive_path)
 
+    # [ORCH-5]'s green-branch fast path is the one consumer of `failures` that reads an
+    # ABSOLUTE threshold rather than a delta, so it is the one the [ORCH-8] correction
+    # actually moves. Before the fix, clinical-mp's 8 skipped + 4 todo were counted as 12
+    # failures, so a branch with nothing genuinely failing reported 12 and this path was
+    # UNREACHABLE for that repo — it paid for a baseline leg it did not need, every route.
+    # The threshold itself is unchanged: 0 still means 0, it is now simply true when the
+    # suite is in fact green. `exit_code == 0` still guards it, so a red run cannot slip
+    # through on a mis-parse.
     branch_green = branch_run.exit_code == 0 and not branch_run.failing_files and (branch_run.failures or 0) == 0
     if branch_green and UNIT_GATE_SKIP_BASELINE_WHEN_GREEN:
         baseline_note = (f"not measured — branch is fully green (0 failures); no baseline can make "
@@ -2264,7 +2347,9 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
         return {"ref": r.ref, "exit_code": r.exit_code, "duration_s": round(r.duration_s, 2),
                 "runner": r.runner, "test_files_total": r.test_files_total,
                 "tests_total": r.tests_total, "tests_passed": r.tests_passed,
-                "failures": r.failures, "failing_files": list(r.failing_files),
+                "failures": r.failures, "tests_skipped": r.tests_skipped,   # [ORCH-8]
+                "tests_todo": r.tests_todo, "failures_source": r.failures_source,
+                "failing_files": list(r.failing_files),
                 "error": r.error}
 
     entries.append({
