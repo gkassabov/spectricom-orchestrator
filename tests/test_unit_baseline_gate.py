@@ -1772,3 +1772,96 @@ class TestOrch9ChangedNoVerdictSemantics:
         cache = json.loads((archive / "unit-baseline-cache.json").read_text())["entries"]
         entry = list(cache.values())[0]
         assert B in entry["flaky_files"] and entry["flaky_seen"][B]["count"] >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-9 [ORCH-9] S2/S3 — the residue, found and named.
+#
+# The gate ran the unit suite through _gate_shell_cmd, so clinical-mp's declared env_file was
+# exported into the suite's process environment. That repo sets `envDir: false` under VITEST
+# (RED-1) and asserts those keys are absent from process.env (RED-4,
+# src/lib/llm/__tests__/env-isolation.test.ts) precisely so the developer .env cannot reach
+# the unit tests. The gate put it back, through the shell, underneath the isolation.
+#
+# Measured at e837cbe, the SAME seven files, back to back, 16 seconds apart, differing only
+# in the shell prefix:
+#     sourced      7 files failed    Tests  29 failed |  93 passed (122)
+#     not sourced  1 file  failed    Tests   3 failed | 119 passed (122)
+# 26 failures over 6 files that belonged to the gate, not to the code — which is the whole
+# residue on RED-5b's branch leg (41 gate = 29 failed + 8 skipped + 4 todo; vitest said 3).
+# ═══════════════════════════════════════════════════════════════════════════════════════
+class TestTheUnitSuiteRunsTheSuiteTheRepoRuns:
+    """AC-O9-02 — the unit leg is invoked as the repo invokes it: no env_file sourcing."""
+
+    @contextmanager
+    def _declaring_env_file(self, repo_dir):
+        (repo_dir / ".env").write_text("VITE_LLM_PROVIDER=x\n")
+        with active(), patch.dict(orchestrator.PRE_MERGE_GATES,
+                                  {"gated-repo": {"gates": ("build",), "env_file": ".env"}}):
+            yield
+
+    def _command_actually_run(self, repo_dir, ref="route"):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return MagicMock(returncode=0, stdout=CMP_GREEN, stderr="")
+
+        with patch.object(orchestrator.subprocess, "run", fake_run):
+            orchestrator._run_unit_suite("npm test", repo_dir, ref)
+        return seen["cmd"]
+
+    def test_the_unit_leg_does_not_source_the_declared_env_file(self, tmp_path):
+        with self._declaring_env_file(tmp_path):
+            cmd = self._command_actually_run(tmp_path)
+        assert cmd == "npm test", f"the gate ran {cmd!r}, not the repo's own command"
+        assert "set -a" not in cmd and ".env" not in cmd
+
+    def test_the_baseline_leg_is_unsourced_too(self, tmp_path):
+        """Both legs, or the comparison is between two different suites."""
+        with self._declaring_env_file(tmp_path):
+            cmd = self._command_actually_run(tmp_path, ref="merge-base abc1234")
+        assert cmd == "npm test"
+
+    def test_the_confirmation_leg_is_unsourced_too(self, tmp_path):
+        """[ORCH-6]'s isolation pass goes through _run_unit_suite, so it inherits this — which
+        is what made an .env-induced failure confirm as a REGRESSION rather than resolve."""
+        with self._declaring_env_file(tmp_path):
+            cmd = self._command_actually_run(tmp_path, ref="confirm route")
+        assert cmd == "npm test"
+
+    def test_the_build_and_sit_gates_still_source_it(self, tmp_path):
+        """The env_file was introduced for tsc/vite build and sit:gate, and stays there."""
+        with self._declaring_env_file(tmp_path):
+            assert orchestrator._gate_shell_cmd("tsc --noEmit", tmp_path) == \
+                "set -a; . ./.env; set +a; tsc --noEmit"
+        src = (REPO_ROOT / "orchestrator.py").read_text()
+        for gate in ("def run_build_gate(", "def run_sit_post_merge("):
+            body = src.split(gate)[1].split("\ndef ")[0]
+            assert "_gate_shell_cmd(" in body, f"{gate} lost its env_file sourcing"
+
+    def test_the_unit_suite_no_longer_reaches_the_env_sourcing_helper(self):
+        src = (REPO_ROOT / "orchestrator.py").read_text()
+        body = src.split("def _run_unit_suite(")[1].split("\ndef ")[0]
+        # Scoped to the CODE: the comment there names the helper to say why it is NOT used,
+        # and a guard that trips on its own explanation guards nothing.
+        code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+        assert "_gate_shell_cmd" not in code, \
+            "[ORCH-9]: the unit suite must be invoked as the repo invokes it"
+
+    def test_a_repo_declaring_no_env_file_is_unaffected(self, tmp_path):
+        """The orchestrator's own meta-fire lane declares env_file=None and always ran clean."""
+        with active(), patch.dict(orchestrator.PRE_MERGE_GATES,
+                                  {"gated-repo": {"gates": ("build",), "env_file": None}}):
+            assert self._command_actually_run(tmp_path) == "npm test"
+
+    def test_ac_o9_09_the_env_file_is_still_linked_into_the_baseline_worktree(self, tmp_path):
+        """Linked for PARITY, not for use: the branch leg runs in a checkout that has the file
+        on disk, so the baseline worktree gets one too. The baseline worktree path itself is
+        untouched by this route — the cold-cache lead was not what was wrong."""
+        src, dst = tmp_path / "src", tmp_path / "dst"
+        (src / "node_modules").mkdir(parents=True)
+        dst.mkdir()
+        with self._declaring_env_file(src):
+            links = orchestrator._link_unit_deps(src, dst)
+        assert {p.name for p in links} == {"node_modules", ".env"}

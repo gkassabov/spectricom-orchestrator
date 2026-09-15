@@ -305,7 +305,8 @@ UNIT_FLAKY_QUARANTINE_THRESHOLD = 2
 # change. Repos absent from this table are UNGATED and that is a stated decision
 # (run_pre_merge_gates returns PASS with reason "ungated by policy").
 #   gates    : ordered tuple of "build" (run_build_gate) / "sit" (run_sit_post_merge)
-#   env_file : dotenv sourced via GATE_ENV_SOURCE in the gate shell, cwd = repo root,
+#   env_file : dotenv sourced via GATE_ENV_SOURCE in the BUILD and SIT gate shells (never the
+#              unit suite — see _run_unit_suite, [ORCH-9]), cwd = repo root,
 #              values never logged (canon §23.9d). Declared-but-missing ⇒ BLOCKED(environment).
 #              None ⇒ no sourcing and no requirement.
 # The S7-CORE-8 [ORCH-3] unit baseline gate is deliberately NOT listed here: per that
@@ -1219,7 +1220,10 @@ def _gate_shell_cmd(cmd: str, repo_path: Path) -> str:
     declares an env_file and it exists. cwd is repo_path, so `. ./.env` resolves to the gated
     repo root. A declared-but-missing env_file is caught before any gate runs
     (run_pre_merge_gates), so the sourcing line can never abort the run silently.
-    Secrets-silent: no set -x, no echo; values are never read by the orchestrator."""
+    Secrets-silent: no set -x, no echo; values are never read by the orchestrator.
+
+    [ORCH-9]: the BUILD and SIT gates only. The unit suite is deliberately NOT run through
+    this — see _run_unit_suite for the measurement that settled it."""
     name, path = _gate_env_file(repo_path)
     if name and path.is_file():
         return f"{GATE_ENV_SOURCE.format(env_file=name)}; {cmd}"
@@ -1735,7 +1739,12 @@ def _unit_merge_base(repo_path: Path, branch_name: Optional[str]) -> Optional[st
 def _link_unit_deps(src: Path, dst: Path) -> list:
     """Symlink the git-ignored dependency paths (and the declared env_file) from the gated
     checkout into the detached baseline worktree, so the baseline runs the same suite the
-    branch does. Returns the links created, for teardown. Never reads any file's contents."""
+    branch does. Returns the links created, for teardown. Never reads any file's contents.
+
+    [ORCH-9]: the env_file is linked for PARITY, not for use — the unit suite is no longer run
+    through the env-sourcing shell. The branch leg runs in a checkout that has the file on
+    disk, so the baseline leg gets one too; whether a repo's own config reads it is the
+    repo's decision to make identically on both sides."""
     created = []
     names = list(UNIT_BASELINE_LINK_PATHS)
     env_name, _ = _gate_env_file(src)
@@ -1792,7 +1801,18 @@ def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None
     started = time.time()
     budget = timeout or _unit_suite_timeout(ref)
     try:
-        r = subprocess.run(_gate_shell_cmd(cmd, cwd), shell=True, capture_output=True,
+        # [ORCH-9] S2/S3: NOT _gate_shell_cmd. The declared env_file belongs to the BUILD and
+        # SIT gates, which run the app's own toolchain and need its configuration. The unit
+        # suite is the opposite case: clinical-mp's vite.config.ts sets `envDir: false` under
+        # VITEST expressly to keep the developer .env out of the unit tests (RED-1), and
+        # src/lib/llm/__tests__/env-isolation.test.ts asserts those keys are absent from
+        # process.env (RED-4). [ORCH-3] inherited the gate-shell convention here without a
+        # decision, so `set -a; . ./.env; set +a` exported exactly the keys that test forbids
+        # — and the gate then failed the repo for it. Measured at e837cbe, the same seven
+        # files back to back: sourced ⇒ 29 failed | 93 passed (122); not sourced ⇒ 3 failed |
+        # 119 passed (122). 26 failures, on 6 files, that belonged to the gate and not to the
+        # code. The gate must measure the suite the repo runs, not a different one.
+        r = subprocess.run(cmd, shell=True, capture_output=True,
                            text=True, cwd=str(cwd), timeout=budget)
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         parsed = _parse_unit_summary(raw)
