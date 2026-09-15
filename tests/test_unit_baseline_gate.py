@@ -1594,3 +1594,181 @@ class TestOrch8ChangedNoVerdictSemantics:
                         branch_out=vitest([A, A, A], failed=3), baseline_out=vitest([A], failed=1))
         assert o.passed is True
         assert "count rose from 1 to 3 with no newly-failing file" in o.detail
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-9 [ORCH-9] — the gate reconciles its OWN number, in the verdict line.
+#
+# RED-5b's gate reported 48 failures at merge-base e837cbe and 41 on the branch, for commits
+# whose own vitest runs reported 9 and 3. [ORCH-8] explained 12 of each (skipped + todo
+# counted as failures). The residue had no accepted explanation, and the standing consequence
+# — "do not quote a gate failure count as the repo's health" — sat in hot.md.
+#
+# The assertion below is the one that makes that state unreachable: a verdict never quotes a
+# count whose own tallies do not add up to the total the runner stated without saying so in
+# the same line. It is arithmetic over what was already parsed — nothing is re-run ([ORCH-2]).
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# The shape the RED-5b gate line must have had: 789 files / 7288 tests, but only 7261 of them
+# accounted for by any named tally. 27 tests belong to nothing.
+CMP_SHORT = (" Test Files  13 failed | 776 passed (789)\n"
+             "      Tests  9 failed | 7240 passed | 8 skipped | 4 todo (7288)\n"
+             "   Duration  307.10s\n")
+
+
+class TestTheGateReconcilesItsOwnNumber:
+    """AC-O9-03 — the tally-agreement check, on the agreeing AND the disagreeing case."""
+
+    def test_ac_o9_03_the_agreeing_case_is_silent(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="orch"):
+            o, entries = run_gate(repo, tmp_path, branch_out=CMP_FIXTURE, baseline_out=CMP_FIXTURE)
+        assert o.branch.tally_sum == 7288 == o.branch.tests_total, "9 + 7267 + 8 + 4"
+        assert o.branch.tally_note is None and o.tally_note is None
+        assert "TALLY MISMATCH" not in (o.detail or "") and "TALLY MISMATCH" not in caplog.text
+        assert entries[-1]["branch"]["tally_agrees"] is True
+        assert entries[-1]["branch"]["tally_sum"] == 7288
+
+    def test_ac_o9_03_the_disagreeing_case_says_so_in_the_verdict_line(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="orch"):
+            o, entries = run_gate(repo, tmp_path, branch_out=CMP_SHORT, baseline_out=CMP_FIXTURE)
+        assert o.branch.tally_sum == 7261
+        assert "TALLY MISMATCH on route" in o.detail
+        assert "9 failed + 7240 passed + 8 skipped + 4 todo = 7261" in o.detail
+        assert "but the runner states 7288" in o.detail
+        assert "TALLY MISMATCH" in caplog.text, "§4: flagged LOUDLY, not only in the record"
+        assert entries[-1]["branch"]["tally_agrees"] is False
+        assert entries[-1]["branch"]["tally_sum"] == 7261
+
+    def test_the_baseline_leg_is_checked_too_and_named(self, repo, tmp_path):
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_FIXTURE, baseline_out=CMP_SHORT)
+        assert "TALLY MISMATCH on merge-base" in o.detail
+        assert "TALLY MISMATCH on route" not in o.detail
+
+    def test_both_legs_disagreeing_names_both(self, repo, tmp_path):
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_SHORT, baseline_out=CMP_SHORT)
+        assert o.detail.count("TALLY MISMATCH") == 2
+
+    def test_the_check_reports_and_never_decides(self, repo, tmp_path):
+        """AC-O9-07: it is a report. A mismatch changes no verdict — the same run without it
+        passes, and so does this one."""
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_SHORT, baseline_out=CMP_FIXTURE)
+        assert o.passed is True and o.env is False and o.signal is None
+
+    def test_a_clamped_derivation_is_caught(self):
+        """The one way the FALLBACK count can disagree: `max(0, …)` clamping a negative.
+        5 passed + 9 skipped over a stated total of 7 describes no run that happened."""
+        c = orchestrator._parse_unit_summary("      Tests  5 passed | 9 skipped (7)\n")
+        r = orchestrator.UnitSuiteRun(ref="route", exit_code=1, **c)
+        assert r.failures == 0 and r.failures_source == "derived"
+        assert r.tally_sum == 14 and "but the runner states 7" in r.tally_note
+
+    def test_a_cached_baseline_is_reconciled_the_same_way(self, repo, tmp_path):
+        """[ORCH-5]'s cache must not launder a mismatch out of the verdict."""
+        archive = tmp_path / "archive"
+        for _ in range(2):
+            with active(archive=archive), patch.object(
+                    orchestrator, "_run_unit_suite", fake_suite(CMP_FIXTURE, CMP_SHORT)):
+                o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.baseline_source == "cache"
+        assert "TALLY MISMATCH on merge-base" in o.detail
+
+    def test_ac_o9_04_the_check_is_arithmetic_over_what_was_already_parsed(self):
+        """[ORCH-2]: the gate counts from captured output and never re-runs. The agreement
+        check must not smuggle a run in — no subprocess, no command, in either property."""
+        src = (REPO_ROOT / "orchestrator.py").read_text()
+        for name in ("tally_sum", "tally_note"):
+            body = src.split(f"    def {name}(self)")[1].split("\n    @property")[0]
+            for forbidden in ("subprocess", "run(", "Popen", "_run_unit_suite", "os.system"):
+                assert forbidden not in body, f"{name} must not {forbidden} — [ORCH-2]"
+
+
+class TestAnUnknownIsNotADisagreement:
+    """AC-O9-05 — §2.4 survives the new check: absent output is UNKNOWN, never 0, and never
+    a mismatch either. A reporting gap must not be dressed up as a contradiction."""
+
+    @pytest.mark.parametrize("raw", ["", "npm ERR! missing script: test",
+                                     "some tool printed nothing recognisable"])
+    def test_ac_o9_05_unrecognised_output_stays_none_and_is_not_flagged(self, raw):
+        c = orchestrator._parse_unit_summary(raw)
+        assert c["failures"] is None, "§2.4: absent ⇒ UNKNOWN, never 0"
+        r = orchestrator.UnitSuiteRun(ref="route", exit_code=1, **c)
+        assert r.tally_sum is None and r.tally_note is None
+
+    def test_ac_o9_05_the_gate_still_blocks_as_environment_not_product(self, repo, tmp_path):
+        o, entries = run_gate(repo, tmp_path, branch_out="npm ERR! nothing parseable\n",
+                              baseline_out=CMP_FIXTURE, branch_code=1)
+        assert o.passed is False and o.env is True and o.signal == "comparison-unavailable"
+        assert "TALLY MISMATCH" not in (o.detail or "")
+        assert entries[-1]["branch"]["failures"] is None
+        assert entries[-1]["branch"]["tally_agrees"] is True, "nothing to disagree with"
+        assert entries[-1]["branch"]["tally_sum"] is None
+
+    def test_a_partial_summary_with_no_total_is_unknown_not_mismatched(self):
+        """`Tests  5 passed` with no parenthesised total: nothing to check against."""
+        r = orchestrator.UnitSuiteRun(ref="route", exit_code=0,
+                                      **orchestrator._parse_unit_summary("      Tests  5 passed\n"))
+        assert r.tests_total is None and r.tally_sum is None and r.tally_note is None
+
+
+class TestOrch8BehaviourIsUnchanged:
+    """AC-O9-06 — [ORCH-9] adds a check; it moves nothing [ORCH-8] got right."""
+
+    def test_the_count_still_comes_from_the_runners_stated_failed_segment(self):
+        c = orchestrator._parse_unit_summary(CMP_FIXTURE)
+        assert (c["failures"], c["failures_source"]) == (9, "reported")
+
+    def test_the_fallback_still_subtracts_the_named_skipped_and_todo(self):
+        c = orchestrator._parse_unit_summary(CMP_GREEN)
+        assert (c["failures"], c["failures_source"]) == (0, "derived")
+        assert (c["tests_skipped"], c["tests_todo"]) == (8, 4)
+
+    def test_failures_source_still_reaches_the_line_and_the_record(self, repo, tmp_path):
+        o, entries = run_gate(repo, tmp_path, branch_out=CMP_FIXTURE, baseline_out=CMP_FIXTURE)
+        assert entries[-1]["branch"]["failures_source"] == "reported"
+        assert "9 failed, 7267 passed, 8 skipped, 4 todo" in o.branch.collection
+
+
+class TestOrch9ChangedNoVerdictSemantics:
+    """AC-O9-07 — every rule the verdict already carried, named, and still true."""
+
+    def test_orch1_gate_then_merge_is_untouched(self):
+        """The gate lane still runs BEFORE the merge; this branch did not touch that code."""
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--unified=0",
+                            "--", "orchestrator.py"], capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip("no `main` ref to diff against")
+        touched = [l for l in r.stdout.splitlines() if l.startswith(("+", "-"))
+                   and not l.startswith(("+++", "---"))]
+        for lane in ("run_pre_merge_gates", "git merge", "_acquire_fire_lock", "worktree add",
+                     "TIMEOUT =", "UNIT_GATE_SKIP_BASELINE_WHEN_GREEN"):
+            assert not [l for l in touched if lane in l], f"{lane} moved — [ORCH-9] is a report"
+
+    def test_orch4_the_lock_is_still_per_repo_not_global(self):
+        """[ORCH-4]: one lock file per repo, so a meta-fire cannot refuse a clinical-mp route."""
+        with patch.object(orchestrator, "ORCH_DIR", Path("/x")):
+            a = orchestrator._running_marker_path("clinical-mp")
+            b = orchestrator._running_marker_path("orchestrator")
+        assert a != b and a.name == "running-clinical-mp.json"
+
+    def test_orch5_the_green_branch_fast_path_is_still_reachable(self, repo, tmp_path):
+        """AC-O9-07: reachable since [ORCH-8]; a green branch still costs ONE suite run."""
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_GREEN, branch_code=0)
+        assert o.passed is True and o.baseline_source == "not-needed" and o.baseline is None
+
+    def test_orch6_and_6b_the_verdict_still_keys_on_confirmed_files(self, repo, tmp_path):
+        o, _ = run_gate(repo, tmp_path, branch_out=vitest([A, A, A], failed=3),
+                        baseline_out=vitest([A], failed=1))
+        assert o.passed is True, "[ORCH-6b]: a count delta alone is not a regression"
+        assert "count rose from 1 to 3 with no newly-failing file" in o.detail
+
+    def test_orch7_the_flaky_tail_still_accumulates_on_the_cache_entry(self, repo, tmp_path):
+        archive = tmp_path / "archive"
+        with active(archive=archive), \
+             patch.object(orchestrator, "_run_unit_suite",
+                          fake_suite(vitest([A, B], failed=2), vitest([A], failed=1))), \
+             patch.object(orchestrator, "_unit_confirm_new_files",
+                          return_value=((B,), (), orchestrator.UnitSuiteRun(ref="confirm", exit_code=0))):
+            o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.flaky_files == (B,)
+        cache = json.loads((archive / "unit-baseline-cache.json").read_text())["entries"]
+        entry = list(cache.values())[0]
+        assert B in entry["flaky_files"] and entry["flaky_seen"][B]["count"] >= 1

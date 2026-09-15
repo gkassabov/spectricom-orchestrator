@@ -1530,6 +1530,37 @@ class UnitSuiteRun:
         return s
 
     @property
+    def tally_sum(self) -> Optional[int]:
+        """[ORCH-9] failed + passed + skipped + todo, over the tallies THIS run carries. A
+        tally the runner did not state contributes 0 — it was not counted anywhere else
+        either. None when there is nothing to add up, or no stated total to check it
+        against: an UNKNOWN is not a disagreement (§2.4)."""
+        if self.tests_total is None or self.failures is None or self.tests_passed is None:
+            return None
+        return self.failures + self.tests_passed + (self.tests_skipped or 0) + (self.tests_todo or 0)
+
+    @property
+    def tally_note(self) -> Optional[str]:
+        """[ORCH-9] AC-O9-03 — None when the tallies add up to the total the runner stated
+        (or when there is not enough to check); otherwise the sentence that says they do not.
+
+        This is the assertion §4 asks for, and the one that would have caught [ORCH-8]'s
+        `total - passed` three sessions earlier: 7288 - 7267 = 21 reconciles against nothing,
+        while 9 + 7267 + 8 + 4 = 7288 reconciles against vitest's own parenthesised total. A
+        number that does not add up is not evidence, and the verdict must not quote it
+        silently."""
+        s = self.tally_sum
+        if s is None or s == self.tests_total:
+            return None
+        parts = [f"{self.failures} failed", f"{self.tests_passed} passed"]
+        for n, label in ((self.tests_skipped, "skipped"), (self.tests_todo, "todo")):
+            if n is not None:
+                parts.append(f"{n} {label}")
+        return (f"TALLY MISMATCH on {self.ref}: {' + '.join(parts)} = {s}, but the runner "
+                f"states {self.tests_total} — these counts do not all come from one run, or "
+                f"one of them was not read from the runner's own summary")
+
+    @property
     def describe(self) -> str:
         return f"{self.ref}: {self.collection or 'collection unknown (summary not parsed)'} in {self.duration_s:.1f}s"
 
@@ -1569,6 +1600,14 @@ class UnitGateOutcome:
         if self.flaky_files:
             s += f" | flaky, confirmed in isolation (not blocking): {', '.join(self.flaky_files)}"
         return s
+
+    @property
+    def tally_note(self) -> Optional[str]:
+        """[ORCH-9] AC-O9-03: whichever leg's tallies do not add up to the total its runner
+        stated, named. None when both reconcile — or when neither could be checked."""
+        notes = [n for n in ((self.branch.tally_note if self.branch else None),
+                             (self.baseline.tally_note if self.baseline else None)) if n]
+        return "; ".join(notes) or None
 
 
 # ── suite-output parsing ───────────────────────────────────────────────────────────────
@@ -2321,6 +2360,15 @@ def _unit_done(o: UnitGateOutcome, started: float, repo_path: Path,
     """Stamp the duration and persist the run. AC-O3-06: what the gate collected on BOTH
     sides is written down, in the shape [ORCH-2] established for the SIT gate."""
     o.duration_s = time.time() - started
+    # [ORCH-9] AC-O9-03 / §4: the gate reconciles itself. A verdict never quotes a failure
+    # count whose own tallies do not sum to the total the runner stated without saying so in
+    # the same line — and it says so LOUDLY, because that disagreement means the number and
+    # the run it claims to describe have come apart. Pure arithmetic over what was already
+    # parsed: nothing is re-run here ([ORCH-2]).
+    note = o.tally_note
+    if note:
+        log.warning(f"⚠️  Unit gate: {note}")
+        o.detail = f"{o.detail} | {note}" if o.detail else note
     try:
         _log_unit_outcome(archive_path or SIT_ARCHIVE_DIR, repo_path, o)
     except Exception as e:
@@ -2349,6 +2397,9 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
                 "tests_total": r.tests_total, "tests_passed": r.tests_passed,
                 "failures": r.failures, "tests_skipped": r.tests_skipped,   # [ORCH-8]
                 "tests_todo": r.tests_todo, "failures_source": r.failures_source,
+                # [ORCH-9] AC-O9-03: the agreement check, persisted — a later reader can tell
+                # whether this entry's number reconciled without re-deriving it.
+                "tally_sum": r.tally_sum, "tally_agrees": r.tally_note is None,
                 "failing_files": list(r.failing_files),
                 "error": r.error}
 
