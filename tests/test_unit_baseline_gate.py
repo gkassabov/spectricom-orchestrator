@@ -1575,8 +1575,10 @@ class TestOrch8ChangedNoVerdictSemantics:
         assert orchestrator.UNIT_GATE_TIMEOUT == 900
         assert orchestrator.UNIT_BASELINE_TIMEOUT == 1800
         assert orchestrator.UNIT_CONFIRM_TIMEOUT == 300
-        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--unified=0"],
-                           capture_output=True, text=True)
+        # Scoped to the CODE: the brief itself quotes `testTimeout: 15000` while naming §4
+        # as report-only, and a guard that trips on its own brief guards nothing.
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--unified=0",
+                            "--", "orchestrator.py", "config/"], capture_output=True, text=True)
         if r.returncode != 0:
             pytest.skip("no `main` ref to diff against")
         touched = [l for l in r.stdout.splitlines() if l.startswith(("+", "-"))
