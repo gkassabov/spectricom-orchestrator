@@ -1727,20 +1727,37 @@ class TestOrch8BehaviourIsUnchanged:
         assert "9 failed, 7267 passed, 8 skipped, 4 todo" in o.branch.collection
 
 
+# [ORCH-9] is a historical claim about two specific commits, so the guard below is pinned to
+# them. `062e2f6` is the parent of `121ca54`; `bf9254c` is the second and last ORCH-9 commit.
+# It used to read `main...HEAD`, which made it an assertion about *whatever branch is checked
+# out* — a standing trap for every later route that legitimately touches these lanes. It sprang
+# on SIT-RATE-1 and cost that route its gate. Third instance of this shape ([ORCH-2b]; df6746a
+# scoped the ORCH-8 no-scheduling-knob guard the same way). Two other branch-relative guards
+# remain in this file — the no-scheduling-knob check and the `config/repos.yaml` check. Named
+# here, deliberately not changed: neither is failing, and a sweep is its own route.
+ORCH9_BASE = "062e2f6"
+ORCH9_TIP = "bf9254c"
+
+
 class TestOrch9ChangedNoVerdictSemantics:
     """AC-O9-07 — every rule the verdict already carried, named, and still true."""
 
     def test_orch1_gate_then_merge_is_untouched(self):
-        """The gate lane still runs BEFORE the merge; this branch did not touch that code."""
-        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--unified=0",
+        """The gate lane still ran BEFORE the merge across the [ORCH-9] commits themselves."""
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff",
+                            f"{ORCH9_BASE}..{ORCH9_TIP}", "--unified=0",
                             "--", "orchestrator.py"], capture_output=True, text=True)
         if r.returncode != 0:
-            pytest.skip("no `main` ref to diff against")
+            pytest.skip("the [ORCH-9] commits are not present in this clone")
         touched = [l for l in r.stdout.splitlines() if l.startswith(("+", "-"))
                    and not l.startswith(("+++", "---"))]
+        # A lane NAMED in a comment has not moved. The old guard matched raw diff text, so a
+        # comment mentioning `run_pre_merge_gates` counted as a change to it. That one comment
+        # line was the entire failure.
+        code = [l for l in touched if not l[1:].lstrip().startswith("#")]
         for lane in ("run_pre_merge_gates", "git merge", "_acquire_fire_lock", "worktree add",
                      "TIMEOUT =", "UNIT_GATE_SKIP_BASELINE_WHEN_GREEN"):
-            assert not [l for l in touched if lane in l], f"{lane} moved — [ORCH-9] is a report"
+            assert not [l for l in code if lane in l], f"{lane} moved — [ORCH-9] is a report"
 
     def test_orch4_the_lock_is_still_per_repo_not_global(self):
         """[ORCH-4]: one lock file per repo, so a meta-fire cannot refuse a clinical-mp route."""
