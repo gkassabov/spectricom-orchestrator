@@ -1,0 +1,66 @@
+# filename: sit_gate_vitest_429_19files_3down.txt
+# S7-CORE-10 [ORCH-11] AC-SR-03 — the SIT gate output of 2026-09-15 22:20 on clinical-mp @181a109,
+# as run_sit_post_merge received it. The OperationOutcomeError blocks (ANSI colour included) are
+# verbatim from sit-archive/orchestrator-sit-log.json error_excerpt; the per-file lines and the
+# summary are the vitest 4.1.4 shape for that entry's counts (19 files / 16 passed, 60 tests /
+# 51 passed, 3 suites down at login, 0 failed assertions).
+
+ RUN  v4.1.4 /home/gkassa/spectricom-clinical-mp
+
+ ✓ sit/integration/autosave-persistence.integration.test.ts (2 tests) 1843ms
+ ✓ sit/integration/careplan-customization.integration.test.ts (3 tests) 1102ms
+ ✓ sit/integration/careplan-materialize-live.integration.test.ts (4 tests) 1499ms
+ ✓ sit/integration/careplan-product-template.integration.test.ts (3 tests) 988ms
+ ✓ sit/integration/longevity-advanced-partner-results.integration.test.ts (4 tests) 2310ms
+ ✓ sit/integration/longevity-cadence-config.integration.test.ts (3 tests) 774ms
+ ✓ sit/integration/longevity-cadence.integration.test.ts (3 tests) 801ms
+ ✓ sit/integration/longevity-external-results.integration.test.ts (4 tests) 1210ms
+ ✓ sit/integration/longevity-function.integration.test.ts (3 tests) 690ms
+ ✓ sit/integration/longevity-ingested-results.integration.test.ts (4 tests) 1305ms
+ ✓ sit/integration/longevity-panel.integration.test.ts (3 tests) 655ms
+ ✓ sit/integration/longevity-prescribe-surface.integration.test.ts (3 tests) 720ms
+ ✓ sit/integration/longevity-range-config.integration.test.ts (3 tests) 701ms
+ ✓ sit/integration/longevity-step-vocabulary.integration.test.ts (3 tests) 612ms
+ ✓ sit/integration/longevity-thresholds-config.integration.test.ts (3 tests) 640ms
+ ✓ sit/integration/longevity-tiered-consent.integration.test.ts (3 tests) 733ms
+ ❯ sit/integration/longevity-trajectory.integration.test.ts (3 tests | 3 skipped)
+ ❯ sit/integration/longevity-vocabulary-config.integration.test.ts (3 tests | 3 skipped)
+ ❯ sit/integration/sign-finalization.integration.test.ts (3 tests | 3 skipped)
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯ Failed Suites 3 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  sit/integration/longevity-trajectory.integration.test.ts [ sit/integration/longevity-trajectory.integration.test.ts ]
+[31m[1mOperationOutcomeError[22m: Too Many Requests ({"_remainingPoints":0,"_msBeforeNext":47212,"_consumedPoints":50090,"_isFirstInDuration":false,"limit":50000})[39m
+[90m [2m❯[22m Zt.request node_modules/@medplum/core/src/client.ts:[2m3609:12[22m[39m
+[36m [2m❯[22m SitIntegrationHarness.login sit/integration/medplum-harness.ts:[2m89:26[22m[39m
+[90m [2m❯[22m sit/integration/longevity-trajectory.integration.test.ts:[2m41:3[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯[22m[39m
+
+ FAIL  sit/integration/sign-finalization.integration.test.ts [ sit/integration/sign-finalization.integration.test.ts ]
+[31m[1mOperationOutcomeError[22m: Too Many Requests ({"_remainingPoints":0,"_msBeforeNext":46330,"_consumedPoints":50061,"_isFirstInDuration":false,"limit":50000})[39m
+[90m [2m❯[22m Zt.request node_modules/@medplum/core/src/client.ts:[2m3609:12[22m[39m
+[36m [2m❯[22m SitIntegrationHarness.login sit/integration/medplum-harness.ts:[2m89:26[22m[39m
+[90m [2m❯[22m sit/integration/sign-finalization.integration.test.ts:[2m22:3[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯[22m[39m
+
+ FAIL  sit/integration/longevity-vocabulary-config.integration.test.ts [ sit/integration/longevity-vocabulary-config.integration.test.ts ][22m
+[31m[1mOperationOutcomeError[22m: Too Many Requests ({"_remainingPoints":0,"_msBeforeNext":45401,"_consumedPoints":50037,"_isFirstInDuration":false,"limit":50000})[39m
+[90m [2m❯[22m Zt.request node_modules/@medplum/core/src/client.ts:[2m3609:12[22m[39m
+[36m [2m❯[22m SitIntegrationHarness.login sit/integration/medplum-harness.ts:[2m89:26[22m[39m
+    [90m 87|[39m     await this.medplum.startClientLogin(process.env.MEDPLUM_CLIENT_ID,…
+    [90m 88|[39m
+    [90m 89|[39m     const practitioner = await this.medplum.createResource<Practitione…
+    [90m   |[39m                          [31m^[39m
+    [90m 90|[39m       resourceType[33m:[39m [32m'Practitioner'[39m[33m,[39m
+    [90m 91|[39m       meta[33m:[39m [35mthis[39m[33m.[39m[34mtag[39m()[33m,[39m
+[90m [2m❯[22m sit/integration/longevity-vocabulary-config.integration.test.ts:[2m73:3[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯[22m[39m
+
+ Test Files  3 failed | 16 passed (19)
+      Tests  51 passed | 9 skipped (60)
+   Start at  22:19:53
+   Duration  16.80s (transform 2.41s, setup 0ms, import 6.02s, tests 14.9s, environment 0ms)
+

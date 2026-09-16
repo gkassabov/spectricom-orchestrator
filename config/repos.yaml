@@ -43,6 +43,17 @@ repos:
     # here is the whole repo (773 files / 7103 tests). The [ORCH-5] comment claiming the
     # branch leg "fits in 900s on a warm checkout" was measured once, optimistically.
     test_timeout_s: 1800
+    # S7-CORE-10 SIT-RATE-1 (measured 2026-09-15 @181a109): 19 SIT files in ONE gate run =
+    # `_consumedPoints 50090` against Medplum's `limit: 50000` → HTTP 429 in the harness login
+    # (each file's login provisions a Practitioner; cost scales with file count). The same
+    # commit in two halves 90 s apart: 10 files/29 tests + 9 files/31 tests, all green.
+    # `sit_list_cmd` enumerates the suite (`file > test` per line) WITHOUT running it: it is
+    # both the batch source and the whole-suite count the batches must sum to (AC-SR-05).
+    # Absent ⇒ one unbatched run. Batch size / pause default to SIT_BATCH_FILES /
+    # SIT_BATCH_PAUSE_S in orchestrator.py; each SIT_TIMEOUT is the budget of one batch.
+    sit_list_cmd: "npx vitest list --config vitest.sit.config.ts"
+    sit_batch_files: 10
+    sit_batch_pause_s: 90
     default: false
 
   orchestrator:

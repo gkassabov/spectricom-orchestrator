@@ -202,6 +202,26 @@ SIT_BLOCKING = os.environ.get("DISABLE_SIT_BLOCKING", "") == ""
 BUILD_GATE_CMD = "npx tsc --noEmit && npm run build"
 BUILD_GATE_TIMEOUT = 600  # 10 min
 SIT_TIMEOUT = 600  # S6S47: 300 was too tight for full smoke suite w/ 4 workers
+# S7-CORE-10 SIT-RATE-1: the SIT gate runs in BATCHES of files with a pause between, so one
+# batch completes inside the upstream rate-limit window. Measured 2026-09-15 on clinical-mp
+# @181a109: 19 files in ONE run = `_consumedPoints 50090` against `limit: 50000` → HTTP 429
+# thrown in the harness login (each file's login provisions a Practitioner, so gate cost
+# scales with file count: 10 files a week earlier, 19 now). The same commit in two halves
+# 90 s apart: 10 files/29 tests green, then 9 files/31 tests green — 19/19, 60/60.
+# Batching is ON for a repo iff it declares `sit_list_cmd` in config/repos.yaml — the command
+# that ENUMERATES the suite without running it (`file > test` per line). That enumeration is
+# also the whole-suite count the batched totals must reconcile against (AC-SR-05): a batching
+# scheme that loses a file is worse than the rate limit. Size and pause are per-repo keys
+# with these defaults; never inline a number at a call site (CLAUDE.md). SIT_TIMEOUT above
+# is the budget of ONE batch (each batch is one gate invocation).
+SIT_BATCH_FILES = 10
+SIT_BATCH_PAUSE_S = 90
+SIT_LIST_CMD_KEY = "sit_list_cmd"
+SIT_BATCH_FILES_KEY = "sit_batch_files"
+SIT_BATCH_PAUSE_KEY = "sit_batch_pause_s"
+# SitOutcome.error values that are an ENVIRONMENT verdict on the gate's own machinery, never
+# a verdict about the product (run_pre_merge_gates maps them to BLOCKED(environment)).
+SIT_GATE_ENV_ERRORS = ("zero-collection", "sit-list-failed", "batch-incomplete")
 # S7-CORE-7 [ORCH-2] / D-S7CORE6-05: the thin-gate floor is configuration, not a literal.
 # Unset ⇒ no floor, no warning; only the collected counts are reported. Zero-collection
 # blocking (§4.5) is independent of this floor and always on.
@@ -353,6 +373,27 @@ ENV_BLOCK_SIGNALS = (
     ("env-file-unsourceable",
      r"\./\.env: (?:line )?\d+:",
      ".env present but the shell could not source it"),
+    # S7-CORE-10 [ORCH-11] AC-SR-02: transport-level refusals. 2026-09-15: Medplum answered
+    # the harness login with HTTP 429 (`_consumedPoints 50090 / limit 50000`) and the gate
+    # returned FAIL(product) because nothing above knew a 429 — the second false FAIL(product)
+    # from this detector that night. A refusal at the transport is never a product verdict.
+    # `429` is matched only in its HTTP shapes: a bare 429 is also a line number
+    # (`harness.ts:429:5`), a tally (`429 passed (429)`) or an id (`obs-429`), and none of
+    # those may turn a product failure into an environment one.
+    ("rate-limited",
+     r"Too Many Requests|_consumedPoints|\bHTTP[ /]?429\b|\bstatus(?:Code)?\W{0,3}429\b"
+     r"|\bcode\W{0,3}429\b|\b429\s+Too Many",
+     "upstream rate limit (HTTP 429) — the budget, not the product"),
+    ("connection-refused",
+     r"\bECONNREFUSED\b|\bECONNRESET\b|\bETIMEDOUT\b",
+     "connection refused/reset by a dependency (any host)"),
+    # The Medplum client raising for a SERVER-side refusal, before any assertion ran. Scoped
+    # to the transport-class statuses on purpose: an OperationOutcomeError carrying a 400 for a
+    # resource the PRODUCT built wrong is a product failure and must fall through.
+    ("client-operation-outcome",
+     r"^\s*OperationOutcomeError\b[^\n]*(?:Too Many Requests|Service Unavailable|Bad Gateway"
+     r"|Gateway Timeout|Internal Server Error|Request Timeout|fetch failed|ECONN[A-Z]+)",
+     "Medplum client raised OperationOutcomeError for a server/transport refusal, not an assertion"),
 )
 # A gate throw naming a required env var, e.g. "requires `MEDPLUM_CLIENT_ID`" (2026-09-09).
 # Fires as signal "env-var-unsourced" only when the named var IS a key in the repo's env_file —
@@ -362,7 +403,9 @@ ENV_VAR_MISSING_PATTERNS = (
     r"[`'\"]?([A-Z][A-Z0-9_]{2,})[`'\"]?\s+(?:is|was)\s+(?:not set|not defined|missing|required|undefined)",
     r"[Mm]issing\s+(?:required\s+)?(?:env(?:ironment)?\s+var(?:iable)?)?\s*:?\s*[`'\"]?([A-Z][A-Z0-9_]{2,})",
 )
-_ENV_BLOCK_SIGNALS_RE = [(sid, re.compile(rx, re.IGNORECASE), desc) for sid, rx, desc in ENV_BLOCK_SIGNALS]
+# [ORCH-11] MULTILINE so a signal may anchor to the start of a runner error line; the
+# classifier strips ANSI colour first, because vitest wraps the error name in it.
+_ENV_BLOCK_SIGNALS_RE = [(sid, re.compile(rx, re.IGNORECASE | re.MULTILINE), desc) for sid, rx, desc in ENV_BLOCK_SIGNALS]
 _ENV_VAR_MISSING_RE = [re.compile(rx) for rx in ENV_VAR_MISSING_PATTERNS]
 
 
@@ -1476,15 +1519,32 @@ class SitOutcome:
     test_files_passed: Optional[int] = None
     tests_total: Optional[int] = None
     tests_passed: Optional[int] = None
+    # [ORCH-11] the tally the verdict turns on. None = the summary did not state it and the
+    # named tallies did not reconcile (UNKNOWN, never 0 — §2.4); 0 = the runner's own line says
+    # every executed assertion passed.
+    tests_failed: Optional[int] = None
+    tests_skipped: Optional[int] = None
+    # [SIT-RATE-1] how many gate invocations produced these counts; None = one unbatched run.
+    batches: Optional[int] = None
+    detail: Optional[str] = None  # the sentence behind a machinery `error` (never a secret)
+
+    @property
+    def files_failed(self) -> Optional[int]:
+        """Files that did not finish green — down at setup or carrying a failed test."""
+        if self.test_files_total is None or self.test_files_passed is None:
+            return None
+        return self.test_files_total - self.test_files_passed
 
     @property
     def collection(self) -> Optional[str]:
-        """`7 files/18 tests, 6.6s` for FINAL STATUS / batch summary; None when nothing parsed."""
+        """`7 files/18 tests, 6.6s` for FINAL STATUS / batch summary; None when nothing parsed.
+        [SIT-RATE-1] `19 files/60 tests in 2 batches, 110.2s` when the gate ran batched."""
         if self.test_files_total is None and self.tests_total is None:
             return None
         f = "?" if self.test_files_total is None else self.test_files_total
         t = "?" if self.tests_total is None else self.tests_total
-        return f"{f} files/{t} tests, {self.duration_s:.1f}s"
+        b = f" in {self.batches} batches" if self.batches else ""
+        return f"{f} files/{t} tests{b}, {self.duration_s:.1f}s"
 
 
 # [ORCH-2] vitest summary as the SIT gate prints it (captured 2026-09-11 from clinical-mp, tests/fixtures/):
@@ -1562,6 +1622,157 @@ def _describe_collection(c: dict) -> str:
     return s
 
 
+def _sit_tests_failed(counts: dict, tallies: dict) -> Optional[int]:
+    """[ORCH-11] The failed-assertion count the vitest summary STATES. `Tests 51 passed | 9
+    skipped (60)` carries no `failed` segment; it is read as 0 only when the tallies it does
+    carry reconcile against its own total (51 + 9 = 60). Anything else is None — unknown is
+    not zero (§2.4), and unknown never earns an environment verdict."""
+    if tallies.get("failed") is not None:
+        return tallies["failed"]
+    total, passed = counts.get("tests_total"), counts.get("tests_passed")
+    if total is None or passed is None:
+        return None
+    if passed + (tallies.get("skipped") or 0) + (tallies.get("todo") or 0) == total:
+        return 0
+    return None
+
+
+@dataclass
+class SitPlan:
+    """[SIT-RATE-1] What the suite enumerates, before anything runs. `files` in listing order;
+    `tests_expected` None when the list command printed files only."""
+    files: list = field(default_factory=list)
+    tests_expected: Optional[int] = None
+    batch_files: int = SIT_BATCH_FILES
+    pause_s: int = SIT_BATCH_PAUSE_S
+    error: Optional[str] = None
+    detail: Optional[str] = None
+
+    @property
+    def batches(self) -> list:
+        n = max(1, self.batch_files)
+        return [self.files[i:i + n] for i in range(0, len(self.files), n)]
+
+
+def _sit_plan(repo_path: Path) -> Optional[SitPlan]:
+    """[SIT-RATE-1] None ⇒ batching is not configured for this repo (no `sit_list_cmd`) and
+    the gate runs exactly as before, in one invocation. Otherwise enumerate the suite with the
+    repo's own list command so the batches are cut from the same file set the runner would
+    collect — no glob is duplicated here. A list that fails or enumerates nothing is an
+    environment error (`sit-list-failed`): the gate would otherwise run unbatched into the
+    very rate limit this exists to avoid."""
+    list_cmd = (ACTIVE_REPO_CONFIG.get(SIT_LIST_CMD_KEY) or "").strip()
+    if not list_cmd:
+        return None
+    plan = SitPlan(batch_files=_unit_repo_timeout(SIT_BATCH_FILES_KEY, SIT_BATCH_FILES))
+    raw_pause = ACTIVE_REPO_CONFIG.get(SIT_BATCH_PAUSE_KEY)
+    try:  # 0 is a legitimate pause (none); a non-integer is not
+        plan.pause_s = SIT_BATCH_PAUSE_S if raw_pause in (None, "") else max(0, int(raw_pause))
+    except (TypeError, ValueError):
+        log.warning(f"⚠️  SIT gate: repos.yaml {SIT_BATCH_PAUSE_KEY}={raw_pause!r} is not an integer — using {SIT_BATCH_PAUSE_S}s")
+    try:
+        r = subprocess.run(_gate_shell_cmd(list_cmd, repo_path), shell=True, capture_output=True,
+                           text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        plan.error, plan.detail = "sit-list-failed", f"{list_cmd!r}: {type(e).__name__}"
+        return plan
+    text = _ANSI_RE.sub("", r.stdout or "")
+    files, tests = [], 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or " " in line.split(" > ", 1)[0]:
+            continue  # banners / blank lines are never a path
+        if " > " in line:
+            tests += 1
+        f = line.split(" > ", 1)[0]
+        if f not in files:
+            files.append(f)
+    if r.returncode != 0 or not files:
+        plan.error = "sit-list-failed"
+        plan.detail = (f"{list_cmd!r} exit {r.returncode}, {len(files)} files enumerated: "
+                       f"{((r.stderr or r.stdout or '').strip()[-300:]) or 'no output'}")
+        return plan
+    plan.files, plan.tests_expected = files, (tests or None)
+    return plan
+
+
+@dataclass
+class _SitBatchedRun:
+    """[SIT-RATE-1] The aggregate of every batch — one gate result, never a partial one."""
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    red_output: str = ""   # tails of the RED batches only, for F-20 classification
+    counts: dict = field(default_factory=dict)
+    tallies: dict = field(default_factory=dict)
+    batches: int = 0
+    mismatch: Optional[str] = None
+
+
+def _add_count(agg: dict, key: str, val: Optional[int], unknown: set):
+    if val is None:
+        unknown.add(key)
+    else:
+        agg[key] = agg.get(key, 0) + val
+
+
+def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan) -> _SitBatchedRun:
+    """[SIT-RATE-1] Run `sit_cmd -- <files>` once per batch, pausing `plan.pause_s` between,
+    and add the per-batch vitest summaries up. Every batch runs (no early exit, and NEVER a
+    retry — a re-run against an unrefilled budget is dirtier than the first, measured
+    2026-09-15: 5 files down instead of 3). A batch that collects a different number of files
+    than it was handed, or an aggregate that does not equal the enumeration, is `mismatch`:
+    the [ORCH-8] failure in a new costume, and not a verdict."""
+    out = _SitBatchedRun()
+    agg, unknown = {}, set()
+    batches = plan.batches
+    out.batches = len(batches)
+    notes = []
+    for i, files in enumerate(batches, 1):
+        if i > 1 and plan.pause_s > 0:
+            log.info(f"⏸️  SIT batch pause {plan.pause_s}s (rate-limit window refill) before batch {i}/{len(batches)}")
+            time.sleep(plan.pause_s)
+        cmd = f"{sit_cmd} -- {' '.join(shlex.quote(f) for f in files)}"
+        started = time.time()
+        r = subprocess.run(_gate_shell_cmd(cmd, repo_path), shell=True, capture_output=True,
+                           text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+        d = time.time() - started
+        raw = (r.stdout or "") + "\n" + (r.stderr or "")
+        c, t = _parse_vitest_summary(raw), _parse_vitest_tallies(raw)
+        head = f"── SIT batch {i}/{len(batches)} ({len(files)} files) ──\n"
+        out.stdout += head + (r.stdout or "")
+        out.stderr += head + (r.stderr or "")
+        if r.returncode != 0:
+            out.returncode = out.returncode or r.returncode
+            out.red_output += head + raw[-10000:]
+        status = "PASS" if r.returncode == 0 else f"exit {r.returncode}"
+        log.info(f"🧪 SIT batch {i}/{len(batches)}: {status} — {_describe_collection(c)} in {d:.1f}s")
+        if c["test_files_total"] != len(files):
+            notes.append(f"batch {i} was handed {len(files)} files and collected "
+                         f"{'?' if c['test_files_total'] is None else c['test_files_total']}")
+        for k in ("test_files_total", "test_files_passed", "tests_total", "tests_passed"):
+            _add_count(agg, k, c[k], unknown)
+        # `failed` per batch by the same rule as a single run (_sit_tests_failed): a line with
+        # no `failed` segment that reconciles states 0. skipped/todo are printed only when
+        # non-zero, so absent IS 0 for them.
+        _add_count(agg, "t_failed", _sit_tests_failed(c, t), unknown)
+        for k in ("skipped", "todo"):
+            _add_count(agg, f"t_{k}", t[k] or 0, unknown)
+    out.counts = {k: (None if k in unknown else agg.get(k, 0))
+                  for k in ("test_files_total", "test_files_passed", "tests_total", "tests_passed")}
+    # A batch whose failed count is UNKNOWN makes the aggregate unknown — a partial sum is not
+    # a count (§2.4).
+    out.tallies = {k: (None if f"t_{k}" in unknown else agg.get(f"t_{k}", 0))
+                   for k in ("failed", "skipped", "todo")}
+    got_f, got_t = out.counts["test_files_total"], out.counts["tests_total"]
+    if got_f != len(plan.files):
+        notes.append(f"batches collected {got_f} files, the suite enumerates {len(plan.files)}")
+    if plan.tests_expected is not None and got_t != plan.tests_expected:
+        notes.append(f"batches collected {got_t} tests, the suite enumerates {plan.tests_expected}")
+    out.mismatch = "; ".join(notes) or None
+    return out
+
+
 def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> SitOutcome:
     """Run SIT smoke tests, then apply the MANY-or-SEVERE halt rule.
 
@@ -1583,20 +1794,42 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
     # Playwright config uses env var NO_AUTO_SPAWN (not a CLI flag); with
     # reuseExistingServer: true, no orchestrator-side suppression needed.
     sit_cmd = "npm run sit:gate"  # S6S78: deterministic headless T1 (vitest); exit-code = pass/fail
-    log.info(f"🧪 Running SIT post-merge: {sit_cmd}")
+    # [SIT-RATE-1] None ⇒ one invocation, exactly as before. A plan ⇒ batches of `batch_files`
+    # with `pause_s` between, added up and reconciled against the enumeration.
+    plan = _sit_plan(repo_path)
+    if plan is not None and plan.error:
+        log.error(f"⛔ SIT gate: could not enumerate the suite for batching — {plan.error} ({plan.detail}) "
+                  f"— BLOCKED(environment), not run unbatched into the rate limit")
+        _log_sit_outcome(archive, repo_path, False, -1, 0.0, None, error=plan.error, error_excerpt=plan.detail)
+        return SitOutcome(passed=False, exit_code=-1, error=plan.error, detail=plan.detail, output=plan.detail or "")
+    if plan is None:
+        log.info(f"🧪 Running SIT post-merge: {sit_cmd}")
+    else:
+        log.info(f"🧪 Running SIT post-merge: {sit_cmd} — {len(plan.files)} files"
+                 f"{'' if plan.tests_expected is None else f' / {plan.tests_expected} tests'} enumerated, "
+                 f"in {len(plan.batches)} batches of ≤{plan.batch_files} files, {plan.pause_s}s pause between")
     started = time.time()
+    batch_mismatch: Optional[str] = None
+    batches: Optional[int] = None
 
     try:
-        r = subprocess.run(
-            _gate_shell_cmd(sit_cmd, repo_path), shell=True, capture_output=True, text=True,
-            cwd=str(repo_path), timeout=SIT_TIMEOUT
-        )
+        if plan is None:
+            r = subprocess.run(
+                _gate_shell_cmd(sit_cmd, repo_path), shell=True, capture_output=True, text=True,
+                cwd=str(repo_path), timeout=SIT_TIMEOUT
+            )
+            raw = (r.stdout or "") + "\n" + (r.stderr or "")
+            counts, tallies = _parse_vitest_summary(raw), _parse_vitest_tallies(raw)
+        else:
+            b = _run_sit_batched(sit_cmd, repo_path, plan)
+            r = subprocess.CompletedProcess(sit_cmd, b.returncode, stdout=b.stdout, stderr=b.stderr)
+            raw = b.red_output or (b.stdout + "\n" + b.stderr)
+            counts, tallies, batches, batch_mismatch = b.counts, b.tallies, b.batches, b.mismatch
         duration = time.time() - started
         # S6S47: baseline-aware. Block only on NEW failures, not pre-existing
         # known-failing specs (BUG-018/BUG-026). Parse failing spec basenames
         # from playwright output; if every failing spec is in SIT_KNOWN_FAILING,
         # treat as pass-with-known-failures.
-        raw = (r.stdout or "") + "\n" + (r.stderr or "")
         # S6S78: sit:gate is the deterministic headless T1 (vitest). Pass/fail is
         # exit-code based — a nonzero exit is a real regression and BLOCKS. The old
         # Playwright spec-name / known-failing / critical parsing does NOT apply to
@@ -1608,18 +1841,29 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         # S7-CORE-7 [ORCH-2]: declare what the gate collected. Parsed from `raw` — the summary is
         # already in hand; nothing is re-run. (2026-09-10: a 2.3s PASS over a directory holding two
         # unrelated files promoted three Longevity capabilities. A gate must say what it tested.)
-        counts = _parse_vitest_summary(raw)
+        # [SIT-RATE-1] batched: `counts` is the per-batch sum, already parsed above.
+        tests_failed = _sit_tests_failed(counts, tallies)
         collection = _describe_collection(counts)
-        error = None
-        if passed and (counts["test_files_total"] == 0 or counts["tests_total"] == 0):
+        if batches:
+            collection += f" in {batches} batches"
+        error, detail = None, None
+        if batch_mismatch:
+            # AC-SR-05: the batches do not add up to the suite. Not a verdict about anything.
+            passed, error, detail = False, "batch-incomplete", batch_mismatch
+            log.error(f"⛔ SIT gate batching does not sum to the suite — {batch_mismatch} — "
+                      f"BLOCKED(environment), not PASS, not FAIL(product) ({collection}, {duration:.1f}s)")
+        elif passed and (counts["test_files_total"] == 0 or counts["tests_total"] == 0):
             # §4.5: green exit over an empty collection tested nothing. Environment, never product.
             passed, error = False, "zero-collection"
             log.error(f"⛔ SIT gate collected NOTHING — treating as BLOCKED(environment), not PASS "
                       f"(exit 0, {collection}, {duration:.1f}s)")
         elif passed:
-            log.info(f"🧪 SIT gate: PASS — {collection} in {duration:.1f}s")
+            recon = "" if plan is None else f" (equals the enumerated suite: {len(plan.files)} files" + \
+                    ("" if plan.tests_expected is None else f" / {plan.tests_expected} tests") + ")"
+            log.info(f"🧪 SIT gate: PASS — {collection}{recon} in {duration:.1f}s")
         else:
-            log.error(f"⛔ SIT gate FAILED (exit {r.returncode}) — {collection} — BLOCKING.\n{raw[-800:]}")
+            fl = "?" if tests_failed is None else tests_failed
+            log.error(f"⛔ SIT gate FAILED (exit {r.returncode}) — {collection}, {fl} failed assertions — BLOCKING.\n{raw[-800:]}")
         if (SIT_MIN_TEST_FILES is not None and counts["test_files_total"] is not None
                 and counts["test_files_total"] < SIT_MIN_TEST_FILES):
             # §4.6: warning only, never blocking
@@ -1647,10 +1891,13 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
 
         # Log to orchestrator-sit-log.json
         _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path,
-                         error=error, error_excerpt=error_excerpt, **counts)
+                         error=error, error_excerpt=error_excerpt, tests_failed=tests_failed,
+                         batches=batches, **counts)
 
         return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration,
-                          error=error, output="" if passed else raw[-20000:], **counts)
+                          error=error, detail=detail, output="" if passed else raw[-20000:],
+                          tests_failed=tests_failed, tests_skipped=tallies.get("skipped"),
+                          batches=batches, **counts)
 
     except subprocess.TimeoutExpired:
         duration = time.time() - started
@@ -2653,13 +2900,33 @@ def _env_file_keys(path: Optional[Path]) -> set:
     return keys
 
 
-def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: int) -> GateVerdict:
+# [ORCH-11] rule 1 — the failing FILES named in the runner output (`FAIL sit/x.test.ts`), so
+# the environment verdict says which files were down, not just how many.
+_GATE_FAIL_FILE_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(\S+)", re.MULTILINE)
+
+
+def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: int,
+                           tests_failed: Optional[int] = None,
+                           files_failed: Optional[int] = None) -> GateVerdict:
     """PDLC F-20: BLOCKED(environment) vs FAIL(product) for a red gate. Only the F-20 tables
-    decide. The matched token is quoted (≤80 chars); the gate output is never echoed whole."""
-    text = output or ""
+    decide. The matched token is quoted (≤80 chars); the gate output is never echoed whole.
+
+    S7-CORE-10 [ORCH-11]: two additions, both decided from THIS function's inputs.
+      2. Transport-level refusals (429 / ECONNREFUSED / client OperationOutcomeError) are in
+         the signal table, and the matched signal is NAMED in the log — the way [ORCH-8] made
+         `failures_source` explicit.
+      1. `tests_failed == 0` ⇒ BLOCKED(environment), whatever the output says: a red gate with
+         ZERO failed assertions is test files down at SETUP with every executed assertion
+         passing — an environment verdict by construction. Both false FAIL(product)s of
+         2026-09-15 (RM-I-028; the 19-file 429) had exactly this shape. None is UNKNOWN, not 0,
+         and never earns it (§2.4); a run with one failed assertion still falls through to the
+         product verdict. The caller that has the tallies passes them; a caller that does not
+         gets the pre-[ORCH-11] behaviour unchanged."""
+    text = _ANSI_RE.sub("", output or "")
     for sid, rx, desc in _ENV_BLOCK_SIGNALS_RE:
         m = rx.search(text)
         if m:
+            log.info(f"🔎 F-20 {gate} gate: signal '{sid}' matched — {desc}")
             return GateVerdict(GateOutcome.BLOCKED_ENV, gate, sid, f"{desc}; matched '{m.group(0)[:80]}'")
     _, env_path = _gate_env_file(repo_path)
     keys = _env_file_keys(env_path)
@@ -2667,10 +2934,21 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
         for m in rx.finditer(text):
             var = m.group(1)
             if var in keys:
+                log.info(f"🔎 F-20 {gate} gate: signal 'env-var-unsourced' matched — {var}")
                 return GateVerdict(GateOutcome.BLOCKED_ENV, gate, "env-var-unsourced",
                                    f"gate requires {var}; it is a key in {env_path.name} but did not reach the gate shell")
+    if tests_failed == 0:
+        down = sorted({_norm_test_path(f) for f in _GATE_FAIL_FILE_RE.findall(text)})
+        which = f": {', '.join(down)}" if down else ""
+        n = "?" if files_failed is None else files_failed
+        log.info(f"🔎 F-20 {gate} gate: signal 'no-failed-assertions' matched — 0 failed assertions, "
+                 f"{n} file(s) down at setup{which}")
+        return GateVerdict(GateOutcome.BLOCKED_ENV, gate, "no-failed-assertions",
+                           f"exit {exit_code} with 0 failed assertions and {n} file(s) down at setup{which} "
+                           f"— environment by construction [ORCH-11]")
+    seen = "" if tests_failed is None else f" ({tests_failed} failed assertions)"
     return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}",
-                       "no F-20 environment signal in gate output — product verdict stands")
+                       f"no F-20 environment signal in gate output{seen} — product verdict stands")
 
 
 def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> GateVerdict:
@@ -2716,8 +2994,15 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                         v = GateVerdict(GateOutcome.BLOCKED_ENV, "sit", "zero-collection",
                                         f"exit 0 over an empty collection ({so.collection}) — nothing was tested",
                                         collection=sit_collection)
+                    elif so.error in SIT_GATE_ENV_ERRORS:
+                        # [SIT-RATE-1] the gate's own batching machinery could not produce a whole-suite
+                        # result (enumeration failed / batches do not sum). Not a product verdict.
+                        v = GateVerdict(GateOutcome.BLOCKED_ENV, "sit", so.error, so.detail,
+                                        collection=sit_collection)
                     else:
-                        v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code)
+                        # [ORCH-11] the tallies travel with the output: rule 1 is decided here.
+                        v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code,
+                                                   tests_failed=so.tests_failed, files_failed=so.files_failed)
                         v.collection = sit_collection
                     log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                     return v
@@ -2761,7 +3046,8 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
                      duration: float, report_path: Optional[str], error: Optional[str] = None,
                      error_excerpt: Optional[str] = None,
                      test_files_total: Optional[int] = None, test_files_passed: Optional[int] = None,
-                     tests_total: Optional[int] = None, tests_passed: Optional[int] = None):
+                     tests_total: Optional[int] = None, tests_passed: Optional[int] = None,
+                     tests_failed: Optional[int] = None, batches: Optional[int] = None):
     """Append SIT outcome to orchestrator-sit-log.json. [ORCH-2] carries the four collection
     counts (null when the summary did not parse) so "was the gate ever thin?" is answerable
     historically. Old-shape entries without them still load."""
@@ -2785,6 +3071,8 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
         "test_files_passed": test_files_passed,
         "tests_total": tests_total,
         "tests_passed": tests_passed,
+        "tests_failed": tests_failed,  # [ORCH-11] the tally the verdict turned on; null = not stated
+        "batches": batches,            # [SIT-RATE-1] null = one unbatched run
     }
     if error_excerpt is not None:
         entry["error_excerpt"] = error_excerpt
