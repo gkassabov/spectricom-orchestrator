@@ -41,7 +41,16 @@ class QueueDaemon:
         self.config = {
             "max_consecutive": 10,
             "cooldown_seconds": 30,
-            "stop_on_failure": True
+            "stop_on_failure": True,
+            # S7-CORE-11: the daemon predates --repo, --model and --effort, and its
+            # 45-minute kill predates routes that legitimately run 40-60 min.
+            "repo": os.environ.get("QUEUE_REPO", "clinical-mp"),
+            "model": os.environ.get("TONI_MODEL", "claude-fable-5-1"),
+            "effort": os.environ.get("TONI_EFFORT", "high"),
+            # MUST stay ABOVE orchestrator.py's own 180m hard cap, so the orchestrator
+            # times out gracefully (branch preserved, fire lock released) instead of
+            # this daemon SIGKILLing it mid-route and leaving a stale lock.
+            "timeout_seconds": 11400,
         }
         self.lock = threading.Lock()
         self._ensure_dirs()
@@ -228,12 +237,55 @@ class QueueDaemon:
                 }
                 self._save_state()
 
+            # S7-CORE-11: never fire into a live route. The orchestrator holds a fire
+            # lock per repo (and a legacy global `running.json`); firing anyway would
+            # be refused, and with stop_on_failure the whole queue would halt on a
+            # brief that was never actually wrong. Wait for the lock instead.
+            _waited = 0
+            while any(ORCH_DIR.glob("running*.json")):
+                if _waited == 0:
+                    print(f"[QUEUE] fire lock held — waiting before {batch_name}")
+                time.sleep(30)
+                _waited += 30
+                if _waited > 14400:   # 4h: something is wedged, say so and stop trying
+                    print(f"[QUEUE] fire lock still held after 4h — leaving {batch_name} queued")
+                    break
+            if any(ORCH_DIR.glob("running*.json")):
+                time.sleep(self.config["cooldown_seconds"])
+                continue
+            if _waited:
+                print(f"[QUEUE] lock clear after {_waited}s")
+
             print(f"[QUEUE] Firing: {batch_name}")
 
+            # A batch may name its own model/effort on the first line as
+            #   #!queue model=claude-sonnet-4-5 effort=high repo=clinical-mp
+            # so a mechanical cleanup route can run Sonnet while RM increments run
+            # Fable, without restarting the daemon (George, 2026-09-16).
+            b_model, b_effort, b_repo = (
+                self.config["model"], self.config["effort"], self.config["repo"])
+            try:
+                first = next_batch.read_text(encoding="utf-8").splitlines()[0]
+                if first.startswith("#!queue"):
+                    for tok in first.split()[1:]:
+                        if "=" not in tok:
+                            continue
+                        k, v = tok.split("=", 1)
+                        if k == "model":
+                            b_model = v
+                        elif k == "effort":
+                            b_effort = v
+                        elif k == "repo":
+                            b_repo = v
+            except Exception as e:
+                print(f"[QUEUE] could not read header of {batch_name}: {e}")
+
             cmd = (
-                f"cd {ORCH_DIR} && "
-                f"python3 orchestrator.py run {next_batch} --approve"
+                f"cd {ORCH_DIR} && unset ANTHROPIC_API_KEY && "
+                f"python3 orchestrator.py run {next_batch} --approve "
+                f"--repo {b_repo} --model {b_model} --effort {b_effort}"
             )
+            print(f"[QUEUE] repo={b_repo} model={b_model} effort={b_effort}")
 
             exit_code = -1
             try:
@@ -242,9 +294,10 @@ class QueueDaemon:
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     executable="/bin/bash"
                 )
-                exit_code = self.current_process.wait(timeout=2700)
+                exit_code = self.current_process.wait(
+                    timeout=self.config["timeout_seconds"])
             except subprocess.TimeoutExpired:
-                print(f"[QUEUE] Timeout (45m) on {batch_name}. Killing.")
+                print(f"[QUEUE] Timeout ({self.config['timeout_seconds']}s) on {batch_name}. Killing.")
                 self.current_process.kill()
                 self.current_process.wait()
                 exit_code = -1
