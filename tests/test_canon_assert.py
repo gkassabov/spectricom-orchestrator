@@ -1,5 +1,5 @@
 # filename: tests/test_canon_assert.py
-"""BOOT-ASSERT-2 — every assertion B1–B9 is shown to FAIL before it is trusted to PASS.
+"""BOOT-ASSERT-2 / 2b — every assertion B1–B9 is shown to FAIL before it is trusted to PASS.
 
 The fixture canon lives in tests/fixtures/canon/ (real shapes, not real content). Each drift
 test copies it to tmp_path, builds two tiny git repos so B2/B5 have something live to read,
@@ -148,7 +148,8 @@ def test_b3_drift_canon_index_lags_sessions(tmp_path):
     out = block(by["B3"])
     assert "FAIL B3" in out and "S7-CORE-8" in out and "S7-CORE-10" in out
     assert "Canon_Index.md:7" in out and "hot.md:1" in out
-    assert all(by[i].status == "PASS" for i in IDS if i != "B3"), text
+    assert by["B6"].status == "FAIL"        # the body has no block for S7-CORE-8: the same drift, seen from B6 (2b)
+    assert all(by[i].status == "PASS" for i in IDS if i not in ("B3", "B6")), text
 
 
 def test_b3_drift_frontmatter_registry_pointer_stale(tmp_path):
@@ -242,6 +243,92 @@ def test_b6_unknown_when_body_has_no_blockquote(tmp_path):
     assert by["B6"].status == "UNKNOWN" and code != 0
 
 
+def _append_preamble(ci: Path, prefix: str, line: str) -> None:
+    """Insert `line` after the last preamble line starting with `prefix` (older history goes below)."""
+    lines = ci.read_text(encoding="utf-8").splitlines()
+    end = next(i for i, l in enumerate(lines) if l.startswith("# "))
+    last = max(i for i in range(end) if lines[i].startswith(prefix))
+    lines.insert(last + 1, line)
+    ci.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_b6_ac01_older_blocks_disagreeing_with_the_newest_is_the_normal_state(tmp_path):
+    """The live S7-CORE-11 finding, reproduced: SDLC L Batch1 is named only by an S7-CORE-3
+    blockquote (v0-3) and by the S7-CORE-10 EOS bullet (v0-10). Old rule: FAIL. Newest block
+    only: not compared in the blockquote set, and it agrees everywhere it is named."""
+    canon, repos = materialize(tmp_path)
+    ci = canon / "Canon_Index.md"
+    edit(ci, "SDLC L **Batch1 v0-10 / Batch6 v0-1** · **SDLC PlatformConfig Batch1 v0-5** · **EOS Protocol v1-7**",
+         "**EOS Protocol v1-7**")                                                  # no window blockquote names SDLC
+    _append_preamble(ci, ">", "> **Canon latest (S7-CORE-3 EOS · 2026-09-09):** Registry **v5-206** · Roadmap **v2-1 DRAFT** · SDLC_L_Batch1 **v0-3** · Kanban **v0-3**")
+    _append_preamble(ci, "-", "- **S7-CORE-6 (2026-09-10) pointer refresh.** [SCP_SDLC_Decomposition_L_Batch1_v0-8](SCP_SDLC_Decomposition_L_Batch1_v0-8.md) · [SCP_Kanban_v0-8](SCP_Kanban_v0-8.md) · [SCA_Bug_Registry_v1-32](SCA_Bug_Registry_v1-32.md)")
+    edit(ci, "Kanban **v0-29**)\n", "Kanban **v0-29**) · prior: 2026-09-10 (S7-CORE-5 — SDLC L Batch1 v0-8 · Kanban v0-8 · Reg v5-208)\n")
+    by, text, code = run(canon, repos)
+    assert by["B6"].status == "PASS", block(by["B6"])
+    assert code == 0 and all(v.status == "PASS" for v in by.values()), text
+    # the old (whole-file, max-per-family) reading really would have disagreed:
+    ci_parsed = ca.parse_canon_index(canon, ca.all_families(canon))
+    assert ci_parsed.blockquotes["SDLC L Batch1"].version == (0, 3)
+    assert ci_parsed.bullets["SDLC L Batch1"].version == (0, 10)
+    assert "SDLC L Batch1" not in ci_parsed.newest_blockquotes           # the S7-CORE-3 line is history
+    assert ci_parsed.window == ("S7-CORE-11", "S7-CORE-10")
+    assert "newest block = S7-CORE-11 + prior S7-CORE-10" in block(by["B6"])
+
+
+def test_b6_ac02_newest_bullet_disagrees_with_frontmatter(tmp_path):
+    canon, repos = materialize(tmp_path)
+    edit(canon / "Canon_Index.md", "[SCP_Kanban_v0-33](SCP_Kanban_v0-33.md).", "[SCP_Kanban_v0-34](SCP_Kanban_v0-34.md).")
+    by, _, code = run(canon, repos)
+    assert by["B6"].status == "FAIL" and code != 0
+    out = block(by["B6"])
+    assert "FAIL B6: Kanban" in out
+    assert re.search(r"frontmatter updated:\s+v0-33\s+← Canon_Index\.md:7", out)
+    assert re.search(r"body blockquote\s+v0-33\s+← Canon_Index\.md:\d+", out)
+    assert re.search(r"body bullet\s+v0-34\s+← Canon_Index\.md:\d+", out)
+
+
+def test_b6_ac02_frontmatter_moved_on_newest_body_block_did_not(tmp_path):
+    canon, repos = materialize(tmp_path)
+    edit(canon / "Canon_Index.md", "Kanban **v0-33**; everything else", "Kanban **v0-34**; everything else")
+    by, _, _ = run(canon, repos)
+    assert by["B6"].status == "FAIL"
+    out = block(by["B6"])
+    assert "v0-34" in out and "v0-33" in out and "body bullet" in out and "body blockquote" in out
+
+
+def test_b6_ac02_body_has_no_block_for_the_frontmatter_sessions(tmp_path):
+    canon, repos = materialize(tmp_path)
+    ci = canon / "Canon_Index.md"
+    edit(ci, "(**S7-CORE-11, in progress**", "(**S7-CORE-13, in progress**")
+    edit(ci, "(**S7-CORE-10 EOS**", "(**S7-CORE-12 EOS**")
+    by, _, code = run(canon, repos)
+    assert by["B6"].status == "FAIL" and code != 0
+    out = block(by["B6"])
+    assert "no block for the newest session(s) S7-CORE-13 + prior S7-CORE-12" in out
+    assert "body bullet" in out and "body blockquote" in out and "S7-CORE-11" in out
+
+
+def test_b6_older_blocks_are_not_read_at_all(tmp_path):
+    """A wrong value in an OLD block is history, not drift — and a wrong value in the newest block is."""
+    canon, repos = materialize(tmp_path)
+    ci = canon / "Canon_Index.md"
+    edit(ci, "[SCP_Kanban_v0-29](SCP_Kanban_v0-29.md)", "[SCP_Kanban_v0-99](SCP_Kanban_v0-99.md)")   # S7-CORE-9 EOS bullet
+    by, _, _ = run(canon, repos)
+    assert by["B6"].status == "PASS", block(by["B6"])
+    edit(ci, "[SCP_Kanban_v0-32](SCP_Kanban_v0-32.md)", "[SCP_Kanban_v0-98](SCP_Kanban_v0-98.md)")   # S7-CORE-10 EOS bullet (in the window)
+    by, _, _ = run(canon, repos)
+    assert by["B6"].status == "FAIL" and "v0-98" in block(by["B6"])
+
+
+def test_session_window_reads_the_frontmatter_layering():
+    upd = ("2026-09-16 (**S7-CORE-11, in progress** — Kanban v0-33; everything else as the S7-CORE-10 EOS line)"
+           " · prior: 2026-09-15 (**S7-CORE-10 EOS** — …) · prior: 2026-09-15 (**S7-CORE-10, mid-session** — …)"
+           " · prior: 2026-09-15 (S7-CORE-9 — …)")
+    assert ca.session_window(upd) == ("S7-CORE-11", "S7-CORE-10")
+    assert ca.session_window("2026-09-16 (**S7-CORE-11 EOS** — …)") == ("S7-CORE-11",)
+    assert ca.session_window("2026-09-16 (no session here)") == ()
+
+
 # ── B7 ───────────────────────────────────────────────────────────────────────────────────
 def test_b7_drift_hot_md_cites_old_kanban(tmp_path):
     canon, repos = materialize(tmp_path)
@@ -290,6 +377,83 @@ def test_b8_old_dir_and_draft_marker_do_not_count(tmp_path):
     assert by["B8"].status == "PASS"
     fams = ca.root_families(canon)
     assert "Spectricom_Product_Roadmap" in fams and "Spectricom_Product_Roadmap_DRAFT" not in fams
+
+
+def test_b8_ac03_stale_non_core_family_is_info_and_exits_zero(tmp_path):
+    canon, repos = materialize(tmp_path)
+    (canon / "Yorsie_Bug_Registry_v1-31.md").write_text("# Yorsie Bug Registry — v1-31\n")
+    (canon / "spectricom-layout-canon-v1-0.md").write_text("# layout canon v1-0\n")
+    (canon / "spectricom-layout-canon-v1-1.md").write_text("# layout canon v1-1\n")
+    by, text, code = run(canon, repos)
+    assert by["B8"].status == "PASS" and code == 0, text
+    out = block(by["B8"])
+    assert "FAIL B8" not in out
+    assert "INFO B8 — not in the Core brief set" in out
+    assert "INFO B8: Yorsie_Bug_Registry: 2 members" in out and "INFO B8: spectricom-layout-canon: 2 members" in out
+    assert "2 INFO (not asserted)" in out.splitlines()[0]
+    assert "SUMMARY 9 assertions: 9 PASS · 0 FAIL · 0 UNKNOWN" in text
+
+
+@pytest.mark.parametrize("stale", [
+    "SCP_Kanban_v0-32.md",                                # Kanban — also what B7 walks
+    "SCP_SDLC_Decomposition_L_Batch1_v0-9.md",            # an SDLC family — derived, and what B7 walks
+    "George_Decision_Codex_v2-12.md",                     # Codex
+    "SCA_UAT_Coverage_Matrix_v0-17.md",                   # Coverage Matrix
+])
+def test_b8_ac04_stale_core_family_still_fails_and_names_b8(tmp_path, stale):
+    canon, repos = materialize(tmp_path)
+    (canon / stale).write_text("# predecessor left in the root\n")
+    by, text, code = run(canon, repos)
+    assert by["B8"].status == "FAIL" and code != 0
+    out = block(by["B8"])
+    key = ca.FILE_RE.match(stale)["stem"]
+    assert f"FAIL B8: {key}: 2 members in canon root" in out and stale in out
+    assert "INFO" not in out
+    assert all(by[i].status == "PASS" for i in IDS if i != "B8"), text   # the newest member is still the newest
+
+
+def test_b8_ac04_context_slims_are_core(tmp_path):
+    canon, repos = materialize(tmp_path)
+    for name in ("spectricom-context-slim-v4-33-infra.md", "spectricom-context-slim-v4-34-infra.md",
+                 "spectricom-context-slim-clinical-v1-66.md", "spectricom-context-slim-clinical-v1-67.md"):
+        (canon / name).write_text("# slim\n")
+    by, _, code = run(canon, repos)
+    assert by["B8"].status == "FAIL" and code != 0
+    out = block(by["B8"])
+    assert "FAIL B8: spectricom-context-slim-infra: 2 members" in out
+    assert "FAIL B8: spectricom-context-slim-clinical: 2 members" in out
+
+
+def test_b8_partitions_core_fail_from_non_core_info(tmp_path):
+    canon, repos = materialize(tmp_path)
+    (canon / "SCP_Kanban_v0-32.md").write_text("# old\n")
+    (canon / "Yorsie_Bug_Registry_v1-31.md").write_text("# old\n")
+    by, _, code = run(canon, repos)
+    assert by["B8"].status == "FAIL" and code != 0
+    out = block(by["B8"])
+    assert "1 mismatch(es) · 1 INFO (not asserted)" in out.splitlines()[0]
+    assert out.index("FAIL B8: SCP_Kanban") < out.index("INFO B8 — not in the Core brief set") < out.index("INFO B8: Yorsie_Bug_Registry")
+
+
+def test_b8_ac05_core_brief_set_is_derived_once_from_the_family_table(tmp_path):
+    canon, _ = materialize(tmp_path)
+    fams = ca.all_families(canon)
+    core = ca.core_brief_set(fams)
+    assert core == [f.stem for f in ca.STATIC_FAMILIES] + [f.stem for f in ca.sdlc_families(canon)] + list(ca.CORE_SLIM_STEMS)
+    # every family B7 walks is in B8's scope — the two cannot drift apart
+    b7_keys = ["Kanban"] + [f.key for f in fams if f.key.startswith("SDLC ")] + ["Roadmap", "Codex"]
+    for key in b7_keys:
+        assert next(f.stem for f in fams if f.key == key) in core
+    # the brief's Core list, by filename stem, is exactly what the set matches
+    for key in ("Spectricom_Document_Registry", "Spectricom_Pending_Canon_Updates", "Spectricom_Logs",
+                "Spectricom_Parallel_Dev_Master_Plan", "SCP_Kanban", "George_Decision_Codex", "SCA_Feature_Index",
+                "SCA_UAT_Coverage_Matrix", "SCA_Bug_Registry", "Spectricom_Product_Roadmap",
+                "SCP_SDLC_Decomposition_L_Batch1", "SCP_SDLC_Decomposition_PlatformConfig_Batch1",
+                "spectricom-context-slim-clinical", "spectricom-context-slim-infra", "EOS_Protocol"):
+        assert ca.is_core(key, core), key
+    for key in ("Yorsie_Bug_Registry", "yorsie-bug-registry", "spectricom-context-slim-yorsie",
+                "spectricom-context-slim-minime", "Gemma_System_Prompt", "spectricom-layout-canon"):
+        assert not ca.is_core(key, core), key
 
 
 # ── B9 ───────────────────────────────────────────────────────────────────────────────────

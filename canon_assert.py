@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # filename: canon_assert.py
-"""BOOT ASSERT as a program — B1–B9 over the Spectricom canon folder (BOOT-ASSERT-2, S7-CORE-11).
+"""BOOT ASSERT as a program — B1–B9 over the Spectricom canon folder (BOOT-ASSERT-2 / 2b, S7-CORE-11).
 
 Every verdict is decided from DISK and GIT only, never from memory or context — the same
 principle as doc-sweep.sh, which is the sibling tool this one sits beside (doc-sweep answers
@@ -26,9 +26,24 @@ What a "pointer" is here, because nine hand-written files disagree on the spelli
     `> **Canon latest …**` blockquotes in the body preamble, and the `- **…**` pointer bullets
     in the body preamble (the preamble is everything between the frontmatter and the first
     `# ` heading). B6 exists because at S7-CORE-11 two of these disagreed inside one file.
+  * Canon_Index is APPEND-ONLY: every session prepends a bullet and a blockquote and the old
+    ones stay as history. So B6 reads the NEWEST BLOCK ONLY of each of the three sources
+    (BOOT-ASSERT-2b). The newest block is identified by SESSION ID, not by position — every
+    bullet, blockquote and `updated:` segment leads with its session id, and the live file
+    has had a backfilled older block placed above the current one. The block is the current
+    session (the first `updated:` segment) plus the one `prior:` session it is layered over,
+    because the in-progress block is written as a delta ("Kanban v0-33 · everything else as
+    the S7-CORE-10 EOS line below") and the EOS block it delegates to is the one that
+    restates the full set. Nothing older is read. B1, B3, B4 and B7 keep reading the whole
+    file as before.
 
 Families not covered by the alias table (context slims, PDLC record, Gemma prompt) are not
 asserted — say so rather than guess.
+
+B8's FAIL scope is the CORE BRIEF SET (SESSION-BOOT.md: "the pointers a session briefs from,
+not canon"): the canon folder is shared with other products and eras, so a stale family
+outside that set is reported as INFO and never changes the exit code. The set is derived in
+core_brief_set() and nowhere else.
 """
 from __future__ import annotations
 
@@ -151,6 +166,26 @@ def all_families(canon: Path) -> list[Family]:
     return STATIC_FAMILIES + sdlc_families(canon)
 
 
+# The two context slims are briefed from but carry no pointer alias (their versions are cited
+# as "clinical slim v1-67 · infra slim v4-34", never compared), so they are not Families.
+CORE_SLIM_STEMS: tuple[str, ...] = (r"spectricom-context-slim-clinical", r"spectricom-context-slim-infra")
+
+
+def core_brief_set(families: list[Family]) -> list[str]:
+    """The Core brief set, as filename-stem regexes over root_families() keys — defined ONCE.
+
+    Registry, PCU, Logs, Master Plan, Kanban, Codex, Feature Index, Coverage Matrix, Bug
+    Registry, Roadmap, EOS Protocol and the SDLC families are exactly STATIC_FAMILIES plus
+    sdlc_families() — the same objects B1–B7 read, so B7's list and B8's scope cannot drift
+    apart. The context slims are the only members that are not pointer families.
+    """
+    return [f.stem for f in families] + list(CORE_SLIM_STEMS)
+
+
+def is_core(key: str, core: list[str]) -> bool:
+    return any(re.fullmatch(stem, key) for stem in core)
+
+
 # ── pointer extraction ───────────────────────────────────────────────────────────────────
 STRIP_MD = re.compile(r"[*`\[\]()]")
 
@@ -247,6 +282,13 @@ class CanonIndex:
     updated_line: Optional[tuple[int, str]]
     has_blockquotes: bool
     has_bullets: bool
+    # BOOT-ASSERT-2b — the newest block only, keyed by session id (B6 reads these three).
+    window: tuple[str, ...] = ()                                   # (current, prior) session ids
+    newest_frontmatter: dict[str, Pointer] = field(default_factory=dict)
+    newest_blockquotes: dict[str, Pointer] = field(default_factory=dict)
+    newest_bullets: dict[str, Pointer] = field(default_factory=dict)
+    newest_lines: dict[str, list[int]] = field(default_factory=dict)   # source → line numbers read
+    body_sessions: dict[str, list[str]] = field(default_factory=dict)  # source → session ids seen
 
     @property
     def union(self) -> dict[str, Pointer]:
@@ -256,6 +298,26 @@ class CanonIndex:
                 if k not in out or p.version > out[k].version:
                     out[k] = p
         return out
+
+
+PRIOR_SPLIT_RE = re.compile(r"\s·\s*prior:")
+
+
+def session_of(text: str) -> Optional[str]:
+    """The session id a block belongs to: the FIRST id in its text (blocks lead with it)."""
+    m = SESSION_RE.search(text)
+    return m.group(0) if m else None
+
+
+def session_window(updated: str) -> tuple[str, ...]:
+    """(current, prior): the first `updated:` segment's session and the first `prior:` segment
+    naming a different one. The frontmatter declares its own layering; nothing is ordered."""
+    ids = [session_of(seg) for seg in PRIOR_SPLIT_RE.split(updated)]
+    if not ids or ids[0] is None:
+        return ()
+    cur = ids[0]
+    prior = next((i for i in ids[1:] if i and i != cur), None)
+    return (cur, prior) if prior else (cur,)
 
 
 def parse_canon_index(canon: Path, families: list[Family]) -> Optional[CanonIndex]:
@@ -278,12 +340,23 @@ def parse_canon_index(canon: Path, families: list[Family]) -> Optional[CanonInde
         preamble.append((fm_end + 2 + off, l))
     bq = [(n, l) for n, l in preamble if l.startswith(">")]
     bl = [(n, l) for n, l in preamble if l.startswith("-")]
+    window = session_window(updated[1])
+    fm_segs = [(updated[0], seg) for seg in PRIOR_SPLIT_RE.split(updated[1]) if session_of(seg) in window]
+    bq_new = [(n, l) for n, l in bq if session_of(l) in window]
+    bl_new = [(n, l) for n, l in bl if session_of(l) in window]
     return CanonIndex(
         file=path.name,
         frontmatter=extract_pointers([updated], path.name, families),
         blockquotes=extract_pointers(bq, path.name, families),
         bullets=extract_pointers(bl, path.name, families),
         updated_line=updated, has_blockquotes=bool(bq), has_bullets=bool(bl),
+        window=window,
+        newest_frontmatter=extract_pointers(fm_segs, path.name, families),
+        newest_blockquotes=extract_pointers(bq_new, path.name, families),
+        newest_bullets=extract_pointers(bl_new, path.name, families),
+        newest_lines={"blockquote": [n for n, _ in bq_new], "bullet": [n for n, _ in bl_new]},
+        body_sessions={"blockquote": [s for _, l in bq if (s := session_of(l))],
+                       "bullet": [s for _, l in bl if (s := session_of(l))]},
     )
 
 
@@ -367,6 +440,7 @@ class Builder:
         self.fails: list[str] = []
         self.unknowns: list[str] = []
         self.passes: list[str] = []
+        self.infos: list[str] = []
         self.details: list[str] = []
 
     @staticmethod
@@ -386,6 +460,14 @@ class Builder:
         self.details.append(f"UNKNOWN {self.id}: {what}")
         self.details.extend("  " + self._row(*r) for r in rows)
 
+    def heading(self, text: str) -> None:
+        self.details.append(text)
+
+    def info(self, what: str) -> None:
+        """Reported, counted, never a fail — the status and the exit code ignore it."""
+        self.infos.append(what)
+        self.details.append(f"  INFO {self.id}: {what}")
+
     def verdict(self) -> Verdict:
         if self.fails:
             st, summ = FAIL, f"{len(self.fails)} mismatch(es)" + (f", {len(self.unknowns)} unknown" if self.unknowns else "")
@@ -395,6 +477,8 @@ class Builder:
             st, summ = PASS, "; ".join(self.passes)
         else:
             st, summ = UNKNOWN, "nothing was checked"
+        if self.infos:
+            summ += f" · {len(self.infos)} INFO (not asserted)"
         return Verdict(self.id, self.title, st, summ, self.details)
 
 
@@ -593,7 +677,7 @@ def assert_b5(ctx: Ctx) -> Verdict:
 
 
 def assert_b6(ctx: Ctx) -> Verdict:
-    b = Builder("B6", "Canon_Index frontmatter, blockquote and bullet pointer sets agree")
+    b = Builder("B6", "Canon_Index frontmatter, blockquote and bullet pointer sets agree (newest block only)")
     if ctx.ci is None:
         b.unknown("Canon_Index.md missing, or no frontmatter / `updated:` line", ("Canon_Index", "—", "Canon_Index.md"))
         return b.verdict()
@@ -601,9 +685,25 @@ def assert_b6(ctx: Ctx) -> Verdict:
         b.unknown("Canon_Index preamble has no `> Canon latest` blockquote", ("Canon_Index blockquotes", "—", "Canon_Index.md (preamble)"))
     if not ctx.ci.has_bullets:
         b.unknown("Canon_Index preamble has no pointer bullets", ("Canon_Index bullets", "—", "Canon_Index.md (preamble)"))
+    if not ctx.ci.window:
+        b.unknown("`updated:` first segment names no session id — the newest block cannot be identified",
+                  ("Canon_Index updated:", "no session id", f"Canon_Index.md:{ctx.ci.updated_line[0]}"))
     if b.unknowns:
         return b.verdict()
-    sources = [("frontmatter updated:", ctx.ci.frontmatter), ("body blockquote", ctx.ci.blockquotes), ("body bullet", ctx.ci.bullets)]
+    win = " + prior ".join(ctx.ci.window)
+    # The body must carry the newest block at all: a frontmatter written for a session whose
+    # bullet / blockquote was never written is the S7-CORE-11 mechanism, and it is a FAIL.
+    for label, key in (("body bullet", "bullet"), ("body blockquote", "blockquote")):
+        if not ctx.ci.newest_lines[key]:
+            seen = ctx.ci.body_sessions[key]
+            b.fail(f"{label}: no block for the newest session(s) {win} — the body was not written",
+                   ("Canon_Index updated: session", win, f"Canon_Index.md:{ctx.ci.updated_line[0]}"),
+                   (f"{label} sessions present", ", ".join(dict.fromkeys(seen)) or "none", "Canon_Index.md (preamble)"))
+    if b.fails:
+        return b.verdict()
+    sources = [("frontmatter updated:", ctx.ci.newest_frontmatter),
+               ("body blockquote", ctx.ci.newest_blockquotes),
+               ("body bullet", ctx.ci.newest_bullets)]
     compared = 0
     for fam in ctx.families:
         present = [(label, s[fam.key]) for label, s in sources if fam.key in s]
@@ -614,10 +714,11 @@ def assert_b6(ctx: Ctx) -> Verdict:
             continue
         b.fail(f"{fam.key}: the pointer sets inside Canon_Index disagree",
                *[(f"{fam.key} · {label}", vstr(p.version, p.draft), where(p)) for label, p in present])
+    read = ", ".join(f"{k} {'/'.join(map(str, v))}" for k, v in ctx.ci.newest_lines.items())
     if compared == 0:
-        b.unknown("no family is named by two or more of the three pointer sets", ("Canon_Index", "—", "Canon_Index.md"))
+        b.unknown(f"newest block ({win}) names no family in two or more of the three pointer sets", ("Canon_Index", "—", f"Canon_Index.md lines {read}"))
     elif not b.fails:
-        b.ok(f"{compared} families agree across the sets that name them")
+        b.ok(f"newest block = {win} (Canon_Index.md:{ctx.ci.updated_line[0]} + {read}); {compared} families agree across the sets that name them")
     return b.verdict()
 
 
@@ -662,21 +763,27 @@ def root_families(canon: Path) -> dict[str, list[tuple[Version, str]]]:
 
 
 def assert_b8(ctx: Ctx) -> Verdict:
-    b = Builder("B8", "Old/ sweep — exactly one member of each versioned family in the canon root")
+    b = Builder("B8", "Old/ sweep — exactly one member of each Core brief-set family in the canon root")
     fams = root_families(ctx.canon)
     if not fams:
         b.unknown("no versioned *_vN-M.md file in canon root", ("canon root", "—", str(ctx.canon)))
         return b.verdict()
-    for key, members in sorted(fams.items()):
-        if len(members) == 1:
-            continue
-        members.sort()
+    core = core_brief_set(ctx.families)
+    core_keys = [k for k in sorted(fams) if is_core(k, core)]
+    stale_core = {k: sorted(fams[k]) for k in core_keys if len(fams[k]) > 1}
+    stale_other = {k: sorted(fams[k]) for k in sorted(fams) if k not in core_keys and len(fams[k]) > 1}
+    for key, members in stale_core.items():
         newest = members[-1][1]
         preds = [n for _, n in members[:-1]]
         shown = ", ".join(preds[:4]) + (f", … and {len(preds) - 4} more" if len(preds) > 4 else "")
         b.fail(f"{key}: {len(members)} members in canon root", (f"{key} newest", newest, str(ctx.canon)), (f"{key} predecessors", f"{len(preds)} surviving", shown))
+    if stale_other:
+        b.heading(f"INFO B8 — not in the Core brief set, reported not asserted "
+                  f"({len(stale_other)} of {len(fams) - len(core_keys)} non-Core families have predecessors in the canon root):")
+        for key, members in stale_other.items():
+            b.info(f"{key}: {len(members)} members in canon root (newest {members[-1][1]})")
     if not b.fails:
-        b.ok(f"{len(fams)} families, one member each")
+        b.ok(f"{len(core_keys)} Core brief-set families in the canon root, one member each")
     return b.verdict()
 
 
