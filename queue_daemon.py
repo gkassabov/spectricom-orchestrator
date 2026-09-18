@@ -39,7 +39,11 @@ class QueueDaemon:
         self.consecutive_count = 0
         self.started_at = None
         self.config = {
-            "max_consecutive": 10,
+            # S7-CORE-11: raised from 10. The cap is a runaway guard, not a budget —
+            # it counts across daemon restarts from the persisted state, so a queue
+            # loaded with a week's increments silently stalls part-way. It did, at
+            # 10, with two briefs left and nothing wrong.
+            "max_consecutive": 25,
             "cooldown_seconds": 30,
             "stop_on_failure": True,
             # S7-CORE-11: the daemon predates --repo, --model and --effort, and its
