@@ -56,6 +56,7 @@ echo "    Logs · Master_Plan(D-165) · Document_Registry · Pending_Canon_Updat
 echo "    Bug Registries (SCA/Yorsie/Mini-Me) ONLY if bugs found/closed this session"
 echo
 echo "--- 4. GEORGE-ONLY status (not in git; Gemma must ASK at EOS) ---"
-echo "    Dr. K validation scheduled? · push->origin go/hold?"
+echo "    push->origin go/hold?"
+echo "    [REMOVED at EOS_Protocol v1-7 s1.5 (S7-CORE-9, George): the Dr. K validation question. T3 runs AFTER T1+T2 by design, so the sequencing already answers it. Surface T3 ONLY when both have run.]"
 echo "    [MUTED per George S6S67 — do NOT surface until George raises: Advisor outreach (Guarente / MH+son) · Drive OAuth]"
 echo "=============================================================================="
