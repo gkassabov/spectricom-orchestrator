@@ -190,7 +190,8 @@ def _batch_summary(n_files, n_tests, failed=0, extra=""):
 
 
 def _drive(cfg, responses, list_rc=0):
-    """responses: per-batch (returncode, stdout) in order. Returns (outcome, calls, sleeps, entries)."""
+    """responses: per-batch (returncode, stdout) in order, then — [GATE-SIT-2] — one per isolation
+    invocation (an Exception instance is raised instead). Returns (outcome, calls, sleeps, entries)."""
     calls, sleeps = [], []
     it = iter(responses)
 
@@ -198,7 +199,10 @@ def _drive(cfg, responses, list_rc=0):
         calls.append(cmd)
         if len(calls) == 1:  # the list command
             return MagicMock(returncode=list_rc, stdout=LIST_OUT if list_rc == 0 else "", stderr="boom" if list_rc else "")
-        rc, out = next(it)
+        resp = next(it)
+        if isinstance(resp, BaseException):
+            raise resp
+        rc, out = resp
         return MagicMock(returncode=rc, stdout=out, stderr="")
 
     with patch("subprocess.run", side_effect=fake_run), patch("time.sleep", side_effect=lambda s: sleeps.append(s)), \
@@ -278,7 +282,10 @@ class TestSitBatching:
 
     def test_a_real_failure_in_a_batch_is_still_product(self):
         red = " FAIL  sit/integration/f3.integration.test.ts > case 1\nAssertionError: expected 1 to be 2\n" + _batch_summary(2, 4, failed=1)
-        outcome, _, _, _ = _drive(CFG, [(0, _batch_summary(2, 4)), (1, red), (0, _batch_summary(1, 2))])
+        # [GATE-SIT-2] the fourth response is f3 re-run alone: it fails alone too
+        outcome, _, sleeps, _ = _drive(CFG, [(0, _batch_summary(2, 4)), (1, red), (0, _batch_summary(1, 2)),
+                                             (1, _batch_summary(1, 2, failed=1))])
+        assert sleeps == [7, 7, 7]
         assert outcome.passed is False and outcome.tests_failed == 1
         assert (outcome.test_files_total, outcome.tests_total) == (5, 10)
         v = _verdict_for(outcome)
@@ -304,6 +311,235 @@ class TestSitBatching:
         assert m.call_count == 1 and " -- " not in m.call_args[0][0]
         assert outcome.passed is True and outcome.batches is None
         assert outcome.collection == f"7 files/18 tests, {outcome.duration_s:.1f}s"
+
+
+# ═══════════════════════════════════════════════════════
+# S7-CORE-15 [GATE-SIT-2] — a red verdict you can believe: a failing file is re-run ALONE
+# ═══════════════════════════════════════════════════════
+F = {i: f"sit/integration/f{i}.integration.test.ts" for i in range(1, 6)}
+PASS = orchestrator.GateOutcome.PASS
+ALONE_GREEN = (0, _batch_summary(1, 2))
+ALONE_RED = (1, _batch_summary(1, 2, failed=1))
+GREEN_1, GREEN_2, GREEN_3 = (0, _batch_summary(2, 4)), (0, _batch_summary(2, 4)), (0, _batch_summary(1, 2))
+
+
+def _red_batch(*failing, n_files=2, n_tests=4, extra=""):
+    """A batch where each of `failing` carries one failed assertion — no transport text at all."""
+    k = len(failing)
+    heads = "".join(f" FAIL  {f} > case 1\nAssertionError: expected 1 to be 2\n" for f in failing)
+    ft = f"{k} failed" + (f" | {n_files - k} passed" if n_files > k else "") + f" ({n_files})"
+    return (1, f"{extra}{heads} RUN  v4.1.4 /repo\n\n Test Files  {ft}\n"
+               f"      Tests  {k} failed | {n_tests - k} passed ({n_tests})\n   Duration  4.0s\n")
+
+
+# AC-GS-01: every (SitOutcome, GateVerdict) pair these scenarios build must satisfy §2.
+SCENARIOS = {
+    "contaminated": [GREEN_1, _red_batch(F[3]), GREEN_3, ALONE_GREEN],
+    "confirmed": [GREEN_1, _red_batch(F[3]), GREEN_3, ALONE_RED],
+    "mixed": [GREEN_1, _red_batch(F[3], F[4]), GREEN_3, ALONE_GREEN, ALONE_RED],
+    "timeout": [GREEN_1, _red_batch(F[3]), GREEN_3, orchestrator.subprocess.TimeoutExpired("sit", 600)],
+    "two-files-alone": [GREEN_1, _red_batch(F[3]), GREEN_3, (0, _batch_summary(2, 4))],
+    "signal-alone": [GREEN_1, _red_batch(F[3]), GREEN_3,
+                     (1, "OperationOutcomeError: Too Many Requests\n" + _batch_summary(1, 2, failed=1))],
+    "cap": [_red_batch(F[1], F[2]), _red_batch(F[3]), GREEN_3],
+    "rate-limited-2-failed": [GREEN_1, _red_batch(F[3], F[4], extra="OperationOutcomeError: Too Many Requests\n"), GREEN_3],
+    "zero-failed": [GREEN_1, (1, " FAIL  sit/integration/f3.integration.test.ts [ setup ]\n RUN  v4.1.4 /repo\n\n"
+                                 " Test Files  1 failed | 1 passed (2)\n      Tests  2 passed | 2 skipped (4)\n"), GREEN_3],
+    "green": [GREEN_1, GREEN_2, GREEN_3],
+}
+
+
+def _scenario(name, cfg=CFG):
+    return _drive(cfg, SCENARIOS[name])
+
+
+def _sit_verdict(outcome):
+    """(the SIT gate's own verdict, run_pre_merge_gates' return). On the contamination PASS the
+    gate falls through to the unit gate, so the two differ; read the first off the invariant call."""
+    with patch.object(orchestrator, "sit_verdict_violations", wraps=orchestrator.sit_verdict_violations) as spy:
+        final = _verdict_for(outcome)
+    return (spy.call_args[0][1] if spy.called else final), final
+
+
+class TestSitIsolation:
+
+    def test_contamination_is_not_fail_product(self):
+        """AC-GS-02, written against the pre-[GATE-SIT-2] API only (_drive + _verdict_for) so it
+        RUNS on c292570 and fails there with the message below."""
+        outcome, _, _, _ = _scenario("contaminated")
+        v = _verdict_for(outcome)
+        assert v.outcome is not PRODUCT, f"main returned FAIL(product) here: {v.label}"
+
+    def test_contamination_passes_named(self, caplog):
+        """AC-GS-02: f3 failed in batch 2 beside f4, passed alone ⇒ PASS `batch-contamination`."""
+        with caplog.at_level(logging.INFO, logger="orch"):
+            outcome, calls, sleeps, entries = _scenario("contaminated")
+            v, final = _sit_verdict(outcome)
+        assert outcome.passed is False and outcome.tests_failed == 1, "the verdict is not decided in the gate run"
+        assert (v.outcome, v.gate, v.signal) == (PASS, "sit", "batch-contamination")
+        assert final.outcome is PASS and final.collection == outcome.collection
+        iso = outcome.isolation
+        assert iso.contaminated == (F[3],) and iso.confirmed == ()
+        assert iso.neighbours == {F[3]: (F[4],)} and iso.batch_of == {F[3]: 2}
+        assert iso.error is None and iso.skipped is None
+        assert f"{F[3]} failed in batch 2/3 beside {F[4]} — passed alone (2/2); no product failure" == v.detail
+        assert "signal 'batch-contamination'" in caplog.text
+        assert "SIT green after isolation" in caplog.text
+        assert "confirming in isolation before verdict: " + F[3] in caplog.text
+        status = orchestrator._gate_status_label(None, final.outcome.value, final.collection)
+        assert f"contaminated, passed alone (not blocking): {F[3]} (batch 2/3, neighbours: {F[4]})" in status
+        assert status.startswith("PASS (5 files/10 tests in 3 batches, ")
+
+    def test_the_leg_runs_the_file_alone_after_one_pause(self):
+        """AC-GS-04: exactly `<sit_cmd> -- <f3>`, after the configured pause, once."""
+        _, calls, sleeps, _ = _scenario("contaminated")
+        assert len(calls) == 1 + 3 + 1
+        leg = calls[-1]
+        assert leg.endswith(f"npm run sit:gate -- {F[3]}")
+        assert leg.count(".integration.test.ts") == 1 and " -- " in leg
+        assert sleeps == [7, 7, 7], "the configured pause once before the leg, never a literal"
+        for c in calls[1:4]:  # the batches are unchanged
+            assert c.count(".integration.test.ts") in (1, 2)
+
+    def test_a_file_that_fails_alone_is_product(self):
+        """AC-GS-03: isolation cannot mask a genuine product failure."""
+        outcome, calls, _, _ = _scenario("confirmed")
+        v = _verdict_for(outcome)
+        assert v.outcome is PRODUCT
+        assert outcome.isolation.confirmed == (F[3],) and outcome.isolation.contaminated == ()
+        assert "confirmed failing alone: " + F[3] in v.detail and "(1 failed assertions)" in v.detail
+        assert f"confirmed failing alone: {F[3]}" in outcome.collection
+
+    def test_mixed_names_both_sets(self):
+        """AC-GS-03 mixed: f3 passes alone, f4 fails alone ⇒ FAIL(product) naming both."""
+        outcome, calls, sleeps, _ = _scenario("mixed")
+        v = _verdict_for(outcome)
+        assert v.outcome is PRODUCT
+        iso = outcome.isolation
+        assert (iso.contaminated, iso.confirmed) == ((F[3],), (F[4],))
+        assert iso.neighbours == {F[3]: (F[4],), F[4]: (F[3],)}
+        assert f"confirmed failing alone: {F[4]}" in v.detail
+        assert f"contaminated (passed alone, not counted): {F[3]}" in v.detail
+        assert [c.split(" -- ")[1] for c in calls[4:]] == [F[3], F[4]]
+        assert sleeps == [7, 7, 7]
+
+    @pytest.mark.parametrize("name,why", [("timeout", "timeout"), ("two-files-alone", "collected 2 files, not 1"),
+                                          ("signal-alone", "F-20 signal 'rate-limited'")])
+    def test_an_unreadable_measurement_fails_closed(self, name, why):
+        """AC-GS-06: never PASS, never product."""
+        outcome, _, _, _ = _scenario(name)
+        assert outcome.passed is False and outcome.error is None
+        v = _verdict_for(outcome)
+        assert (v.outcome, v.signal) == (ENV, "isolation-unmeasurable")
+        assert why in v.detail and F[3] in v.detail
+        assert orchestrator.sit_verdict_violations(outcome, v) == []
+
+    def test_environment_runs_are_never_re_run(self):
+        """AC-GS-05: 2 failed assertions but a transport signal — D-S7CORE10-02 decides, no leg."""
+        outcome, calls, sleeps, _ = _scenario("rate-limited-2-failed")
+        assert outcome.tests_failed == 2 and outcome.isolation is None
+        assert len(calls) == 1 + 3 and sleeps == [7, 7]
+        v = _verdict_for(outcome)
+        assert (v.outcome, v.signal) == (ENV, "rate-limited")
+
+    def test_the_cap(self):
+        """AC-GS-07: three failing files, batch size 2 ⇒ no isolation call, today's verdict."""
+        outcome, calls, sleeps, entries = _scenario("cap")
+        assert outcome.tests_failed == 3 and len(calls) == 1 + 3 and sleeps == [7, 7]
+        iso = outcome.isolation
+        assert iso.skipped == "3 failing files exceed the batch size 2 — not contamination-shaped, not re-run"
+        assert iso.contaminated == () and iso.confirmed == ()
+        v = _verdict_for(outcome)
+        assert v.outcome is PRODUCT and v.detail.endswith("(3 failed assertions) — product verdict stands")
+        assert entries[-1]["isolation"]["skipped"] == iso.skipped
+
+    @pytest.mark.parametrize("name", ["contaminated", "confirmed"])
+    def test_the_sit_log_carries_the_evidence(self, name):
+        """AC-GS-08."""
+        outcome, _, _, entries = _scenario(name)
+        e = entries[-1]["isolation"]
+        assert {"contaminated", "confirmed", "neighbours", "batch_of", "error"} <= set(e)
+        assert e["neighbours"] == {F[3]: [F[4]]} and e["batch_of"] == {F[3]: 2} and e["error"] is None
+        assert (e["contaminated"], e["confirmed"]) == (([F[3]], []) if name == "contaminated" else ([], [F[3]]))
+
+    def test_no_isolation_key_when_the_leg_was_not_owed(self):
+        _, _, _, entries = _scenario("green")
+        assert "isolation" not in entries[-1]
+
+    @pytest.mark.parametrize("name,outcome_is", [("contaminated", PASS), ("confirmed", PRODUCT)])
+    def test_run_pre_merge_gates_consults_the_invariant(self, name, outcome_is):
+        """AC-GS-10: the non-test caller hands the predicate the exact (so, v) pair it acts on."""
+        outcome, _, _, _ = _scenario(name)
+        with patch.object(orchestrator, "sit_verdict_violations",
+                          wraps=orchestrator.sit_verdict_violations) as spy:
+            final = _verdict_for(outcome)
+        spy.assert_called_once()
+        so, v = spy.call_args[0]
+        assert so is outcome and v.outcome is outcome_is and v.gate == "sit"
+        if outcome_is is PRODUCT:
+            assert v is final
+        else:
+            assert final.outcome is PASS and final.collection == outcome.collection
+
+    def test_a_violation_is_logged_not_acted_on(self, caplog):
+        outcome, _, _, _ = _scenario("contaminated")
+        with patch.object(orchestrator, "sit_verdict_violations", return_value=["V9: synthetic"]), \
+             caplog.at_level(logging.INFO, logger="orch"):
+            v = _verdict_for(outcome)
+        assert v.outcome is PASS
+        assert "⛔ GATE-SIT-2 invariant: V9: synthetic" in caplog.text
+
+
+class TestSitVerdictInvariant:
+    """AC-GS-01 — the §2 predicate: [] for every pair the scenarios build; one clause per negative."""
+
+    @pytest.mark.parametrize("name", sorted(SCENARIOS))
+    def test_every_constructed_pair_is_clean(self, name):
+        outcome, _, _, _ = _scenario(name)
+        v, _ = _sit_verdict(outcome)
+        assert orchestrator.sit_verdict_violations(outcome, v) == []
+
+    def test_the_existing_batched_red_pairs_are_clean(self):
+        red = ("\n".join(l for l in FIXTURE_429.splitlines() if "OperationOutcomeError" in l)[:400]
+               + "\n RUN  v4.1.4 /repo\n\n Test Files  1 failed | 1 passed (2)\n      Tests  2 passed | 2 skipped (4)\n")
+        outcome, calls, _, _ = _drive(CFG, [GREEN_1, (1, red), GREEN_3])
+        assert outcome.isolation is None and len(calls) == 4
+        assert orchestrator.sit_verdict_violations(outcome, _verdict_for(outcome)) == []
+
+    def _so(self, **kw):
+        base = dict(passed=False, exit_code=1, batches=3, tests_failed=1,
+                    output=f" FAIL  {F[3]} > case 1\n Tests  1 failed | 3 passed (4)\n")
+        base.update(kw)
+        return orchestrator.SitOutcome(**base)
+
+    def _one(self, so, v, clause):
+        got = orchestrator.sit_verdict_violations(so, v)
+        assert len(got) == 1 and got[0].startswith(f"{clause}:"), got
+
+    def test_v1_product_with_nothing_confirmed(self):
+        iso = orchestrator.SitIsolation(contaminated=(F[3],))
+        self._one(self._so(isolation=iso), orchestrator.GateVerdict(PRODUCT, "sit", "exit 1"), "V1")
+
+    def test_v2_product_with_isolation_owed_and_not_run(self):
+        self._one(self._so(), orchestrator.GateVerdict(PRODUCT, "sit", "exit 1"), "V2")
+
+    def test_v3_pass_without_isolation(self):
+        self._one(self._so(), orchestrator.GateVerdict(PASS, "sit", "batch-contamination"), "V3")
+
+    def test_v4_isolation_where_rule_1_had_decided(self):
+        iso = orchestrator.SitIsolation(contaminated=(F[3],))
+        self._one(self._so(tests_failed=0, isolation=iso),
+                  orchestrator.GateVerdict(ENV, "sit", "no-failed-assertions"), "V4")
+
+    def test_v5_unmeasurable_without_a_failed_measurement(self):
+        self._one(self._so(output="Tests  1 failed | 3 passed (4)\n"),
+                  orchestrator.GateVerdict(ENV, "sit", "isolation-unmeasurable"), "V5")
+
+    @pytest.mark.parametrize("kw", [dict(batches=None), dict(error="batch-incomplete"), dict(tests_failed=None)])
+    def test_exclusions_say_nothing(self, kw):
+        """A11: unbatched / machinery-error / UNKNOWN runs are outside the predicate."""
+        assert orchestrator.sit_verdict_violations(
+            self._so(**kw), orchestrator.GateVerdict(PRODUCT, "sit", "exit 1")) == []
 
 
 class TestRepoConfig:

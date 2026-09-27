@@ -1557,6 +1557,35 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
 # SIT POST-MERGE INTEGRATION (A58a — advisory v1)
 # ═══════════════════════════════════════════════════════
 @dataclass
+class SitIsolation:
+    """[GATE-SIT-2] The evidence of the isolation leg: each file that failed in its batch,
+    re-run ALONE after the refill pause. A measurement, not a retry — the verdict is decided
+    from it by _classify_gate_failure rule 3, never here."""
+    contaminated: tuple = ()   # failed in the batch, PASSED alone
+    confirmed: tuple = ()      # failed alone too
+    neighbours: dict = field(default_factory=dict)  # file -> the other files of its batch, listing order
+    batch_of: dict = field(default_factory=dict)    # file -> 1-based batch index
+    duration_s: float = 0.0
+    pause_s: int = 0
+    error: Optional[str] = None    # "isolation-unmeasurable" ⇒ fail closed (BLOCKED(environment))
+    detail: Optional[str] = None
+    skipped: Optional[str] = None  # why isolation was owed-shaped but not attempted (the cap)
+    batches: Optional[int] = None  # how many batches the gate ran, for `batch 2/3`
+    alone: dict = field(default_factory=dict)       # file -> `3/3` tests passed alone
+
+    def where(self, f: str) -> str:
+        """`batch 2/3, neighbours: a, b` — the evidence the harness fix needs."""
+        nb = ", ".join(self.neighbours.get(f, ())) or "none"
+        return f"batch {self.batch_of.get(f, '?')}/{self.batches or '?'}, neighbours: {nb}"
+
+    def as_log(self) -> dict:
+        return {"contaminated": list(self.contaminated), "confirmed": list(self.confirmed),
+                "neighbours": {k: list(v) for k, v in self.neighbours.items()},
+                "batch_of": dict(self.batch_of), "error": self.error, "detail": self.detail,
+                "skipped": self.skipped, "duration_s": round(self.duration_s, 2)}
+
+
+@dataclass
 class SitOutcome:
     passed: bool
     exit_code: int
@@ -1578,6 +1607,8 @@ class SitOutcome:
     # [SIT-RATE-1] how many gate invocations produced these counts; None = one unbatched run.
     batches: Optional[int] = None
     detail: Optional[str] = None  # the sentence behind a machinery `error` (never a secret)
+    # [GATE-SIT-2] the isolation leg's evidence; None = the leg was not owed (or not batched).
+    isolation: Optional[SitIsolation] = None
 
     @property
     def files_failed(self) -> Optional[int]:
@@ -1595,7 +1626,15 @@ class SitOutcome:
         f = "?" if self.test_files_total is None else self.test_files_total
         t = "?" if self.tests_total is None else self.tests_total
         b = f" in {self.batches} batches" if self.batches else ""
-        return f"{f} files/{t} tests{b}, {self.duration_s:.1f}s"
+        s = f"{f} files/{t} tests{b}, {self.duration_s:.1f}s"
+        iso = self.isolation
+        if iso is not None and iso.contaminated:
+            # [GATE-SIT-2] named on every path, the way UnitGateOutcome names its flakes
+            s += " | contaminated, passed alone (not blocking): " + \
+                 "; ".join(f"{c} ({iso.where(c)})" for c in iso.contaminated)
+        if iso is not None and iso.confirmed:
+            s += f" | confirmed failing alone: {', '.join(iso.confirmed)}"
+        return s
 
 
 # [ORCH-2] vitest summary as the SIT gate prints it (captured 2026-09-11 from clinical-mp, tests/fixtures/):
@@ -1769,9 +1808,11 @@ def _add_count(agg: dict, key: str, val: Optional[int], unknown: set):
 
 def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan) -> _SitBatchedRun:
     """[SIT-RATE-1] Run `sit_cmd -- <files>` once per batch, pausing `plan.pause_s` between,
-    and add the per-batch vitest summaries up. Every batch runs (no early exit, and NEVER a
-    retry — a re-run against an unrefilled budget is dirtier than the first, measured
-    2026-09-15: 5 files down instead of 3). A batch that collects a different number of files
+    and add the per-batch vitest summaries up. Every batch runs (no early exit, and a BATCH is
+    NEVER re-run — a re-run against an unrefilled budget is dirtier than the first, measured
+    2026-09-15: 5 files down instead of 3). [GATE-SIT-2] A single failing file may afterwards
+    be re-measured ALONE, after the refill pause, by run_sit_post_merge (_sit_isolate) — a
+    measurement, not a retry, and never of a batch. A batch that collects a different number of files
     than it was handed, or an aggregate that does not equal the enumeration, is `mismatch`:
     the [ORCH-8] failure in a new costume, and not a verdict."""
     out = _SitBatchedRun()
@@ -1822,6 +1863,90 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan) -> _SitBatche
         notes.append(f"batches collected {got_t} tests, the suite enumerates {plan.tests_expected}")
     out.mismatch = "; ".join(notes) or None
     return out
+
+
+def _sit_env_signal(text: str) -> Optional[str]:
+    """[GATE-SIT-2] The first F-20 ENV_BLOCK_SIGNALS id matching `text` (ANSI stripped, as the
+    classifier reads it), or None. Rule 2's table, read — never copied."""
+    text = _ANSI_RE.sub("", text or "")
+    for sid, rx, _ in _ENV_BLOCK_SIGNALS_RE:
+        if rx.search(text):
+            return sid
+    return None
+
+
+def _sit_failing_files(text: str) -> list:
+    """[GATE-SIT-2] The failing files the runner output names (`FAIL sit/x.test.ts`), normalised,
+    in first-seen order, each once."""
+    out = []
+    for f in _GATE_FAIL_FILE_RE.findall(_ANSI_RE.sub("", text or "")):
+        f = _norm_test_path(f)
+        if f not in out:
+            out.append(f)
+    return out
+
+
+def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list) -> SitIsolation:
+    """[GATE-SIT-2] Re-run each failing file ALONE — one `sit_cmd -- <file>` invocation per file,
+    in listing order, after ONE refill pause. Copies the [ORCH-6] unit-gate shape: a file that
+    passes alone was its batch's (`contaminated`), a file that fails alone is the product's
+    (`confirmed`), and a measurement that cannot be read stops the leg with `error` — fail
+    closed, never a verdict about the file. More failing files than a batch holds is not
+    contamination-shaped: recorded as `skipped`, nothing re-run."""
+    iso = SitIsolation(pause_s=plan.pause_s, batches=len(plan.batches))
+    if len(files) > plan.batch_files:
+        iso.skipped = (f"{len(files)} failing files exceed the batch size {plan.batch_files} — "
+                       f"not contamination-shaped, not re-run")
+        log.warning(f"⚠️  SIT gate isolation skipped: {iso.skipped}")
+        return iso
+    log.info(f"🔬 SIT gate: {len(files)} failing file(s) — confirming in isolation before verdict: "
+             f"{', '.join(files)}")
+    for i, batch in enumerate(plan.batches, 1):
+        for f in files:
+            if f in batch:
+                iso.batch_of[f] = i
+                iso.neighbours[f] = tuple(x for x in batch if x != f)
+    started = time.time()
+    if plan.pause_s > 0:
+        log.info(f"⏸️  SIT batch pause {plan.pause_s}s (rate-limit window refill) before the isolation leg")
+        time.sleep(plan.pause_s)
+    contaminated, confirmed = [], []
+    for f in files:
+        cmd = f"{sit_cmd} -- {shlex.quote(f)}"
+        why = None
+        try:
+            r = subprocess.run(_gate_shell_cmd(cmd, repo_path), shell=True, capture_output=True,
+                               text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            r, why = None, (f"timeout — exceeded its {SIT_TIMEOUT}s budget"
+                            if isinstance(e, subprocess.TimeoutExpired) else type(e).__name__)
+        if r is not None:
+            raw = (r.stdout or "") + "\n" + (r.stderr or "")
+            c, t = _parse_vitest_summary(raw), _parse_vitest_tallies(raw)
+            tf, sig = _sit_tests_failed(c, t), _sit_env_signal(raw)
+            if sig:
+                why = f"F-20 signal '{sig}' in its own output"
+            elif c["test_files_total"] != 1:
+                why = f"collected {'?' if c['test_files_total'] is None else c['test_files_total']} files, not 1"
+            elif r.returncode == 0 and tf == 0:
+                contaminated.append(f)
+                iso.alone[f] = f"{c['tests_passed']}/{c['tests_total']}"
+            elif r.returncode != 0 and tf is not None and tf >= 1:
+                confirmed.append(f)
+                iso.alone[f] = f"{c['tests_passed']}/{c['tests_total']}"
+            else:
+                why = f"exit {r.returncode} with {'unknown' if tf is None else tf} failed assertions"
+        if why:
+            iso.error = "isolation-unmeasurable"
+            iso.detail = f"{f} could not be measured alone ({why}) — batch contamination cannot be told from a product failure"
+            log.error(f"⛔ SIT gate isolation: {iso.detail}")
+            break
+    iso.contaminated, iso.confirmed = tuple(contaminated), tuple(confirmed)
+    iso.duration_s = time.time() - started
+    log.info(f"🔬 SIT gate isolation — {len(files)} file(s) in {iso.duration_s:.1f}s; "
+             f"contaminated: {', '.join(iso.contaminated) or '(none)'}; "
+             f"confirmed: {', '.join(iso.confirmed) or '(none)'}")
+    return iso
 
 
 def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> SitOutcome:
@@ -1897,6 +2022,17 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         collection = _describe_collection(counts)
         if batches:
             collection += f" in {batches} batches"
+        # [GATE-SIT-2] a red batched run with ≥1 failed assertion, no F-20 signal and named
+        # failing files: re-measure those files alone before anything decides. A run that
+        # D-S7CORE10-02 already calls environment (0 failed / a transport signal) is never
+        # re-run. `passed` stays False whatever this finds — the classifier decides.
+        isolation: Optional[SitIsolation] = None
+        if (plan is not None and r.returncode != 0 and batch_mismatch is None
+                and isinstance(tests_failed, int) and tests_failed >= 1 and _sit_env_signal(raw) is None):
+            named = set(_sit_failing_files(raw))
+            suspects = [f for f in plan.files if _norm_test_path(f) in named]
+            if suspects:
+                isolation = _sit_isolate(sit_cmd, repo_path, plan, suspects)
         error, detail = None, None
         if batch_mismatch:
             # AC-SR-05: the batches do not add up to the suite. Not a verdict about anything.
@@ -1914,7 +2050,11 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
             log.info(f"🧪 SIT gate: PASS — {collection}{recon} in {duration:.1f}s")
         else:
             fl = "?" if tests_failed is None else tests_failed
-            log.error(f"⛔ SIT gate FAILED (exit {r.returncode}) — {collection}, {fl} failed assertions — BLOCKING.\n{raw[-800:]}")
+            iso = "" if isolation is None else (
+                f" (isolation: contaminated {len(isolation.contaminated)}, confirmed {len(isolation.confirmed)}"
+                f"{', ' + (isolation.error or isolation.skipped) if (isolation.error or isolation.skipped) else ''}"
+                f" — the verdict is the classifier's)")
+            log.error(f"⛔ SIT gate FAILED (exit {r.returncode}) — {collection}, {fl} failed assertions{iso} — BLOCKING.\n{raw[-800:]}")
         if (SIT_MIN_TEST_FILES is not None and counts["test_files_total"] is not None
                 and counts["test_files_total"] < SIT_MIN_TEST_FILES):
             # §4.6: warning only, never blocking
@@ -1943,12 +2083,13 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         # Log to orchestrator-sit-log.json
         _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path,
                          error=error, error_excerpt=error_excerpt, tests_failed=tests_failed,
-                         batches=batches, **counts)
+                         batches=batches, isolation=None if isolation is None else isolation.as_log(),
+                         **counts)
 
         return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration,
                           error=error, detail=detail, output="" if passed else raw[-20000:],
                           tests_failed=tests_failed, tests_skipped=tallies.get("skipped"),
-                          batches=batches, **counts)
+                          batches=batches, isolation=isolation, **counts)
 
     except subprocess.TimeoutExpired:
         duration = time.time() - started
@@ -2958,7 +3099,8 @@ _GATE_FAIL_FILE_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(\S+)", re.MULTILINE)
 
 def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: int,
                            tests_failed: Optional[int] = None,
-                           files_failed: Optional[int] = None) -> GateVerdict:
+                           files_failed: Optional[int] = None,
+                           isolation: Optional[SitIsolation] = None) -> GateVerdict:
     """PDLC F-20: BLOCKED(environment) vs FAIL(product) for a red gate. Only the F-20 tables
     decide. The matched token is quoted (≤80 chars); the gate output is never echoed whole.
 
@@ -2972,7 +3114,14 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
          2026-09-15 (RM-I-028; the 19-file 429) had exactly this shape. None is UNKNOWN, not 0,
          and never earns it (§2.4); a run with one failed assertion still falls through to the
          product verdict. The caller that has the tallies passes them; a caller that does not
-         gets the pre-[ORCH-11] behaviour unchanged."""
+         gets the pre-[ORCH-11] behaviour unchanged.
+
+    S7-CORE-15 [GATE-SIT-2], reached only when rules 2 and 1 were silent:
+      3. A failed assertion that passes alone is the batch's, not the product's — decided from
+         this function's inputs, like rules 1 and 2 (`isolation`, the SIT gate's SitIsolation).
+         An unreadable isolation measurement ⇒ BLOCKED(environment) `isolation-unmeasurable`;
+         any file confirmed failing alone ⇒ FAIL(product); only contaminated files ⇒ PASS
+         `batch-contamination`, named. No isolation, or a skipped one ⇒ the product fall-through."""
     text = _ANSI_RE.sub("", output or "")
     for sid, rx, desc in _ENV_BLOCK_SIGNALS_RE:
         m = rx.search(text)
@@ -2998,8 +3147,60 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
                            f"exit {exit_code} with 0 failed assertions and {n} file(s) down at setup{which} "
                            f"— environment by construction [ORCH-11]")
     seen = "" if tests_failed is None else f" ({tests_failed} failed assertions)"
+    if isolation is not None and not isolation.skipped:
+        if isolation.error:
+            log.info(f"🔎 F-20 {gate} gate: signal 'isolation-unmeasurable' matched — {isolation.detail}")
+            return GateVerdict(GateOutcome.BLOCKED_ENV, gate, "isolation-unmeasurable", isolation.detail)
+        if isolation.confirmed:
+            also = (f"; contaminated (passed alone, not counted): {', '.join(isolation.contaminated)}"
+                    if isolation.contaminated else "")
+            return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}",
+                               f"no F-20 environment signal in gate output{seen}; confirmed failing alone: "
+                               f"{', '.join(isolation.confirmed)}{also} — product verdict stands")
+        if isolation.contaminated:
+            why = "; ".join(
+                f"{f} failed in batch {isolation.batch_of.get(f, '?')}/{isolation.batches or '?'} beside "
+                f"{', '.join(isolation.neighbours.get(f, ())) or 'no other file'} — passed alone "
+                f"({isolation.alone.get(f, '?')})" for f in isolation.contaminated) + "; no product failure"
+            log.info(f"🔎 F-20 {gate} gate: signal 'batch-contamination' — {why}")
+            return GateVerdict(GateOutcome.PASS, gate, "batch-contamination", why)
     return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}",
                        f"no F-20 environment signal in gate output{seen} — product verdict stands")
+
+
+def sit_verdict_violations(so: SitOutcome, v: GateVerdict) -> list[str]:
+    """[GATE-SIT-2] EMPTY WHEN CLEAN. Each string names one way (so, v) contradicts §2:
+    no FAIL(product) names a failing file that was not re-run alone and confirmed failing
+    alone; no file that passed alone is counted against the product; and a red gate that
+    D-S7CORE10-02 already calls environment is never re-run.
+
+    Scope: a batched (`so.batches`), red (`so.passed is False`) run with no machinery error
+    (`so.error is None`) and a stated failed count (`so.tests_failed` not None). Everything
+    else — unbatched runs, batch-incomplete / sit-list-failed / zero-collection /
+    timeout-advisory / skipped, UNKNOWN tallies (§2.4) — returns [] from every clause.
+    A SKIPPED isolation (the cap: more failing files than a batch holds) owes nothing:
+    V1 and V2 exclude it, and its FAIL(product) is today's rule, unchanged."""
+    if so.batches is None or so.passed is not False or so.error is not None or so.tests_failed is None:
+        return []
+    out = []
+    iso = so.isolation
+    signal = _sit_env_signal(so.output)
+    product, passed = v.outcome is GateOutcome.FAIL_PRODUCT, v.outcome is GateOutcome.PASS
+    if product and iso is not None and not iso.skipped and not iso.confirmed:
+        out.append(f"V1: FAIL(product) with no file confirmed failing alone (isolation: {iso.as_log()})")
+    if (product and iso is None and so.tests_failed >= 1 and signal is None
+            and _sit_failing_files(so.output)):
+        out.append(f"V2: FAIL(product) over failing file(s) {', '.join(_sit_failing_files(so.output))} "
+                   f"that were never re-run alone")
+    if passed and (iso is None or iso.error or iso.skipped or iso.confirmed or not iso.contaminated):
+        out.append("V3: PASS over a red batched run without every failing file passing alone")
+    if iso is not None and (so.tests_failed == 0 or signal is not None):
+        out.append(f"V4: isolation ran where D-S7CORE10-02 had decided "
+                   f"({'0 failed assertions' if so.tests_failed == 0 else f'signal {signal!r}'}) — a re-run, not a measurement")
+    if (v.outcome is GateOutcome.BLOCKED_ENV and v.signal == "isolation-unmeasurable"
+            and (iso is None or iso.error is None)):
+        out.append("V5: BLOCKED(environment) isolation-unmeasurable without a failed measurement behind it")
+    return out
 
 
 def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> GateVerdict:
@@ -3053,8 +3254,15 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                     else:
                         # [ORCH-11] the tallies travel with the output: rule 1 is decided here.
                         v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code,
-                                                   tests_failed=so.tests_failed, files_failed=so.files_failed)
+                                                   tests_failed=so.tests_failed, files_failed=so.files_failed,
+                                                   isolation=so.isolation)
                         v.collection = sit_collection
+                    # [GATE-SIT-2] the invariant is an oracle, not a fourth rule: it never changes v.
+                    for msg in sit_verdict_violations(so, v):
+                        log.error(f"⛔ GATE-SIT-2 invariant: {msg}")
+                    if v.outcome is GateOutcome.PASS:
+                        log.info(f"✅ Pre-merge gate{where}: SIT green after isolation — {v.label}")
+                        continue
                     log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                     return v
                 log.warning("⚠️  SIT red but DISABLE_SIT_BLOCKING is set — advisory (pre-existing operator escape)")
@@ -3098,10 +3306,13 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
                      error_excerpt: Optional[str] = None,
                      test_files_total: Optional[int] = None, test_files_passed: Optional[int] = None,
                      tests_total: Optional[int] = None, tests_passed: Optional[int] = None,
-                     tests_failed: Optional[int] = None, batches: Optional[int] = None):
+                     tests_failed: Optional[int] = None, batches: Optional[int] = None,
+                     isolation: Optional[dict] = None):
     """Append SIT outcome to orchestrator-sit-log.json. [ORCH-2] carries the four collection
     counts (null when the summary did not parse) so "was the gate ever thin?" is answerable
-    historically. Old-shape entries without them still load."""
+    historically. Old-shape entries without them still load.
+    [GATE-SIT-2] `isolation` (SitIsolation.as_log()) is written only when the leg was owed;
+    entries without the key are runs where it was not."""
     log_file = archive / "orchestrator-sit-log.json"
     entries = []
     if log_file.exists():
@@ -3127,6 +3338,8 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
     }
     if error_excerpt is not None:
         entry["error_excerpt"] = error_excerpt
+    if isolation is not None:
+        entry["isolation"] = isolation
     entries.append(entry)
     log_file.write_text(json.dumps(entries, indent=2))
 
