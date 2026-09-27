@@ -648,6 +648,59 @@ def check_branch_freshness_invariants(repo: QueueRepo, briefs: Iterable[str]) ->
     return out
 
 
+# ── ORCH-CONFLICT-1 · the landed invariant (S7-CORE-15) ──────────────────────────────────
+# The freshness invariant above is asserted before a route runs; this one is asserted as it
+# ends, at the one line every downstream claim is built on (`🏁 FINAL STATUS: passed`):
+#
+#     a route reported passed has its tip on the merge target, and leaves the repo not mid-merge
+#
+# L-UI-SAFETY-1 attempt 2 (2026-09-21 02:27:25) passed its gate, conflicted on merge, and still
+# printed `FINAL STATUS: passed`. The route tip is supplied by the CALLER, captured as the merge
+# was attempted: a good merge deletes the branch, so refs/heads/<branch> cannot be the evidence.
+# Ancestry of that tip is also stricter than _landed's subject scan — a previous attempt's
+# `Merge branch '<same name>'` cannot answer for this one.
+
+
+@dataclass(frozen=True)
+class UnlandedRouteViolation:
+    """A route reported ready to pass whose tip is not on the merge target, or whose repo is mid-merge."""
+    repo: str
+    branch: str
+    merge_target: str
+    route_tip: str      # the route branch's tip as the merge was attempted (caller-supplied)
+    target_tip: str     # the merge target's tip now
+    landed: bool        # git merge-base --is-ancestor <route_tip> <merge_target>
+    mid_merge: bool     # MERGE_HEAD resolves in repo.path
+
+    def __str__(self) -> str:
+        legs = ([] if self.landed else [f"not on {self.merge_target}"]) + \
+               (["repo mid-merge"] if self.mid_merge else [])
+        return (f"{self.branch} tip {self.route_tip[:8]} vs {self.merge_target} "
+                f"{self.target_tip[:8]}: {', '.join(legs)}")
+
+
+def check_route_landed_invariants(repo: QueueRepo, brief: str, route_tip: str) -> list[UnlandedRouteViolation]:
+    """EMPTY WHEN CLEAN. Clean ⇔ `route_tip` is an ancestor of `repo.merge_target` AND
+    `git rev-parse -q --verify MERGE_HEAD` fails in repo.path. The set is exactly ONE route,
+    `repo.branch_for(brief)`, named by the caller. Unreadable (no .git, merge target or
+    route_tip unresolvable) ⇒ [] — the module's rule, same as _landed and
+    check_branch_freshness_invariants."""
+    target = repo.merge_target
+    target_tip = git(repo.path, "rev-parse", "--verify", "--quiet", target)
+    if target_tip is None or not route_tip:
+        return []
+    tip = git(repo.path, "rev-parse", "--verify", "--quiet", f"{route_tip}^{{commit}}")
+    if tip is None:
+        return []
+    landed = _is_ancestor(repo.path, tip, target_tip)
+    mid_merge = git(repo.path, "rev-parse", "-q", "--verify", "MERGE_HEAD") is not None
+    if landed and not mid_merge:
+        return []
+    return [UnlandedRouteViolation(repo=repo.name, branch=repo.branch_for(brief), merge_target=target,
+                                   route_tip=tip, target_tip=target_tip, landed=landed,
+                                   mid_merge=mid_merge)]
+
+
 # ── verdict building ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Verdict:

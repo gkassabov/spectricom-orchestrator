@@ -32,7 +32,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
 # ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
 # shared with the tests; canon_assert imports nothing from here.
-from canon_assert import QueueRepo, check_branch_freshness_invariants
+# ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
+from canon_assert import QueueRepo, check_branch_freshness_invariants, check_route_landed_invariants
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
 PREFIRE_BYPASS = False
@@ -885,6 +886,9 @@ def run_playwright() -> tuple[bool, int]:
 # loud stop. Every git command below is read-only.
 
 TAMPER_VERDICT = "TAMPERED"  # greppable in the FINAL STATUS line and in orchestrator-unit-log.json
+# [ORCH-CONFLICT-1] greppable in the FINAL STATUS gate field. Not a GateOutcome: the gate said PASS
+# and was right; it is the merge that followed it that did not land.
+MERGE_CONFLICT_VERDICT = "MERGE CONFLICT"
 
 
 def _git_read(cmd: str, cwd: Path) -> str:
@@ -3597,6 +3601,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     gate_error: Optional[str] = None     # [ORCH-1] human verdict line (never a secret value)
     gate_collection: Optional[str] = None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed
     unit_collection: Optional[str] = None  # [ORCH-3] both sides of the unit baseline when that gate ran
+    route_tip: Optional[str] = None      # [ORCH-CONFLICT-1] route branch tip as the merge was attempted
     if tamper is not None:
         # [ORCH-10] S2/S3: no gate, no commit, no merge, no checkout, no branch delete.
         # Detect and report only — the ordinary path below both gates AND moves refs
@@ -3671,6 +3676,12 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                         )
                     else:
                         # Merge back to merge target — green gate only
+                        # [ORCH-CONFLICT-1] the route branch is still checked out: its tip is the
+                        # evidence the landed invariant checks, since a good merge deletes the ref.
+                        route_tip = subprocess.run(
+                            "git rev-parse HEAD",
+                            shell=True, capture_output=True, text=True, cwd=str(proj)
+                        ).stdout.strip() or None
                         pre_merge_tip = subprocess.run(
                             f"git rev-parse {MERGE_TARGET}",
                             shell=True, capture_output=True, text=True, cwd=str(proj)
@@ -3705,8 +3716,23 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                                 # Clean up feature branch
                                 subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
                         else:
+                            # [ORCH-CONFLICT-1] a merge that did not land is never `passed`. Abort it
+                            # so MERGE_TARGET is left at its pre-merge tip with a clean tree; keep
+                            # the branch (and the brief) for manual resolution.
                             log.error(f"⚠️ Merge conflict on {branch_name} — MANUAL RESOLUTION NEEDED")
+                            log.error(f"   {r.stdout.strip()}")
                             log.error(f"   {r.stderr.strip()}")
+                            unmerged = subprocess.run(
+                                "git diff --name-only --diff-filter=U",
+                                shell=True, capture_output=True, text=True, cwd=str(proj)
+                            ).stdout.split()
+                            a = subprocess.run("git merge --abort", shell=True, capture_output=True,
+                                               text=True, cwd=str(proj))
+                            if a.returncode != 0:
+                                log.error(f"❌ git merge --abort failed on {MERGE_TARGET}: {a.stderr.strip()}")
+                            status = Status.FAILED
+                            gate_error = (f"{MERGE_CONFLICT_VERDICT} — {branch_name} → {MERGE_TARGET} "
+                                          f"({', '.join(unmerged)}); gate was {gate_outcome}")
                 else:
                     log.warning(
                         "⚠️ Toni produced no changes — skipping commit "
@@ -3739,6 +3765,19 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         if verdict.outcome is not GateOutcome.PASS:
             gate_error = verdict.label
             status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
+
+    # [ORCH-CONFLICT-1] the landed invariant: a route-lane `passed` that produced changes has its
+    # tip on MERGE_TARGET and leaves the repo not mid-merge. Acted on, not just logged — this
+    # guards the one line every downstream claim is built on.
+    if (tamper is None and branch_name and worktree is None and status is Status.PASSED
+            and not no_change_run and route_tip is not None):
+        unlanded = check_route_landed_invariants(
+            QueueRepo(ACTIVE_REPO_NAME, proj, MERGE_TARGET, BRANCH_PREFIX), batch_file.name, route_tip)
+        for v in unlanded:
+            log.error(f"⛔ ORCH-CONFLICT-1 invariant: {v}")
+        if unlanded:
+            status = Status.FAILED
+            gate_error = f"ORCH-CONFLICT-1 invariant — {unlanded[0]}; gate was {gate_outcome}"
 
     # [ORCH-10] AC-O10-05: `tampered` in the status field and `TAMPERED` in the gate field —
     # distinct from `passed` and from `FAIL(product)`, and greppable either way.
