@@ -49,11 +49,12 @@ from __future__ import annotations
 
 import argparse
 import re
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 HERE = Path(__file__).resolve().parent
 DOC_SWEEP = HERE / "doc-sweep.sh"
@@ -699,6 +700,83 @@ def check_route_landed_invariants(repo: QueueRepo, brief: str, route_tip: str) -
     return [UnlandedRouteViolation(repo=repo.name, branch=repo.branch_for(brief), merge_target=target,
                                    route_tip=tip, target_tip=target_tip, landed=landed,
                                    mid_merge=mid_merge)]
+
+
+# ── ORCH-STDOUT-1 · the gate-log invariant (S7-CORE-15) ─────────────────────────────────────
+# The queue daemon's third invariant, asserted over what it RECORDED rather than what it fires:
+#
+#     every route in queue-state.json `completed` / `failed` names, under `log_file`, a regular,
+#     readable, non-empty file holding that route's full stdout+stderr
+#
+# Until ORCH-STDOUT-1 the daemon spawned every route into a `subprocess.PIPE` nobody read — a
+# 64 KiB deadlock waiting to happen, and every traceback, print and warning discarded — and the
+# record named no log at all. The second half of the target ("no daemon-fired child writes to a
+# pipe") is a source guard in tests/test_queue_gate_log.py, not a predicate.
+
+@dataclass(frozen=True)
+class GateLogViolation:
+    """One daemon-recorded route whose output is not on disk where its record says."""
+    brief: str               # entry["file"]; "<unnamed>" if the entry has none
+    started_at: str          # entry.get("started_at") or ""
+    exit_code: object        # entry.get("exit_code")
+    log_file: Optional[str]  # entry.get("log_file")
+    reason: str              # no-log-recorded | log-missing | log-not-a-file | log-unreadable | log-empty
+
+    def __str__(self) -> str:
+        where = f" — {self.log_file}" if self.log_file else ""
+        return f"{self.brief} ({self.started_at or '?'}, exit {self.exit_code}): {self.reason}{where}"
+
+
+def _gate_log_reason(log_file: object) -> Optional[str]:
+    """The FIRST reason, in check_gate_log_invariants' order, that applies to `log_file`; None if clean."""
+    if not log_file:
+        return "no-log-recorded"
+    p = Path(str(log_file))
+    try:
+        st = p.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return "log-missing"
+    except OSError:
+        return "log-unreadable"   # e.g. a parent directory that cannot be searched
+    if not stat.S_ISREG(st.st_mode):
+        return "log-not-a-file"
+    try:
+        with open(p, "rb") as f:
+            f.read(1)
+    except OSError:
+        return "log-unreadable"
+    if st.st_size == 0:
+        return "log-empty"
+    return None
+
+
+def check_gate_log_invariants(entries: Iterable[Mapping[str, object]]) -> list[GateLogViolation]:
+    """[ORCH-STDOUT-1] EMPTY WHEN CLEAN. The set is exactly the mappings in `entries`, each
+    judged once — the caller passes one freshly recorded entry, or `completed + failed` as
+    loaded from queue-state.json; nothing is excluded by date, exit code or tray. At most one
+    violation per entry: the FIRST that applies of no-log-recorded (`log_file` absent, None or
+    ""), log-missing, log-not-a-file, log-unreadable (open + read one byte raises OSError),
+    log-empty (st_size == 0).
+
+    UNREADABLE IS A VIOLATION HERE, ON PURPOSE — the opposite of _landed's rule. _landed's
+    violations authorise a retirement, so doubt must not count; this predicate authorises
+    nothing, it reports, and a log that cannot be read is exactly the defect it looks for.
+
+    What this proves and what it does not: the file is THERE (regular, readable, non-empty).
+    That it holds the child's OUTPUT is proved by tests/test_queue_gate_log.py, which drives the
+    real run_loop against a child that writes known markers. Neither substitutes for the other.
+    """
+    out: list[GateLogViolation] = []
+    for e in entries:
+        log_file = e.get("log_file")
+        reason = _gate_log_reason(log_file)
+        if reason is None:
+            continue
+        out.append(GateLogViolation(brief=str(e.get("file") or "<unnamed>"),
+                                    started_at=str(e.get("started_at") or ""),
+                                    exit_code=e.get("exit_code"),
+                                    log_file=log_file if log_file else None, reason=reason))
+    return out
 
 
 # ── verdict building ─────────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ Can also run standalone for testing:
   python3 queue_daemon.py enqueue <f>  # copy batch to queue/
   python3 queue_daemon.py status       # show queue state
   python3 queue_daemon.py check        # boot assert B6: queued briefs whose route already merged
+  python3 queue_daemon.py check-logs   # ORCH-STDOUT-1: recorded routes without a readable log
 """
 
 import os, sys, json, time, shutil, threading, subprocess
@@ -26,13 +27,15 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # QUEUE-RETIRE-1: one implementation of the trunk invariant, shared by the boot path and the
 # tests. It lives with the other boot asserts; nothing here reimplements it.
-from canon_assert import QueueRepo, Violation, check_queue_trunk_invariants, queue_header
+from canon_assert import (GateLogViolation, QueueRepo, Violation, check_gate_log_invariants,
+                          check_queue_trunk_invariants, queue_header)
 
 ORCH_DIR = Path.home() / "spectricom-orchestrator"
 QUEUE_DIR = ORCH_DIR / "queue"
 QUEUE_DONE = QUEUE_DIR / "done"
 QUEUE_FAILED = QUEUE_DIR / "failed"
 QUEUE_STATE = ORCH_DIR / "queue-state.json"
+LOG_DIR = ORCH_DIR / "logs"   # the same root orchestrator.py writes to
 ORCHESTRATOR = ORCH_DIR / "orchestrator.py"
 REPOS_CONFIG = ORCH_DIR / "config" / "repos.yaml"
 
@@ -70,23 +73,50 @@ def _parse_batch_header(path) -> dict:
     return hdr
 
 
+def _repo_config(name: str) -> dict:
+    """The repo's entry in config/repos.yaml, or {} — the one reader of that file here."""
+    try:
+        repos = (yaml.safe_load(REPOS_CONFIG.read_text(encoding="utf-8")) or {}).get("repos") or {}
+    except Exception as e:
+        print(f"[QUEUE] could not read {REPOS_CONFIG}: {e}")
+        return {}
+    return repos.get(name) or {}
+
+
 def repo_route(name: str) -> Optional[QueueRepo]:
     """Resolve a repo name to the (path, merge_target, branch_prefix) the trunk invariant needs.
 
     Read from config/repos.yaml — the one place that knows — so a repo added there needs no
     change here. An unknown name resolves to None and is skipped rather than guessed at.
     """
-    try:
-        repos = (yaml.safe_load(REPOS_CONFIG.read_text(encoding="utf-8")) or {}).get("repos") or {}
-    except Exception as e:
-        print(f"[QUEUE] could not read {REPOS_CONFIG}: {e}")
-        return None
-    r = repos.get(name) or {}
+    r = _repo_config(name)
     if not r.get("project_dir"):
         return None
     return QueueRepo(name=name, path=Path(r["project_dir"]),
                      merge_target=r.get("merge_target", "main"),
                      branch_prefix=r.get("branch_prefix", "orch"))
+
+
+def _log_subdir(repo_name: str) -> str:
+    """The repo's log subdirectory — orchestrator.py's rule, `r.get("log_subdir", name)`."""
+    return _repo_config(repo_name).get("log_subdir", repo_name)
+
+
+def route_log_path(repo_name: str, batch_name: str, when: datetime) -> Path:
+    """ORCH-STDOUT-1: where a daemon-fired route's full stdout+stderr goes —
+    logs/<log_subdir>/orch-<stem>-<ts>.log, beside fire_toni's toni-<stem>-<ts>.log (same
+    directory, stem and timestamp shape; `orch-` says whose output it is).
+
+    The parent is created here. If that fails the path is still returned: the open in
+    _run_route then fails as a spawn error (-2), and the post-route oracle reports the
+    recorded path as log-missing rather than the daemon thread dying on it.
+    """
+    path = LOG_DIR / _log_subdir(repo_name) / f"orch-{Path(batch_name).stem}-{when:%Y%m%d-%H%M%S}.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"[QUEUE] could not create {path.parent}: {e}")
+    return path
 
 
 class QueueDaemon:
@@ -223,12 +253,23 @@ class QueueDaemon:
             if self.current_batch:
                 batch_file = QUEUE_DIR / self.current_batch["file"]
                 _safe_move(batch_file, QUEUE_FAILED / batch_file.name)
+                log_file = self.current_batch.get("log_file")
+                if log_file:
+                    # ORCH-STDOUT-1: the route's own log says why it stopped. Appended, so it
+                    # lands beside whatever _run_route's trailer writes when wait() returns.
+                    try:
+                        with open(log_file, "a", encoding="utf-8") as lf:
+                            lf.write(f"\n{'='*60}\nCancelled: {datetime.now().isoformat()}\n"
+                                     f"Exit: -9 (cancelled by user)\n")
+                    except OSError as e:
+                        print(f"[QUEUE] could not write cancel trailer to {log_file}: {e}")
                 self.failed.append({
                     "file": self.current_batch["file"],
                     "exit_code": -9,
                     "reason": "cancelled by user",
                     "finished_at": datetime.now().isoformat(),
-                    "started_at": self.current_batch.get("started_at")
+                    "started_at": self.current_batch.get("started_at"),
+                    "log_file": log_file,
                 })
                 self.current_batch = None
                 self.current_process = None
@@ -278,6 +319,11 @@ class QueueDaemon:
         for repo in self.queue_repos():
             out.extend(check_queue_trunk_invariants(QUEUE_DIR, repo))
         return out
+
+    def find_missing_gate_logs(self) -> list[GateLogViolation]:
+        """ORCH-STDOUT-1 over the recorded history: every completed/failed entry whose log is
+        not a readable, non-empty file. Empty = clean. Report only — `check-logs` calls this."""
+        return check_gate_log_invariants(self.completed + self.failed)
 
     def retire_merged_briefs(self) -> int:
         """Boot assert B6, automated (QUEUE-RETIRE-1 / T3). Returns the number retired.
@@ -375,28 +421,19 @@ class QueueDaemon:
 
             cmd = (
                 f"cd {ORCH_DIR} && unset ANTHROPIC_API_KEY && "
-                f"python3 orchestrator.py run {next_batch} --approve "
+                f"python3 -u orchestrator.py run {next_batch} --approve "
                 f"--repo {b_repo} --model {b_model} --effort {b_effort}"
             )
             print(f"[QUEUE] repo={b_repo} model={b_model} effort={b_effort}")
 
-            exit_code = -1
-            try:
-                self.current_process = subprocess.Popen(
-                    cmd, shell=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    executable="/bin/bash"
-                )
-                exit_code = self.current_process.wait(
-                    timeout=self.config["timeout_seconds"])
-            except subprocess.TimeoutExpired:
-                print(f"[QUEUE] Timeout ({self.config['timeout_seconds']}s) on {batch_name}. Killing.")
-                self.current_process.kill()
-                self.current_process.wait()
-                exit_code = -1
-            except Exception as e:
-                print(f"[QUEUE] Error on {batch_name}: {e}")
-                exit_code = -2
+            log_path = route_log_path(b_repo, batch_name, start_time)
+            with self.lock:
+                if self.current_batch is not None:
+                    self.current_batch["log_file"] = str(log_path)
+                self._save_state()
+            print(f"[QUEUE] log={log_path}")
+
+            exit_code = self._run_route(cmd, batch_name, log_path)
 
             end_time = datetime.now()
             duration_s = (end_time - start_time).total_seconds()
@@ -407,7 +444,8 @@ class QueueDaemon:
                     "exit_code": exit_code,
                     "duration_s": round(duration_s, 1),
                     "started_at": start_time.isoformat(),
-                    "finished_at": end_time.isoformat()
+                    "finished_at": end_time.isoformat(),
+                    "log_file": str(log_path),
                 }
 
                 if exit_code == 0:
@@ -426,6 +464,10 @@ class QueueDaemon:
                         print(f"[QUEUE] stop_on_failure=true. Pausing queue.")
                         self.status = "paused"
 
+                # ORCH-STDOUT-1 — post-route oracle. Reports; changes no state and no verdict.
+                for v in check_gate_log_invariants([entry]):
+                    print(f"[QUEUE] ⛔ ORCH-STDOUT-1 invariant: {v}")
+
                 self.current_batch = None
                 self.current_process = None
                 self._save_state()
@@ -435,6 +477,50 @@ class QueueDaemon:
                 time.sleep(self.config["cooldown_seconds"])
 
         print("[QUEUE] Daemon stopped.")
+
+    def _run_route(self, cmd: str, batch_name: str, log_path: Path) -> int:
+        """Run one route with its stdout+stderr going to `log_path`; return its exit code.
+
+        ORCH-STDOUT-1. The child gets an open FILE as stdout — fire_toni's shape — never a
+        pipe: a pipe nobody reads deadlocks once the child writes 64 KiB, and a pipe read into
+        memory loses everything if the daemon dies mid-route. With a file there is no buffer to
+        fill, output is on disk as it is produced (`tail -f` works), and a kill leaves a partial
+        log. Appended, not truncated, so cancel_current's trailer and this one both land.
+
+        Exit codes are unchanged: the child's own, -1 on timeout, -2 on any other error
+        (including a log that cannot be opened). A trailer is written on every path it can be.
+        """
+        timeout = self.config["timeout_seconds"]
+        try:
+            lf = open(log_path, "a", encoding="utf-8")
+        except Exception as e:
+            print(f"[QUEUE] Error on {batch_name}: cannot open {log_path}: {e}")
+            return -2
+        with lf:
+            note = ""
+            proc = None
+            try:
+                lf.write(f"=== QUEUE ROUTE ===\nBatch: {batch_name}\n")
+                lf.write(f"Started: {datetime.now().isoformat()}\nCommand: {cmd}\n{'='*60}\n\n")
+                lf.flush()
+                proc = self.current_process = subprocess.Popen(
+                    cmd, shell=True, executable="/bin/bash",
+                    stdout=lf, stderr=subprocess.STDOUT)
+                exit_code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                print(f"[QUEUE] Timeout ({timeout}s) on {batch_name}. Killing.")
+                proc.kill()
+                proc.wait()
+                exit_code, note = -1, f" (timeout after {timeout}s)"
+            except Exception as e:
+                print(f"[QUEUE] Error on {batch_name}: {e}")
+                exit_code, note = -2, f" (error: {e})"
+            try:
+                lf.write(f"\n{'='*60}\nFinished: {datetime.now().isoformat()}\n"
+                         f"Exit: {exit_code}{note}\n")
+            except Exception as e:
+                print(f"[QUEUE] could not write trailer to {log_path}: {e}")
+        return exit_code
 
     def stop(self):
         self.cancel_current()
@@ -470,8 +556,22 @@ if __name__ == "__main__":
                 print(f"FAIL {v}")
             print(f"B6: {len(violations)} queued brief(s) whose route already merged")
             sys.exit(1 if violations else 0)
+        elif cmd == "check-logs":
+            # ORCH-STDOUT-1 over completed + failed, report-only. Deliberately NOT part of
+            # `check`: B6's exit semantics stay B6's. Entries recorded before ORCH-STDOUT-1
+            # have no log_file and report no-log-recorded until they roll out of the lists.
+            violations = d.find_missing_gate_logs()
+            for v in violations:
+                print(f"FAIL {v}")
+            counts = {}
+            for v in violations:
+                counts[v.reason] = counts.get(v.reason, 0) + 1
+            breakdown = ", ".join(f"{n} {r}" for r, n in counts.items())
+            print(f"ORCH-STDOUT-1: {len(violations)} recorded route(s) without a readable log"
+                  + (f" ({breakdown})" if violations else ""))
+            sys.exit(1 if violations else 0)
         else:
-            print(f"Usage: {sys.argv[0]} [enqueue <file> | status | check | clear]")
+            print(f"Usage: {sys.argv[0]} [enqueue <file> | status | check | check-logs | clear]")
             print(f"  Or run without args to start the daemon loop.")
     else:
         d = QueueDaemon()
