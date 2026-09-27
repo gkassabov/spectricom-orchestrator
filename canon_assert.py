@@ -420,6 +420,171 @@ def git_unpushed(repo: Path) -> Optional[int]:
     return None
 
 
+# ── QUEUE-RETIRE-1 · the trunk invariant (S7-CORE-15 · D-S7CORE14-02) ────────────────────
+# B6's other half, the one that is not about canon pointers:
+#
+#     no brief file remains in queue/ whose route has already merged to its repo's merge target
+#
+# It has been a human running two commands at boot. RESOLVER-1 shows what one missed run costs:
+# merged 21 Sep as f1359634, the brief stayed in queue/ for five days, and the 26 Sep restart
+# re-fired an already-merged route. Shipped here as a PREDICATE — empty list when clean — so the
+# boot path and the tests read the same implementation and nobody writes a second copy.
+#
+# Disk and git only, like every other verdict in this file. It reports; it never moves a file,
+# writes a ref or imports the fire path. The caller retires.
+#
+# EVIDENCE IS ALWAYS BRANCH-NAMED, never "the brief file is on the merge target". Briefs are
+# committed to their repo BEFORE the route fires (`brief(s7core14): RESOLVER-1, MEDS-UI-2` at
+# 8a9b6f46), so file presence is evidence of staging and not of a merge; keying on it would
+# retire work that never ran. Three detectors, all keyed to the route branch
+# `<branch_prefix>-<brief stem>`, strongest first:
+#
+#   1. MERGE COMMIT — a merge commit on the merge target naming the branch in its subject.
+#   2. REFLOG — a `merge <branch>` entry in the merge target's reflog whose commit is still
+#      reachable. The clinical-mp lane merges FAST-FORWARD, so for most routes there is no
+#      merge commit to find at all (`merge orch-mp-40-…: Fast-forward`) and this is the only
+#      record left once the branch is deleted.
+#   3. BRANCH REF — the branch still exists and is an ancestor of the merge target. The
+#      meta-fire `--ff-only` lane never deletes it, and RESOLVER-1's own branch tip IS
+#      f1359634 — this is the detector that catches the incident that caused this brief.
+#
+# The asymmetry is deliberate and is the whole safety argument: a MISSED violation leaves B6 to
+# the human for one brief; a WRONG one retires work that never ran. Detector 3 cannot tell a
+# merged fast-forward from a branch created and never committed to, so it is tried last and is
+# named in the violation it produces. Retirement moves a brief to queue/done/ — recoverable,
+# never deleted.
+
+
+@dataclass(frozen=True)
+class QueueRepo:
+    """The four facts about a repo that decide whether a brief's route has landed.
+
+    Resolved by the caller from its own config (the daemon reads config/repos.yaml); this
+    module stays free of the fire path's configuration.
+    """
+    name: str
+    path: Path
+    merge_target: str = "main"
+    branch_prefix: str = "orch"
+
+    def branch_for(self, brief: str) -> str:
+        """`39-resolver-1-….md` → `orch-mp-39-resolver-1-…` — the route branch the orchestrator
+        creates from the batch file's stem."""
+        return f"{self.branch_prefix}-{Path(brief).stem}"
+
+
+@dataclass(frozen=True)
+class Violation:
+    """One brief that is still queued although its route is already on the merge target."""
+    brief: str            # filename, as it sits in queue/
+    path: Path            # where it sits — the caller should not have to re-join
+    repo: str
+    branch: str
+    commit: str           # the merge commit that already carries it
+    subject: str          # that commit's subject line, for the human
+    evidence: str         # which detector fired, in words
+
+    def __str__(self) -> str:
+        return (f"{self.brief}: route {self.branch} is already on {self.repo}/"
+                f"{self.commit[:8]} [{self.evidence}] {self.subject}").strip()
+
+
+def _git_rc(repo: Path, *args: str) -> int:
+    """Exit code only — for the git commands whose answer IS the exit code (`--is-ancestor`)."""
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True).returncode
+
+
+def _is_ancestor(repo: Path, rev: str, of: str) -> bool:
+    return _git_rc(repo, "merge-base", "--is-ancestor", rev, of) == 0
+
+
+def _subject(repo: Path, sha: str) -> str:
+    return git(repo, "log", "-1", "--format=%s", sha) or ""
+
+
+def _landed(repo: QueueRepo, branch: str) -> Optional[tuple[str, str, str]]:
+    """(commit, subject, evidence) if `branch` is already on repo's merge target, else None.
+
+    Nothing readable (no repo, no .git, no merge target) ⇒ None: unreadable is never a
+    violation, because a violation authorises a retirement.
+    """
+    target = repo.merge_target
+    if git(repo.path, "rev-parse", "--verify", "--quiet", target) is None:
+        return None
+
+    # 1 · a merge commit that names the branch. `git merge X` writes `Merge branch 'X'`.
+    merges = git(repo.path, "log", target, "--merges", "-n", "500", "--format=%H\x1f%s") or ""
+    for line in merges.splitlines():
+        sha, _, subject = line.partition("\x1f")
+        if f"'{branch}'" in subject:
+            return sha, subject, "merge commit"
+
+    # 2 · the merge target's reflog. A fast-forward merge leaves no commit of its own, only
+    #     `merge <branch>: Fast-forward` here. Reachability is re-checked: a reflog entry
+    #     survives a reset, and a reset-away merge has not landed.
+    reflog = git(repo.path, "reflog", "show", "--format=%H\x1f%gs", target) or ""
+    for line in reflog.splitlines():
+        sha, _, msg = line.partition("\x1f")
+        if msg.startswith(f"merge {branch}:") and _is_ancestor(repo.path, sha, target):
+            return sha, _subject(repo.path, sha), "reflog merge into " + target
+
+    # 3 · the branch ref itself, still there and wholly contained in the merge target. Last,
+    #     because it is the one detector that cannot distinguish a merged fast-forward from a
+    #     branch that was created and never committed to.
+    tip = git(repo.path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if tip and _is_ancestor(repo.path, tip, target):
+        return tip, _subject(repo.path, tip), f"branch ref merged into {target}"
+
+    return None
+
+
+def queue_header(path: Path) -> dict[str, str]:
+    """`#!queue model=… effort=… repo=…` on line 1 → {key: value}; no header ⇒ {}.
+
+    The queue's own one-line dialect, parsed in ONE place — the scheduler reads it to decide
+    how to fire a brief, the trunk invariant reads it to decide which repo the brief belongs
+    to, and they must never disagree about what it says.
+    """
+    try:
+        first = Path(path).read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, IndexError, UnicodeDecodeError):
+        return {}
+    if not first.startswith("#!queue"):
+        return {}
+    return dict(tok.split("=", 1) for tok in first.split()[1:] if "=" in tok)
+
+
+def check_queue_trunk_invariants(queue_dir: Path, repo: QueueRepo) -> list[Violation]:
+    """Briefs still in `queue_dir` whose route has already merged to `repo`'s merge target.
+
+    EMPTY WHEN CLEAN. That is the acceptance oracle for QUEUE-RETIRE-1 and the automated form
+    of boot assert B6.
+
+    Scans the TOP LEVEL of queue_dir only: `done/`, `failed/` and `held/` are the scheduler's
+    own trays and a brief parked there is not queued. A queue holds briefs for several repos,
+    each brief naming its own (`#!queue repo=…`): a brief that names a DIFFERENT repo is
+    skipped rather than looked for here, so two repos that happen to share a branch prefix
+    cannot answer for each other's routes. A brief naming none is taken as this repo's — the
+    same default the scheduler applies when it fires one. Call once per repo the queue names.
+    """
+    queue_dir = Path(queue_dir)
+    if not queue_dir.is_dir():
+        return []
+    out: list[Violation] = []
+    for brief in sorted(p for p in queue_dir.glob("*.md") if p.is_file()):
+        declared = queue_header(brief).get("repo")
+        if declared and declared != repo.name:
+            continue
+        branch = repo.branch_for(brief.name)
+        landed = _landed(repo, branch)
+        if landed is None:
+            continue
+        sha, subject, evidence = landed
+        out.append(Violation(brief=brief.name, path=brief, repo=repo.name, branch=branch,
+                             commit=sha, subject=subject, evidence=evidence))
+    return out
+
+
 # ── verdict building ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Verdict:

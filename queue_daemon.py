@@ -13,11 +13,20 @@ Can also run standalone for testing:
   python3 queue_daemon.py              # run daemon
   python3 queue_daemon.py enqueue <f>  # copy batch to queue/
   python3 queue_daemon.py status       # show queue state
+  python3 queue_daemon.py check        # boot assert B6: queued briefs whose route already merged
 """
 
 import os, sys, json, time, shutil, threading, subprocess
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
+
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# QUEUE-RETIRE-1: one implementation of the trunk invariant, shared by the boot path and the
+# tests. It lives with the other boot asserts; nothing here reimplements it.
+from canon_assert import QueueRepo, Violation, check_queue_trunk_invariants, queue_header
 
 ORCH_DIR = Path.home() / "spectricom-orchestrator"
 QUEUE_DIR = ORCH_DIR / "queue"
@@ -25,6 +34,59 @@ QUEUE_DONE = QUEUE_DIR / "done"
 QUEUE_FAILED = QUEUE_DIR / "failed"
 QUEUE_STATE = ORCH_DIR / "queue-state.json"
 ORCHESTRATOR = ORCH_DIR / "orchestrator.py"
+REPOS_CONFIG = ORCH_DIR / "config" / "repos.yaml"
+
+
+def _safe_move(src, dst) -> bool:
+    """Move a queue file; a source that is already gone is a NO-OP, not an exception.
+
+    QUEUE-RETIRE-1 / T2. File retirement now belongs to the process that merged
+    (orchestrator.retire_batch_file), so by the time the scheduler reaches its own move the
+    brief is normally already in queue/done/. That is the expected state, not an error. These
+    moves remain as the path for everything the merge never reached — a failed route, a
+    cancel, a timeout, a repo whose merge never happened.
+
+    STATE BOOKKEEPING STAYS THE SCHEDULER'S: the completed/failed entry is recorded by the
+    caller either way. Only the file move became someone else's job.
+    """
+    src, dst = Path(src), Path(dst)
+    try:
+        if not src.exists():
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        return True
+    except Exception as e:
+        print(f"[QUEUE] could not move {src.name} → {dst.parent.name}/: {e}")
+        return False
+
+
+def _parse_batch_header(path) -> dict:
+    """The batch's `#!queue` header, through the one parser (canon_assert.queue_header), plus
+    the scheduler's own warning for the case that is news to it: a batch file it cannot read."""
+    hdr = queue_header(path)
+    if not hdr and not os.access(str(path), os.R_OK):
+        print(f"[QUEUE] could not read header of {Path(path).name}")
+    return hdr
+
+
+def repo_route(name: str) -> Optional[QueueRepo]:
+    """Resolve a repo name to the (path, merge_target, branch_prefix) the trunk invariant needs.
+
+    Read from config/repos.yaml — the one place that knows — so a repo added there needs no
+    change here. An unknown name resolves to None and is skipped rather than guessed at.
+    """
+    try:
+        repos = (yaml.safe_load(REPOS_CONFIG.read_text(encoding="utf-8")) or {}).get("repos") or {}
+    except Exception as e:
+        print(f"[QUEUE] could not read {REPOS_CONFIG}: {e}")
+        return None
+    r = repos.get(name) or {}
+    if not r.get("project_dir"):
+        return None
+    return QueueRepo(name=name, path=Path(r["project_dir"]),
+                     merge_target=r.get("merge_target", "main"),
+                     branch_prefix=r.get("branch_prefix", "orch"))
 
 
 class QueueDaemon:
@@ -160,8 +222,7 @@ class QueueDaemon:
                     self.current_process.kill()
             if self.current_batch:
                 batch_file = QUEUE_DIR / self.current_batch["file"]
-                if batch_file.exists():
-                    shutil.move(str(batch_file), str(QUEUE_FAILED / batch_file.name))
+                _safe_move(batch_file, QUEUE_FAILED / batch_file.name)
                 self.failed.append({
                     "file": self.current_batch["file"],
                     "exit_code": -9,
@@ -202,9 +263,50 @@ class QueueDaemon:
                 return {"ok": True, "config": self.config}
         return {"ok": False, "error": f"Unknown config key: {key}"}
 
+    def queue_repos(self) -> list[QueueRepo]:
+        """The repos this queue's briefs actually name — `#!queue repo=…`, plus the configured
+        default for the briefs that name nothing. A queue is multi-repo; the trunk invariant is
+        per repo, so it is asked once per repo rather than once per brief."""
+        names = {self.config["repo"]}
+        for f in self._scan_queue():
+            names.add(_parse_batch_header(f).get("repo") or self.config["repo"])
+        return [r for r in (repo_route(n) for n in sorted(names)) if r is not None]
+
+    def find_merged_briefs(self) -> list[Violation]:
+        """Every queued brief whose route is already on its repo's merge target. Empty = clean."""
+        out = []
+        for repo in self.queue_repos():
+            out.extend(check_queue_trunk_invariants(QUEUE_DIR, repo))
+        return out
+
+    def retire_merged_briefs(self) -> int:
+        """Boot assert B6, automated (QUEUE-RETIRE-1 / T3). Returns the number retired.
+
+        This is the RECOVERY half. T1 makes the merging process retire its own brief, which is
+        what closes the RESOLVER-1 window; a kill *inside* that window — or any brief that
+        merged before this change shipped — still leaves an already-merged route's brief in
+        queue/, and that is a state the merge itself could not have finished. Only a check
+        against git can clear it, and it runs before the first batch so a restart cannot
+        re-fire a merged route.
+
+        IDEMPOTENT: the brief is moved to queue/done/, which the predicate does not scan, so a
+        second start finds nothing. It moves, never deletes — a wrong retirement is recoverable
+        from queue/done/ and this says which brief and which commit, every time.
+        """
+        retired = 0
+        for v in self.find_merged_briefs():
+            if _safe_move(v.path, QUEUE_DONE / v.brief):
+                retired += 1
+                print(f"[QUEUE] retired (route already merged): {v}")
+        if retired:
+            print(f"[QUEUE] {retired} already-merged brief(s) retired before the first batch (B6)")
+        return retired
+
     def run_loop(self):
         """Main daemon loop. Call from a background thread."""
         self._ensure_dirs()
+        # QUEUE-RETIRE-1 / T3 — B6 before the first batch, never after it.
+        self.retire_merged_briefs()
         self.started_at = datetime.now().isoformat()
         self.status = "running"
         self._save_state()
@@ -266,23 +368,10 @@ class QueueDaemon:
             #   #!queue model=claude-sonnet-4-5 effort=high repo=clinical-mp
             # so a mechanical cleanup route can run Sonnet while RM increments run
             # Fable, without restarting the daemon (George, 2026-09-16).
-            b_model, b_effort, b_repo = (
-                self.config["model"], self.config["effort"], self.config["repo"])
-            try:
-                first = next_batch.read_text(encoding="utf-8").splitlines()[0]
-                if first.startswith("#!queue"):
-                    for tok in first.split()[1:]:
-                        if "=" not in tok:
-                            continue
-                        k, v = tok.split("=", 1)
-                        if k == "model":
-                            b_model = v
-                        elif k == "effort":
-                            b_effort = v
-                        elif k == "repo":
-                            b_repo = v
-            except Exception as e:
-                print(f"[QUEUE] could not read header of {batch_name}: {e}")
+            hdr = _parse_batch_header(next_batch)
+            b_model = hdr.get("model", self.config["model"])
+            b_effort = hdr.get("effort", self.config["effort"])
+            b_repo = hdr.get("repo", self.config["repo"])
 
             cmd = (
                 f"cd {ORCH_DIR} && unset ANTHROPIC_API_KEY && "
@@ -322,12 +411,15 @@ class QueueDaemon:
                 }
 
                 if exit_code == 0:
-                    shutil.move(str(next_batch), str(QUEUE_DONE / batch_name))
+                    # Normally already retired by the merge itself (QUEUE-RETIRE-1 / T1) —
+                    # a no-op here, and that is the healthy case. The entry is recorded
+                    # regardless: state bookkeeping is still the scheduler's.
+                    _safe_move(next_batch, QUEUE_DONE / batch_name)
                     self.completed.append(entry)
                     self.consecutive_count += 1
                     print(f"[QUEUE] PASSED: {batch_name} ({duration_s:.0f}s)")
                 else:
-                    shutil.move(str(next_batch), str(QUEUE_FAILED / batch_name))
+                    _safe_move(next_batch, QUEUE_FAILED / batch_name)
                     self.failed.append(entry)
                     print(f"[QUEUE] FAILED: {batch_name} (exit {exit_code}, {duration_s:.0f}s)")
                     if self.config["stop_on_failure"]:
@@ -370,8 +462,16 @@ if __name__ == "__main__":
         elif cmd == "clear":
             r = d.clear_queue()
             print(json.dumps(r, indent=2))
+        elif cmd == "check":
+            # Boot assert B6 as a command — the two commands a human used to run by hand,
+            # report-only. The daemon retires on start; this one never moves anything.
+            violations = d.find_merged_briefs()
+            for v in violations:
+                print(f"FAIL {v}")
+            print(f"B6: {len(violations)} queued brief(s) whose route already merged")
+            sys.exit(1 if violations else 0)
         else:
-            print(f"Usage: {sys.argv[0]} [enqueue <file> | status | clear]")
+            print(f"Usage: {sys.argv[0]} [enqueue <file> | status | check | clear]")
             print(f"  Or run without args to start the daemon loop.")
     else:
         d = QueueDaemon()

@@ -74,6 +74,10 @@ LOG_DIR = ORCH_DIR / "logs"
 STATE_FILE = ORCH_DIR / "state.json"
 RUNNING_FILE = ORCH_DIR / "running.json"
 REPOS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "repos.yaml"
+# QUEUE-RETIRE-1: the queue the daemon feeds this process from. Retirement happens here, in
+# the process that merges — see retire_batch_file.
+QUEUE_DIR = ORCH_DIR / "queue"
+QUEUE_DONE = QUEUE_DIR / "done"
 
 # Per-repo state — populated by set_active_repo() at module load (defaults to yorsie).
 # A3 will re-call set_active_repo() after CLI / brief-header parsing to switch repos pre-fire.
@@ -1377,7 +1381,44 @@ def merge_branch(br: str) -> bool:
     log.error(f"Merge conflict on {br} — MANUAL RESOLUTION NEEDED"); return False
 
 
-def _self_mod_auto_merge(orch_dir: Path, branch_name: str, gate_outcome: Optional[str] = None) -> bool:
+def retire_batch_file(batch_file: Path) -> Optional[Path]:
+    """Retire a QUEUED batch file to queue/done/ — part of the merge's own completion.
+
+    D-S7CORE14-02: the process that merges is the only process that knows the merge happened.
+    Until QUEUE-RETIRE-1 the scheduler owned this half of the transaction and did it only after
+    `self.current_process.wait()` returned (queue_daemon.py:325). Everything between the merge
+    inside this process and that line was an unguarded window, and a kill in it left an
+    already-merged brief queued: RESOLVER-1 merged as f1359634 on 21 Sep, sat in queue/ for five
+    days, and was re-fired on the 26th. Widening the window was never the fix; moving the
+    retirement to the side that knows is.
+
+    BOUNDED — and the bound is the point. Only a batch file whose parent IS queue/ moves. A
+    batch passed by path from anywhere else (the DATE-7 shape,
+    `orchestrator.py run ~/spectricom-clinical-mp/briefs/41-….md --repo clinical-mp`) is never
+    touched and this returns None: that invocation behaves byte-identically to before.
+    queue/done/, queue/failed/ and queue/held/ are the scheduler's trays, not the queue, so a
+    file already parked in one of them is not queued and does not move either.
+
+    Never raises. A failed retirement must not turn a good merge into a failed route.
+    """
+    try:
+        src = Path(batch_file)
+        if not src.is_file():
+            return None
+        if src.resolve().parent != QUEUE_DIR.resolve():
+            return None            # not queued — the path lane, untouched
+        QUEUE_DONE.mkdir(parents=True, exist_ok=True)
+        dst = QUEUE_DONE / src.name
+        src.replace(dst)           # same filesystem by construction — atomic rename
+        log.info(f"🗃️  Retired {src.name} → queue/done/ (the merge retires its own brief)")
+        return dst
+    except Exception as e:
+        log.warning(f"⚠️ Could not retire batch file {batch_file}: {e}")
+        return None
+
+
+def _self_mod_auto_merge(orch_dir: Path, branch_name: str, gate_outcome: Optional[str] = None,
+                         batch_file: Optional[Path] = None) -> bool:
     """Auto-merge meta-fire branch to main after successful self-mod fire.
 
     Returns True if merge succeeded (or no commits to merge), False on failure.
@@ -1389,6 +1430,11 @@ def _self_mod_auto_merge(orch_dir: Path, branch_name: str, gate_outcome: Optiona
     gate_outcome; anything but PASS is refused here and the branch preserved.
     gate_outcome=None means the caller made no gate claim (tests / manual use) and is
     honoured as-is — the production path always passes the verdict.
+
+    QUEUE-RETIRE-1: batch_file is the brief this route came from. A REAL merge retires it
+    before returning success (retire_batch_file — a no-op unless it is sitting in queue/).
+    The `no commits to bring in` path deliberately does NOT retire: nothing merged there, so
+    the trunk invariant has nothing to say and the scheduler's bookkeeping still owns it.
     """
     if gate_outcome is not None and gate_outcome != GateOutcome.PASS.value:
         log.error(
@@ -1415,6 +1461,8 @@ def _self_mod_auto_merge(orch_dir: Path, branch_name: str, gate_outcome: Optiona
     )
     if r.returncode == 0:
         log.info(f"✅ Self-mod auto-merge: brought {count} commits to main")
+        if batch_file is not None:
+            retire_batch_file(batch_file)
         return True
     else:
         log.warning(
@@ -3174,7 +3222,8 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
             if is_self_mod and meta_branch:
                 if result is not None and result.exit_code == 0 and result.status == Status.PASSED:
                     # [ORCH-1] gate verdict was rendered in _run_batch_inner on the worktree checkout
-                    merged = _self_mod_auto_merge(ORCH_DIR, meta_branch, gate_outcome=result.gate_outcome)
+                    merged = _self_mod_auto_merge(ORCH_DIR, meta_branch, gate_outcome=result.gate_outcome,
+                                                  batch_file=batch_file)
                     if merged:
                         cleanup_worktree(meta_wt)
                 elif result is not None and result.gate_outcome not in (None, GateOutcome.PASS.value):
@@ -3399,6 +3448,12 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                                 status = Status.FAILED
                             else:
                                 log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET} ({pre_merge_tip[:7]} → {post_merge_tip[:7]})")
+                                # QUEUE-RETIRE-1 / D-S7CORE14-02: retire the originating brief
+                                # HERE, as part of the merge's own completion — first thing
+                                # after the merge is known good, before the branch is deleted
+                                # and long before this process returns to the scheduler. No-op
+                                # unless the batch file is sitting in queue/.
+                                retire_batch_file(batch_file)
                                 # Clean up feature branch
                                 subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
                         else:
