@@ -1882,3 +1882,147 @@ class TestTheUnitSuiteRunsTheSuiteTheRepoRuns:
         with self._declaring_env_file(src):
             links = orchestrator._link_unit_deps(src, dst)
         assert {p.name for p in links} == {"node_modules", ".env"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-15 [ORCH-TALLY-1] — an expected fail is a tally, and the reconciliation counts it.
+#
+# vitest 4.1.4 prints a FIFTH named tally on the `Tests` line when a `test.fails(...)` fails
+# as expected — `failed | passed | expected fail | skipped | todo (total)` — and EXCLUDES it
+# from `passed` (getStateString). clinical-mp has carried one since fe6d97c5 (2026-09-15,
+# finalize-encounter.test.ts:353). [ORCH-8]'s grammar knew failed/skipped/todo only, so every
+# clinical-mp route since then logged, on BOTH legs (logs/orch-20260926-182746.log:35):
+#   TALLY MISMATCH on …: 4 failed + 8754 passed + 8 skipped + 4 todo = 8770, but the runner states 8771
+# A warning that fires on every correct run trains its reader to ignore the next real one.
+# Quieter, same gap: a run with no `failed` segment DERIVED the expected fail as 1 failure,
+# which kept [ORCH-5]'s green fast path unreachable for clinical-mp.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# The DATE-7 `Tests` line exactly as vitest printed it. The `Test Files` line is NOT observed:
+# the log records 870 files (orch-20260926-182746.log:30) and the unit log two failing files,
+# so the 2 / 868 split is inferred, and the Duration is illustrative. Nothing asserts on either.
+CMP_EXPECTED_FAIL_TESTS_LINE = \
+    "      Tests  4 failed | 8754 passed | 1 expected fail | 8 skipped | 4 todo (8771)"
+CMP_EXPECTED_FAIL = (" Test Files  2 failed | 868 passed (870)\n"
+                     + CMP_EXPECTED_FAIL_TESTS_LINE + "\n   Duration  216.90s\n")
+# The same repo with nothing genuinely failing: no `failed` segment, so the count is derived.
+CMP_EXPECTED_FAIL_GREEN_LINE = "      Tests  8758 passed | 1 expected fail | 8 skipped | 4 todo (8771)"
+CMP_EXPECTED_FAIL_GREEN = (" Test Files  870 passed (870)\n"
+                           + CMP_EXPECTED_FAIL_GREEN_LINE + "\n   Duration  210.00s\n")
+# One more test than the five tallies account for — an unrelated off-by-one the new term must
+# NOT absorb.
+CMP_EXPECTED_FAIL_OFF_BY_ONE = \
+    "      Tests  4 failed | 8754 passed | 1 expected fail | 8 skipped | 4 todo (8772)\n"
+# A genuine [ORCH-9]-kind mismatch on a run that also carries an expected fail.
+CMP_EXPECTED_FAIL_SHORT = (" Test Files  2 failed | 868 passed (870)\n"
+                           "      Tests  4 failed | 8740 passed | 1 expected fail | 8 skipped | 4 todo (8771)\n"
+                           "   Duration  216.90s\n")
+ORCH_TALLY1_BASE = "23ab07f"
+
+
+class TestAnExpectedFailIsAParsedTally:
+    """AC-T1-01 / AC-T1-06 — the fifth segment is read, and its absence stays None."""
+
+    def test_ac_t1_01_the_date7_line_parses_all_five_tallies(self):
+        c = orchestrator._parse_unit_summary(CMP_EXPECTED_FAIL)
+        assert (c["failures"], c["failures_source"]) == (4, "reported")
+        assert c["tests_expected_fail"] == 1
+        assert (c["tests_skipped"], c["tests_todo"], c["tests_total"]) == (8, 4, 8771)
+
+    @pytest.mark.parametrize("raw", [VITEST_ZERO, PYTEST_RED, PYTEST_GREEN,
+                                     CMP_FIXTURE, CMP_GREEN, CMP_SHORT],
+                             ids=["VITEST_ZERO", "PYTEST_RED", "PYTEST_GREEN",
+                                  "CMP_FIXTURE", "CMP_GREEN", "CMP_SHORT"])
+    def test_ac_t1_06_absent_is_none_not_zero(self, raw):
+        assert orchestrator._parse_unit_summary(raw)["tests_expected_fail"] is None
+
+
+class TestTheDate7RunReconciles:
+    """AC-T1-02 / AC-T1-05 / AC-T1-07 — a correct run with an expected fail is silent."""
+
+    def test_ac_t1_02_both_legs_reconcile_and_nothing_warns(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="orch"):
+            o, entries = run_gate(repo, tmp_path, branch_out=CMP_EXPECTED_FAIL,
+                                  baseline_out=CMP_EXPECTED_FAIL)
+        assert o.branch.tally_sum == o.baseline.tally_sum == 8771, "4 + 8754 + 1 + 8 + 4"
+        assert o.tally_note is None
+        assert "TALLY MISMATCH" not in (o.detail or "") and "TALLY MISMATCH" not in caplog.text
+        assert entries[-1]["branch"]["tally_agrees"] is True
+        assert entries[-1]["branch"]["tests_expected_fail"] == 1
+
+    def test_ac_t1_05_the_log_line_carries_it_in_vitests_order(self, repo, tmp_path):
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_EXPECTED_FAIL, baseline_out=CMP_EXPECTED_FAIL)
+        assert "4 failed, 8754 passed, 1 expected fail, 8 skipped, 4 todo" in o.branch.collection
+        plain = orchestrator.UnitSuiteRun(ref="route", exit_code=1,
+                                          **orchestrator._parse_unit_summary(CMP_FIXTURE))
+        assert "expected fail" not in plain.collection, "absent ⇒ omitted, never `0 expected fail`"
+
+    def test_ac_t1_07_the_cache_does_not_launder_it_back(self, repo, tmp_path):
+        archive = tmp_path / "archive"
+        for _ in range(2):
+            with active(archive=archive), patch.object(
+                    orchestrator, "_run_unit_suite", fake_suite(CMP_EXPECTED_FAIL, CMP_EXPECTED_FAIL)):
+                o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.baseline_source == "cache"
+        assert o.baseline.tests_expected_fail == 1
+        assert "TALLY MISMATCH" not in (o.detail or "")
+
+
+class TestAnExpectedFailIsNotAFailure:
+    """AC-T1-03 — the fallback derivation subtracts it, so a green run is green."""
+
+    def test_ac_t1_03_a_green_run_derives_zero_and_takes_the_fast_path(self, repo, tmp_path):
+        r = orchestrator.UnitSuiteRun(ref="route", exit_code=0,
+                                      **orchestrator._parse_unit_summary(CMP_EXPECTED_FAIL_GREEN_LINE))
+        assert (r.failures, r.failures_source) == (0, "derived")
+        assert r.tally_note is None
+        seen = []
+        o, _ = run_gate(repo, tmp_path, branch_out=CMP_EXPECTED_FAIL_GREEN, seen=seen)
+        assert o.baseline_source == "not-needed"
+        assert baseline_runs(seen) == [], "an expected fail is not a failure — no baseline leg"
+
+
+class TestAGenuineMismatchStillWarns:
+    """AC-T1-04 / AC-T1-08 — the new term closes the one known gap and nothing else."""
+
+    def test_ac_t1_04_a_real_mismatch_warns_and_names_the_expected_fail(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="orch"):
+            o, _ = run_gate(repo, tmp_path, branch_out=CMP_EXPECTED_FAIL_SHORT,
+                            baseline_out=CMP_EXPECTED_FAIL)
+        assert o.branch.tally_sum == 8757
+        assert "4 failed + 8740 passed + 1 expected fail + 8 skipped + 4 todo = 8757" in o.detail
+        assert "but the runner states 8771" in o.detail
+        assert "TALLY MISMATCH on route" in caplog.text
+        assert "TALLY MISMATCH on merge-base" not in o.detail
+
+    @pytest.mark.parametrize("raw", [CMP_EXPECTED_FAIL_OFF_BY_ONE, CMP_SHORT],
+                             ids=["expected-fail-off-by-one", "CMP_SHORT"])
+    def test_ac_t1_08_the_fix_does_not_silence_the_check(self, raw):
+        r = orchestrator.UnitSuiteRun(ref="route", exit_code=1, **orchestrator._parse_unit_summary(raw))
+        assert r.tally_note is not None and "TALLY MISMATCH on route" in r.tally_note
+
+
+def _def_body(src: str, name: str) -> str:
+    """A top-level function's source, from its `def` line to the next top-level statement."""
+    lines = src.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(f"def {name}("))
+    end = next((j for j in range(start + 1, len(lines)) if lines[j] and not lines[j][0].isspace()),
+               len(lines))
+    return "\n".join(lines[start:end]).rstrip()
+
+
+class TestOrchTally1ChangedNoGateOrSitSemantics:
+    """AC-T1-09 — a reporting fix: the SIT gate and the unit gate's decisions are untouched."""
+
+    @pytest.mark.parametrize("name", ["_sit_tests_failed", "_run_sit_batched",
+                                      "run_sit_post_merge", "run_unit_gate"])
+    def test_ac_t1_09_the_function_is_byte_identical_to_the_base(self, name):
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "show", f"{ORCH_TALLY1_BASE}:orchestrator.py"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip(f"{ORCH_TALLY1_BASE} is not reachable in this clone")
+        now = (REPO_ROOT / "orchestrator.py").read_text()
+        assert _def_body(now, name) == _def_body(r.stdout, name), f"{name} moved — out of scope"
+
+    def test_ac_t1_09_the_cache_version_and_fast_path_switch_are_unchanged(self):
+        assert orchestrator.UNIT_BASELINE_CACHE_VERSION == 1
+        assert orchestrator.UNIT_GATE_SKIP_BASELINE_WHEN_GREEN is True

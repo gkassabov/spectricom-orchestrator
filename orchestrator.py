@@ -1661,8 +1661,12 @@ _VITEST_NO_FILES_RE = re.compile(r"^\s*No test files found", re.MULTILINE)
 _VITEST_FAILED_RE = re.compile(r"(\d+) failed\b")
 _VITEST_SKIPPED_RE = re.compile(r"(\d+) skipped\b")
 _VITEST_TODO_RE = re.compile(r"(\d+) todo\b")
-_VITEST_TALLY_RES = {"failed": _VITEST_FAILED_RE, "skipped": _VITEST_SKIPPED_RE,
-                     "todo": _VITEST_TODO_RE}
+# S7-CORE-15 [ORCH-TALLY-1]: and a FIFTH — a `test.fails(...)` that failed as expected, which
+# vitest (4.1.4, getStateString) prints between `passed` and `skipped` and EXCLUDES from
+# `passed`. `failed\b` never matches `1 expected fail`, so it was silently dropped.
+_VITEST_EXPECTED_FAIL_RE = re.compile(r"(\d+) expected fail\b")
+_VITEST_TALLY_RES = {"failed": _VITEST_FAILED_RE, "expected_fail": _VITEST_EXPECTED_FAIL_RE,
+                     "skipped": _VITEST_SKIPPED_RE, "todo": _VITEST_TODO_RE}
 
 
 def _parse_vitest_summary(raw: str) -> dict:
@@ -1686,13 +1690,14 @@ def _parse_vitest_summary(raw: str) -> dict:
 
 
 def _parse_vitest_tallies(raw: str) -> dict:
-    """[ORCH-8] The NAMED tallies on vitest's `Tests` line: failed / skipped / todo.
+    """[ORCH-8] The NAMED tallies on vitest's `Tests` line: failed / expected fail / skipped /
+    todo ([ORCH-TALLY-1] added the second).
 
     Kept separate from _parse_vitest_summary so [ORCH-2]'s four-key contract — which the SIT
     gate and its tests depend on — is untouched. A segment the summary does not carry is
     None, not 0: `Tests  7288 passed (7288)` states nothing about failures, and the caller
     (not this parser) decides what to make of that absence (§2.4)."""
-    out = {"failed": None, "skipped": None, "todo": None}
+    out = {"failed": None, "expected_fail": None, "skipped": None, "todo": None}
     text = _ANSI_RE.sub("", raw or "")
     for m in _VITEST_SUMMARY_RE["tests"].finditer(text):  # last match wins, as above
         seg = m.group(1)
@@ -2131,6 +2136,9 @@ class UnitSuiteRun:
     # segment, which is NOT the same as zero and is rendered as an omission, never as a 0.
     tests_skipped: Optional[int] = None
     tests_todo: Optional[int] = None
+    # [ORCH-TALLY-1] vitest's `N expected fail` (a `test.fails` that failed as expected). Same
+    # discipline: None ⇒ no such segment (and always None on pytest), never rendered as 0.
+    tests_expected_fail: Optional[int] = None
     # [ORCH-8] AC-O8-03: "reported" ⇒ the runner stated the failure count and we read it;
     # "derived" ⇒ there was no `failed` segment and it came from the fallback subtraction.
     # A reader of the log must never have to guess which of the two produced the number.
@@ -2158,21 +2166,23 @@ class UnitSuiteRun:
             s += f", {self.failures} failed"
             if self.failures_source == "derived":
                 s += " (derived)"
-        for n, label in ((self.tests_passed, "passed"), (self.tests_skipped, "skipped"),
-                         (self.tests_todo, "todo")):
+        for n, label in ((self.tests_passed, "passed"), (self.tests_expected_fail, "expected fail"),
+                         (self.tests_skipped, "skipped"), (self.tests_todo, "todo")):
             if n is not None:
                 s += f", {n} {label}"
         return s
 
     @property
     def tally_sum(self) -> Optional[int]:
-        """[ORCH-9] failed + passed + skipped + todo, over the tallies THIS run carries. A
+        """[ORCH-9] failed + passed + expected fail + skipped + todo, over the tallies THIS
+        run carries ([ORCH-TALLY-1] added expected fail — vitest counts it in its total). A
         tally the runner did not state contributes 0 — it was not counted anywhere else
         either. None when there is nothing to add up, or no stated total to check it
         against: an UNKNOWN is not a disagreement (§2.4)."""
         if self.tests_total is None or self.failures is None or self.tests_passed is None:
             return None
-        return self.failures + self.tests_passed + (self.tests_skipped or 0) + (self.tests_todo or 0)
+        return (self.failures + self.tests_passed + (self.tests_expected_fail or 0)
+                + (self.tests_skipped or 0) + (self.tests_todo or 0))
 
     @property
     def tally_note(self) -> Optional[str]:
@@ -2188,7 +2198,8 @@ class UnitSuiteRun:
         if s is None or s == self.tests_total:
             return None
         parts = [f"{self.failures} failed", f"{self.tests_passed} passed"]
-        for n, label in ((self.tests_skipped, "skipped"), (self.tests_todo, "todo")):
+        for n, label in ((self.tests_expected_fail, "expected fail"), (self.tests_skipped, "skipped"),
+                         (self.tests_todo, "todo")):
             if n is not None:
                 parts.append(f"{n} {label}")
         return (f"TALLY MISMATCH on {self.ref}: {' + '.join(parts)} = {s}, but the runner "
@@ -2280,7 +2291,8 @@ def _parse_unit_summary(raw: str) -> dict:
     text = _ANSI_RE.sub("", raw or "")
     out = {"runner": None, "test_files_total": None, "tests_total": None,
            "tests_passed": None, "failures": None, "tests_skipped": None,
-           "tests_todo": None, "failures_source": None, "failing_files": ()}
+           "tests_todo": None, "tests_expected_fail": None, "failures_source": None,
+           "failing_files": ()}
 
     v = _parse_vitest_summary(text)
     if v["tests_total"] is not None or v["test_files_total"] is not None:
@@ -2295,11 +2307,13 @@ def _parse_unit_summary(raw: str) -> dict:
         t = _parse_vitest_tallies(text)
         out["tests_skipped"] = t["skipped"]
         out["tests_todo"] = t["todo"]
+        out["tests_expected_fail"] = t["expected_fail"]  # [ORCH-TALLY-1]
         if t["failed"] is not None:
             out["failures"] = t["failed"]
             out["failures_source"] = "reported"
         elif v["tests_total"] is not None and v["tests_passed"] is not None:
-            out["failures"] = max(0, v["tests_total"] - v["tests_passed"]
+            # [ORCH-TALLY-1] an expected fail is not a failure either.
+            out["failures"] = max(0, v["tests_total"] - v["tests_passed"] - (t["expected_fail"] or 0)
                                   - (t["skipped"] or 0) - (t["todo"] or 0))
             out["failures_source"] = "derived"
         files = {_norm_test_path(m) for m in _UNIT_VITEST_FAIL_RE.findall(text)}
@@ -2620,6 +2634,7 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         # does. Entries written before this existed simply lack these keys and read as None.
         "tests_skipped": run.tests_skipped, "tests_todo": run.tests_todo,
         "failures_source": run.failures_source,
+        "tests_expected_fail": run.tests_expected_fail,   # [ORCH-TALLY-1], additive the same way
     }
     try:
         _unit_cache_file(archive).write_text(
@@ -2724,6 +2739,7 @@ def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
                         test_files_total=e.get("test_files_total"), tests_total=e.get("tests_total"),
                         tests_passed=e.get("tests_passed"), failures=e.get("failures"),
                         tests_skipped=e.get("tests_skipped"), tests_todo=e.get("tests_todo"),
+                        tests_expected_fail=e.get("tests_expected_fail"),
                         failures_source=e.get("failures_source"),
                         failing_files=tuple(e.get("failing_files") or ()))
 
@@ -3048,6 +3064,7 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
                 "tests_total": r.tests_total, "tests_passed": r.tests_passed,
                 "failures": r.failures, "tests_skipped": r.tests_skipped,   # [ORCH-8]
                 "tests_todo": r.tests_todo, "failures_source": r.failures_source,
+                "tests_expected_fail": r.tests_expected_fail,           # [ORCH-TALLY-1]
                 # [ORCH-9] AC-O9-03: the agreement check, persisted — a later reader can tell
                 # whether this entry's number reconciled without re-deriving it.
                 "tally_sum": r.tally_sum, "tally_agrees": r.tally_note is None,
