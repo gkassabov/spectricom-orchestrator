@@ -30,6 +30,9 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
+# ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
+# shared with the tests; canon_assert imports nothing from here.
+from canon_assert import QueueRepo, check_branch_freshness_invariants
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
 PREFIRE_BYPASS = False
@@ -3185,22 +3188,36 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         meta_wt = Path(f"/tmp/orch-fire-{ts}")
         meta_branch = f"{BRANCH_PREFIX}-{batch_file.stem}"
+        stale_err = None
         try:
             if meta_wt.exists():
                 subprocess.run(f"cd {PROJECT_ROOT} && git worktree remove {meta_wt} --force",
                     shell=True, capture_output=True)
-            r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} -b {meta_branch}",
-                shell=True, capture_output=True, text=True)
-            if r.returncode != 0:
-                r = subprocess.run(f"cd {PROJECT_ROOT} && git worktree add {meta_wt} {meta_branch}",
+            # ORCH-STALEBASE-1: never adopt an existing route branch — retire it, cut fresh
+            # from the merge target (the self-mod merge is --ff-only and needs that base).
+            try:
+                retire_stale_branch(PROJECT_ROOT, meta_branch, MERGE_TARGET)
+            except Exception as e:
+                stale_err = str(e)
+            if stale_err is None:
+                r = subprocess.run(
+                    f"cd {PROJECT_ROOT} && git worktree add {meta_wt} -b {meta_branch} {MERGE_TARGET}",
                     shell=True, capture_output=True, text=True)
-            if r.returncode == 0:
-                log.info(f"Meta-fire worktree: {meta_wt} (branch: {meta_branch})")
-                worktree = meta_wt
-            else:
-                log.error(f"Meta-fire worktree failed: {r.stderr}")
+                if r.returncode == 0:
+                    log.info(f"Meta-fire worktree: {meta_wt} (branch: {meta_branch})")
+                    worktree = meta_wt
+                    v = check_branch_freshness_invariants(
+                        QueueRepo(ACTIVE_REPO_NAME, PROJECT_ROOT, MERGE_TARGET, BRANCH_PREFIX),
+                        [batch_file.name])
+                    if v:
+                        stale_err = str(v[0])
+                        cleanup_worktree(meta_wt)
+                else:
+                    log.error(f"Meta-fire worktree failed: {r.stderr}")
         except Exception as e:
             log.error(f"Meta-fire worktree error: {e}")
+        if stale_err is not None:
+            return _stale_base_result(batch_file, datetime.now(), 0, stale_err)
 
     proj = worktree or PROJECT_ROOT
     started = datetime.now()
@@ -3257,30 +3274,48 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     log.info(f"timeout={timeout_min}min source={timeout_src}")
 
     # Auto branch creation (D-148) — skip if using worktrees
+    # ORCH-STALEBASE-1: an existing route branch is never adopted. It is retired (renamed) and
+    # the route branch is cut afresh, explicitly from MERGE_TARGET, then the freshness
+    # predicate is asserted BEFORE capture_handoff — a violation does not fire Toni.
     branch_name = None
     if worktree is None:
         branch_name = f"{BRANCH_PREFIX}-{batch_file.stem}"
+        stale_err = None
+        retired = None
         try:
-            r = subprocess.run(
-                f"git checkout -b {branch_name}",
-                shell=True, capture_output=True, text=True, cwd=str(proj)
-            )
-            if r.returncode == 0:
-                log.info(f"🌿 Branch: {branch_name}")
-            else:
-                # Branch may already exist — try switching to it
-                r2 = subprocess.run(
-                    f"git checkout {branch_name}",
+            retired = retire_stale_branch(proj, branch_name, MERGE_TARGET)
+        except Exception as e:
+            stale_err = str(e)
+        if stale_err is None:
+            try:
+                r = subprocess.run(
+                    f"git checkout -b {branch_name} {MERGE_TARGET}",
                     shell=True, capture_output=True, text=True, cwd=str(proj)
                 )
-                if r2.returncode == 0:
-                    log.info(f"🌿 Switched to existing branch: {branch_name}")
+                if r.returncode == 0:
+                    tip = _git_read(f"git rev-parse {MERGE_TARGET}", proj)
+                    log.info(f"🌿 Branch: {branch_name} (from {MERGE_TARGET} @ {tip[:7]})")
+                    v = check_branch_freshness_invariants(
+                        QueueRepo(ACTIVE_REPO_NAME, proj, MERGE_TARGET, BRANCH_PREFIX),
+                        [batch_file.name])
+                    if v:
+                        stale_err = str(v[0])
+                        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True,
+                                       capture_output=True, cwd=str(proj))
+                elif retired is not None:
+                    stale_err = (f"could not cut {branch_name} from {MERGE_TARGET} after retiring "
+                                 f"{retired}: {r.stderr.strip()}")
                 else:
-                    log.warning(f"⚠️ Could not create/switch branch: {r.stderr.strip()}. Running on current branch.")
+                    log.warning(f"⚠️ Could not create branch: {r.stderr.strip()}. Running on current branch.")
                     branch_name = None
-        except Exception as e:
-            log.warning(f"⚠️ Branch creation failed: {e}. Running on current branch.")
-            branch_name = None
+            except Exception as e:
+                if retired is not None:
+                    stale_err = f"could not cut {branch_name} after retiring {retired}: {e}"
+                else:
+                    log.warning(f"⚠️ Branch creation failed: {e}. Running on current branch.")
+                    branch_name = None
+        if stale_err is not None:
+            return _stale_base_result(batch_file, started, len(briefs), stale_err)
 
     mig_before = get_migrations()
     # [ORCH-10] S1: record the route's expected state at the hand-off point — the branch
@@ -3747,6 +3782,44 @@ def _is_branch_merged(repo_path: Path, branch: str, target: str = "main") -> boo
         shell=True, capture_output=True, cwd=str(repo_path),
     )
     return r.returncode == 0
+
+
+def retire_stale_branch(proj: Path, branch_name: str, merge_target: str) -> Optional[str]:
+    """If refs/heads/<branch_name> exists, rename it to
+    <branch_name>--stale-<YYYYmmdd-HHMMSS> (git branch -m) and return the new name.
+    Returns None when the branch does not exist (nothing to retire).
+    Raises RuntimeError when the branch exists and the rename fails — the caller must
+    NOT fall through to running on the stale branch.
+
+    ORCH-STALEBASE-1. Rename, never delete: the previous attempt's commits are evidence a
+    human may want. A second retirement inside the same second gets a `-2`, `-3`, … suffix
+    rather than failing. A brief stem never contains `--stale-`, so a retired name is never
+    `QueueRepo.branch_for(any brief)` and stays out of check_branch_freshness_invariants.
+    """
+    if not _git_read(f"git rev-parse --verify --quiet refs/heads/{branch_name}", proj):
+        return None
+    behind = _git_read(f"git rev-list --count {branch_name}..{merge_target}", proj)
+    base = f"{branch_name}--stale-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    new_name, n = base, 2
+    while _git_read(f"git rev-parse --verify --quiet refs/heads/{new_name}", proj):
+        new_name, n = f"{base}-{n}", n + 1
+    r = subprocess.run(f"git branch -m {branch_name} {new_name}",
+                       shell=True, capture_output=True, text=True, cwd=str(proj))
+    if r.returncode != 0:
+        raise RuntimeError(f"could not retire {branch_name} → {new_name}: {r.stderr.strip()}")
+    where = f"at {merge_target} tip" if behind == "0" else f"was {behind or '?'} behind {merge_target}"
+    log.info(f"♻️  Retired stale branch {branch_name} → {new_name} ({where})")
+    return new_name
+
+
+def _stale_base_result(batch_file: Path, started: datetime, briefs: int, err: str) -> Result:
+    """ORCH-STALEBASE-1: the route was not fired — its branch could not be made fresh."""
+    log.error(f"⛔ STALE-BASE — {err} — not firing.")
+    now = datetime.now()
+    return Result(batch_file=batch_file.name, status=Status.FAILED,
+                  started=started.isoformat(), finished=now.isoformat(),
+                  duration_s=(now - started).total_seconds(),
+                  exit_code=2, briefs=briefs, error=f"stale-base: {err}")
 
 
 def list_branches(repo_path: Path, pattern: str = "orch-*") -> list:

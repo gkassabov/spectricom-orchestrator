@@ -585,6 +585,69 @@ def check_queue_trunk_invariants(queue_dir: Path, repo: QueueRepo) -> list[Viola
     return out
 
 
+# ── ORCH-STALEBASE-1 · the branch-side invariant (S7-CORE-15 · BUG-S7CORE14-ORCH-STALEBASE-01) ──
+# The trunk invariant above asks "has this route already landed?". This one asks the question
+# before the route runs at all:
+#
+#     a route branch contains its merge target's current tip
+#
+# L-UI-SAFETY-1 (clinical-mp) is what its absence costs: attempt 1 went red and its branch was
+# preserved on purpose; main moved 7 commits; attempt 2 `git checkout -b` failed on the existing
+# name and the orchestrator switched to the old branch. The gate measured against a base main no
+# longer looked like, said PASS, and the merge conflicted. The orchestrator asserts this at the
+# moment of action, right after it cuts the branch and before it hands off to the executor.
+#
+# The set is QUANTIFIED by the caller: exactly `repo.branch_for(b)` for the briefs it names,
+# never "every orch-* head". A retired `<branch>--stale-<ts>` is not `branch_for` of any brief
+# (a brief stem never contains `--stale-`), so it is never in the set.
+
+
+@dataclass(frozen=True)
+class StaleBaseViolation:
+    """A route branch whose base is behind the merge target's current tip."""
+    repo: str
+    branch: str
+    merge_target: str
+    target_tip: str          # sha the merge target is at now
+    branch_tip: str          # sha the branch is at now
+    merge_base: str          # git merge-base <target> <branch>
+    behind: int              # git rev-list --count <branch>..<target>  (>0 by construction)
+
+    def __str__(self) -> str:
+        return (f"{self.branch} is {self.behind} commit(s) behind {self.merge_target} "
+                f"({self.target_tip[:8]}): cut at {self.merge_base[:8]}, tip {self.branch_tip[:8]}")
+
+
+def check_branch_freshness_invariants(repo: QueueRepo, briefs: Iterable[str]) -> list[StaleBaseViolation]:
+    """For each brief name in `briefs`, the route branch `repo.branch_for(brief)`, IF it
+    exists as refs/heads/<branch>, must contain the merge target's current tip:
+    `git merge-base --is-ancestor <merge_target> <branch>` must succeed.
+    EMPTY WHEN CLEAN. A branch that does not exist is not a violation (nothing to be
+    stale). An unreadable repo / missing merge target ⇒ [] (unreadable is never a
+    violation — same rule as _landed). Retired branches are never in the set:
+    they are not `branch_for(any brief)`.
+    """
+    target = repo.merge_target
+    target_tip = git(repo.path, "rev-parse", "--verify", "--quiet", target)
+    if target_tip is None:
+        return []
+    out: list[StaleBaseViolation] = []
+    for brief in briefs:
+        branch = repo.branch_for(brief)
+        branch_tip = git(repo.path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+        if branch_tip is None or _is_ancestor(repo.path, target_tip, branch_tip):
+            continue
+        behind = git(repo.path, "rev-list", "--count", f"{branch_tip}..{target_tip}")
+        if behind is None or not behind.isdigit():
+            continue  # unreadable is never a violation
+        # Unrelated histories have no merge base; the branch is still not cut from the target.
+        merge_base = git(repo.path, "merge-base", target_tip, branch_tip) or ""
+        out.append(StaleBaseViolation(repo=repo.name, branch=branch, merge_target=target,
+                                      target_tip=target_tip, branch_tip=branch_tip,
+                                      merge_base=merge_base, behind=int(behind)))
+    return out
+
+
 # ── verdict building ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Verdict:
