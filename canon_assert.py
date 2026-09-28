@@ -912,6 +912,75 @@ def check_handback_invariants(log_file: Path, rules: Sequence[OutstandingWorkRul
     return sorted(out, key=lambda v: v.line_no)
 
 
+# ── TONI-BG-CEILING-1 · the executor wait ceiling (S7-CORE-15) ─────────────────────────────
+# The prevention half of [TONI-BACKGROUND-EXIT]. The `claude` CLI stops waiting on the executor's
+# background work at CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (600 s when unset), kills it and exits
+# 0 — and until TONI-BG-CEILING-1 no fire ever set it. For every fire f through an executor spawn
+# site (a process-spawning call whose command runs `claude`), with T_f the route timeout in
+# seconds that the site hands to proc.wait and env_f the mapping it passes as `env=`:
+#
+#     T_f is an int (not a bool) and T_f > 0
+#     ∧ env_f is not None                        (explicit, never implicit inheritance)
+#     ∧ V ∈ env_f ∧ env_f[V] matches ^[0-9]+$
+#     ∧ 0 < int(env_f[V]) < 1000 · T_f           (positive — 0 waits forever — and below the route)
+#
+# A wait must never be able to outlive the route that owns it. The source-guard half — the set of
+# executor spawn sites in the orchestrator is exactly fire_toni's Popen, and it passes `env=` —
+# lives in tests/test_bg_ceiling.py, not here.
+
+BG_WAIT_CEILING_VAR = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"
+
+
+@dataclass(frozen=True)
+class BgCeilingViolation:
+    """One executor spawn whose environment does not bound the CLI's background wait."""
+    site: str                # e.g. "orchestrator.fire_toni"
+    route_timeout_s: object  # T_f as handed in, unvalidated
+    value: Optional[str]     # env.get(V); None when env is None or V is absent
+    reason: str              # route-timeout-invalid | env-not-explicit | ceiling-absent |
+                             # ceiling-not-an-integer | ceiling-not-positive |
+                             # ceiling-not-below-route-timeout
+
+    def __str__(self) -> str:
+        return f"{self.site} (route timeout {self.route_timeout_s!r}s, {BG_WAIT_CEILING_VAR}={self.value!r}): {self.reason}"
+
+
+def check_bg_ceiling_invariants(site: str, env: Optional[Mapping[str, str]],
+                                route_timeout_s: object) -> list[BgCeilingViolation]:
+    """[TONI-BG-CEILING-1] EMPTY WHEN CLEAN. The set is ONE spawn at ONE executor spawn site:
+    `env` is the mapping the site passes as `env=` and `route_timeout_s` the timeout it hands to
+    proc.wait. At most one violation — the FIRST that applies, in this order:
+
+      1. route-timeout-invalid            — not an int, a bool, or <= 0 (no valid ceiling exists);
+      2. env-not-explicit                 — env is None: the child would inherit implicitly, and
+                                            the predicate will not vouch for an environment the
+                                            site did not construct;
+      3. ceiling-absent                   — V not in env;
+      4. ceiling-not-an-integer           — env[V] does not fullmatch [0-9]+ (" 5", "+5", "5.0", "");
+      5. ceiling-not-positive             — int(env[V]) == 0 ("0", "000": 0 means wait forever);
+      6. ceiling-not-below-route-timeout  — int(env[V]) >= 1000 * route_timeout_s.
+    """
+    value = None if env is None else env.get(BG_WAIT_CEILING_VAR)
+
+    def _v(reason: str) -> list[BgCeilingViolation]:
+        return [BgCeilingViolation(site=site, route_timeout_s=route_timeout_s, value=value, reason=reason)]
+
+    if not isinstance(route_timeout_s, int) or isinstance(route_timeout_s, bool) or route_timeout_s <= 0:
+        return _v("route-timeout-invalid")
+    if env is None:
+        return _v("env-not-explicit")
+    if value is None:
+        return _v("ceiling-absent")
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+        return _v("ceiling-not-an-integer")
+    ms = int(value)
+    if ms <= 0:
+        return _v("ceiling-not-positive")
+    if ms >= 1000 * route_timeout_s:
+        return _v("ceiling-not-below-route-timeout")
+    return []
+
+
 # ── verdict building ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Verdict:

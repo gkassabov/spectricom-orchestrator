@@ -26,14 +26,16 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Optional
+from typing import Mapping, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
 # ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
 # shared with the tests; canon_assert imports nothing from here.
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
-from canon_assert import (QueueRepo, check_branch_freshness_invariants, check_handback_invariants,
+# TONI-BG-CEILING-1: the executor wait-ceiling invariant, asserted at fire_toni's spawn.
+from canon_assert import (BG_WAIT_CEILING_VAR, QueueRepo, check_bg_ceiling_invariants,
+                          check_branch_freshness_invariants, check_handback_invariants,
                           check_route_landed_invariants, load_outstanding_work_rules)
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
@@ -193,6 +195,7 @@ def parse_repo_from_brief(filepath) -> Optional[str]:
 TIMEOUT_DEFAULT_MIN = 45
 TIMEOUT_HARD_CAP_MIN = 180
 TONI_TIMEOUT = int(os.environ.get("TONI_TIMEOUT_MIN", str(TIMEOUT_DEFAULT_MIN))) * 60
+BG_WAIT_MARGIN_S = 300  # TONI-BG-CEILING-1 §2.2: CLI bg-wait ceiling = route timeout − this (>=25 m wait on a 30 m route)
 
 # Executor model/effort (D-S7CORE3-05, S7-CORE-4 [MODEL-1]).
 # Precedence: CLI --model/--effort > env TONI_MODEL/TONI_EFFORT > default.
@@ -801,7 +804,25 @@ def get_migrations() -> set:
 # ═══════════════════════════════════════════════════════
 # TONI EXECUTOR
 # ═══════════════════════════════════════════════════════
+def bg_wait_ceiling_ms(route_timeout_s: int) -> int:
+    """[TONI-BG-CEILING-1] The CLI's background-wait ceiling for a route of `route_timeout_s`:
+    BG_WAIT_MARGIN_S below the route, or half of it for tiny (<= 600 s) env-override routes."""
+    if route_timeout_s > 2 * BG_WAIT_MARGIN_S:
+        return (route_timeout_s - BG_WAIT_MARGIN_S) * 1000
+    return route_timeout_s * 1000 // 2
+
+
+def toni_child_env(route_timeout_s: int, base: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """[TONI-BG-CEILING-1] The executor's explicit environment: a copy of `base` (os.environ, read
+    now, when None) with BG_WAIT_CEILING_VAR OVERRIDDEN — an inherited value, 0 included, never
+    survives. Mutates neither `base` nor os.environ."""
+    env = dict(os.environ if base is None else base)
+    env[BG_WAIT_CEILING_VAR] = str(bg_wait_ceiling_ms(route_timeout_s))
+    return env
+
+
 def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
+    route_timeout_s = TONI_TIMEOUT  # TONI-BG-CEILING-1: read once — the wait bound and the ceiling cannot diverge
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_subdir = ensure_log_subdir(LOG_SUBDIR)
     out_log = log_subdir / f"toni-{batch_file.stem}-{ts}.log"
@@ -826,22 +847,30 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         pass
     log.info(f"Firing Toni: {batch_file.name}")
     log.info(f"  Project: {project}")
-    log.info(f"  Timeout: {TONI_TIMEOUT // 60}m")
+    log.info(f"  Timeout: {route_timeout_s // 60}m")
+    env = toni_child_env(route_timeout_s)
+    v = check_bg_ceiling_invariants("orchestrator.fire_toni", env, route_timeout_s)
+    if v:
+        log.error(f"⛔ Toni NOT fired — bg-wait ceiling: {v[0]}")
+        return -2, str(out_log)
+    ceiling_ms = env[BG_WAIT_CEILING_VAR]
+    log.info(f"  BG wait ceiling: {ceiling_ms}ms ({BG_WAIT_CEILING_VAR}; route timeout {route_timeout_s}s, margin {BG_WAIT_MARGIN_S}s)")
     log.info(f"  Log: {out_log}")
     try:
         with open(out_log, "w") as lf:
             lf.write(f"=== TONI EXECUTION ===\nBatch: {batch_file.name}\n")
-            lf.write(f"Started: {datetime.now().isoformat()}\nCommand: {cmd}\n{'='*60}\n\n")
+            lf.write(f"Started: {datetime.now().isoformat()}\nCommand: {cmd}\n")
+            lf.write(f"BgWaitCeilingMs: {ceiling_ms} (route timeout {route_timeout_s}s, margin {BG_WAIT_MARGIN_S}s)\n{'='*60}\n\n")
             lf.flush()
             proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash",
                 stdout=lf, stderr=subprocess.STDOUT, cwd=str(project),
-                preexec_fn=os.setsid)
-            ec = proc.wait(timeout=TONI_TIMEOUT)
+                preexec_fn=os.setsid, env=env)
+            ec = proc.wait(timeout=route_timeout_s)
             lf.write(f"\n{'='*60}\nFinished: {datetime.now().isoformat()}\nExit: {ec}\n")
         log.info(f"Toni finished: exit {ec}")
         return ec, str(out_log)
     except subprocess.TimeoutExpired:
-        log.error(f"Toni TIMEOUT after {TONI_TIMEOUT//60}m")
+        log.error(f"Toni TIMEOUT after {route_timeout_s//60}m")
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         time.sleep(3)
         try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
