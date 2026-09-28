@@ -966,19 +966,97 @@ def check_bg_ceiling_invariants(site: str, env: Optional[Mapping[str, str]],
     def _v(reason: str) -> list[BgCeilingViolation]:
         return [BgCeilingViolation(site=site, route_timeout_s=route_timeout_s, value=value, reason=reason)]
 
-    if not isinstance(route_timeout_s, int) or isinstance(route_timeout_s, bool) or route_timeout_s <= 0:
+    if not _route_timeout_valid(route_timeout_s):
         return _v("route-timeout-invalid")
     if env is None:
         return _v("env-not-explicit")
+    why = _ms_bound_reason(value, route_timeout_s)
+    return _v(f"ceiling-{why}") if why else []
+
+
+def _route_timeout_valid(route_timeout_s: object) -> bool:
+    """T_f is an int (not a bool) and T_f > 0."""
+    return isinstance(route_timeout_s, int) and not isinstance(route_timeout_s, bool) and route_timeout_s > 0
+
+
+def _ms_bound_reason(value: object, route_timeout_s: int) -> Optional[str]:
+    """The ONE rule for a millisecond bound handed to the executor, shared by both predicates in this
+    section: the first of absent / not-an-integer (not fullmatch [0-9]+) / not-positive (0 waits
+    forever) / not-below-route-timeout (>= 1000 · T) that applies to `value`; None when it holds."""
     if value is None:
-        return _v("ceiling-absent")
+        return "absent"
     if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
-        return _v("ceiling-not-an-integer")
+        return "not-an-integer"
     ms = int(value)
     if ms <= 0:
-        return _v("ceiling-not-positive")
+        return "not-positive"
     if ms >= 1000 * route_timeout_s:
-        return _v("ceiling-not-below-route-timeout")
+        return "not-below-route-timeout"
+    return None
+
+
+# ── ORCH-FOREGROUND-1 · no background the executor would lose (S7-CORE-16) ──────────────────
+# The second door of [TONI-BACKGROUND-EXIT]. Route 60's probe and this route's T0 probe (CLI
+# 2.1.283) found that a command the executor backgrounds is killed when its turn ends, and that no
+# follow-up turn arrives. T0 also found DISABLE_BG_TASKS_VAR honoured: with it set to "1" the Bash
+# tool is not offered `run_in_background` and runs the command in the foreground. For every fire f
+# through an executor spawn site, with T_f and env_f as in TONI-BG-CEILING-1:
+#
+#     T_f valid ∧ env_f is not None
+#     ∧ env_f[DISABLE_BG_TASKS_VAR] == "1"
+#     ∧ ∀ V ∈ FOREGROUND_BOUND_VARS: env_f[V] matches ^[0-9]+$ ∧ 0 < int(env_f[V]) < 1000 · T_f
+#
+# so a foreground command may run long, but never longer than the route that owns it.
+
+DISABLE_BG_TASKS_VAR = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
+BASH_DEFAULT_TIMEOUT_VAR = "BASH_DEFAULT_TIMEOUT_MS"   # the Bash tool's timeout when none is asked for
+BASH_MAX_TIMEOUT_VAR = "BASH_MAX_TIMEOUT_MS"           # the most a single Bash call may ask for
+FOREGROUND_BOUND_VARS = (BG_WAIT_CEILING_VAR, BASH_DEFAULT_TIMEOUT_VAR, BASH_MAX_TIMEOUT_VAR)
+
+
+@dataclass(frozen=True)
+class ForegroundViolation:
+    """One executor spawn whose environment offers a background, or a wait longer than its route."""
+    site: str
+    route_timeout_s: object
+    var: Optional[str]       # the variable the reason is about; None for the first two reasons
+    value: Optional[str]     # env.get(var)
+    reason: str              # route-timeout-invalid | env-not-explicit | background-not-disabled |
+                             # bound-absent | bound-not-an-integer | bound-not-positive |
+                             # bound-not-below-route-timeout
+
+    def __str__(self) -> str:
+        where = f", {self.var}={self.value!r}" if self.var else ""
+        return f"{self.site} (route timeout {self.route_timeout_s!r}s{where}): {self.reason}"
+
+
+def check_foreground_invariants(site: str, env: Optional[Mapping[str, str]],
+                                route_timeout_s: object) -> list[ForegroundViolation]:
+    """[ORCH-FOREGROUND-1] EMPTY WHEN CLEAN. ONE spawn at ONE executor spawn site, as in
+    check_bg_ceiling_invariants. At most one violation — the FIRST that applies, in this order:
+
+      1. route-timeout-invalid    — not an int, a bool, or <= 0;
+      2. env-not-explicit         — env is None;
+      3. background-not-disabled  — env[DISABLE_BG_TASKS_VAR] != "1" (absent, "0", "true": only "1");
+      4. bound-<reason>           — for each V in FOREGROUND_BOUND_VARS, in that order, the first V
+                                    whose value fails _ms_bound_reason (absent, not-an-integer,
+                                    not-positive, not-below-route-timeout).
+    """
+    def _v(reason: str, var: Optional[str] = None) -> list[ForegroundViolation]:
+        value = None if env is None or var is None else env.get(var)
+        return [ForegroundViolation(site=site, route_timeout_s=route_timeout_s, var=var, value=value,
+                                    reason=reason)]
+
+    if not _route_timeout_valid(route_timeout_s):
+        return _v("route-timeout-invalid")
+    if env is None:
+        return _v("env-not-explicit")
+    if env.get(DISABLE_BG_TASKS_VAR) != "1":
+        return _v("background-not-disabled", DISABLE_BG_TASKS_VAR)
+    for var in FOREGROUND_BOUND_VARS:
+        why = _ms_bound_reason(env.get(var), route_timeout_s)
+        if why:
+            return _v(f"bound-{why}", var)
     return []
 
 

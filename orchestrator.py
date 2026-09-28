@@ -35,10 +35,13 @@ import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
 # TONI-BG-CEILING-1: the executor wait-ceiling invariant, asserted at fire_toni's spawn.
 # GATE-CLOCK-1: the clock-plausibility predicate, asserted at the end of every gate leg.
-from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, ClockViolation, LegClocks,
-                          QueueRepo, check_bg_ceiling_invariants, check_branch_freshness_invariants,
-                          check_clock_plausibility, check_handback_invariants,
-                          check_route_landed_invariants, load_outstanding_work_rules)
+# ORCH-FOREGROUND-1: the executor's foreground-only environment, asserted beside the ceiling.
+from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, DISABLE_BG_TASKS_VAR,
+                          FOREGROUND_BOUND_VARS, ClockViolation, LegClocks, QueueRepo,
+                          check_bg_ceiling_invariants, check_branch_freshness_invariants,
+                          check_clock_plausibility, check_foreground_invariants,
+                          check_handback_invariants, check_route_landed_invariants,
+                          load_outstanding_work_rules)
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
 PREFIRE_BYPASS = False
@@ -825,10 +828,27 @@ def bg_wait_ceiling_ms(route_timeout_s: int) -> int:
 def toni_child_env(route_timeout_s: int, base: Optional[Mapping[str, str]] = None) -> dict[str, str]:
     """[TONI-BG-CEILING-1] The executor's explicit environment: a copy of `base` (os.environ, read
     now, when None) with BG_WAIT_CEILING_VAR OVERRIDDEN — an inherited value, 0 included, never
-    survives. Mutates neither `base` nor os.environ."""
+    survives. Mutates neither `base` nor os.environ.
+    [ORCH-FOREGROUND-1] Likewise overridden: DISABLE_BG_TASKS_VAR = "1" (no background to lose),
+    and the Bash tool's default and maximum timeouts — ONE bound for all of FOREGROUND_BOUND_VARS,
+    bg_wait_ceiling_ms(T): a foreground command may run long, never past the route."""
     env = dict(os.environ if base is None else base)
-    env[BG_WAIT_CEILING_VAR] = str(bg_wait_ceiling_ms(route_timeout_s))
+    bound = str(bg_wait_ceiling_ms(route_timeout_s))
+    for var in FOREGROUND_BOUND_VARS:
+        env[var] = bound
+    env[DISABLE_BG_TASKS_VAR] = "1"
     return env
+
+
+def _toni_trailer(out_log: Path, exit_note: str):
+    """[ORCH-TIMEOUT-HOLD-1] the trailer fire_toni's normal path writes, for the paths that never reach
+    it: `Finished:` and `Exit: <code> (<why>)`, appended — so handback-scan, the guard's
+    _executor_output and a human all see where the executor stopped and why."""
+    try:
+        with open(out_log, "a") as lf:
+            lf.write(f"\n{'='*60}\nFinished: {datetime.now().isoformat()}\nExit: {exit_note}\n")
+    except OSError as e:
+        log.error(f"Toni log trailer not written ({out_log}): {e}")
 
 
 def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
@@ -845,7 +865,9 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         f"stdbuf -oL "
         f"claude --dangerously-skip-permissions "
         f"--model {TONI_MODEL} --effort {TONI_EFFORT} "
-        f'"Read {brief_rel} and execute all briefs in order."'
+        f'"Read {brief_rel} and execute all briefs in order. Run every command in the foreground and '
+        f'wait for it to finish; never use run_in_background — background tasks are killed when your '
+        f'turn ends and no follow-up turn will come."'
     )
     # Update running.json with log file path
     try:
@@ -864,16 +886,23 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         log.error(f"⛔ Toni NOT fired — bg-wait ceiling: {v[0]}")
         log.error(f"🛡 bg-wait-ceiling: BLOCKED — {v[0].reason}; not fired")
         return -2, str(out_log)
+    fv = check_foreground_invariants("orchestrator.fire_toni", env, route_timeout_s)
+    if fv:
+        log.error(f"⛔ Toni NOT fired — foreground: {fv[0]}")
+        log.error(f"🛡 bg-wait-ceiling: BLOCKED — {fv[0].reason} ({fv[0].var}); not fired")
+        return -2, str(out_log)
     ceiling_ms = env[BG_WAIT_CEILING_VAR]
+    foreground = f"{DISABLE_BG_TASKS_VAR}=1, " + ", ".join(f"{k}={env[k]}" for k in FOREGROUND_BOUND_VARS[1:])
     log.info(f"🛡 bg-wait-ceiling: CLEAN — {BG_WAIT_CEILING_VAR}={ceiling_ms} < {1000 * route_timeout_s} "
-             f"(route timeout {route_timeout_s}s)")
+             f"(route timeout {route_timeout_s}s); foreground: {foreground}")
     log.info(f"  BG wait ceiling: {ceiling_ms}ms ({BG_WAIT_CEILING_VAR}; route timeout {route_timeout_s}s, margin {BG_WAIT_MARGIN_S}s)")
     log.info(f"  Log: {out_log}")
     try:
         with open(out_log, "w") as lf:
             lf.write(f"=== TONI EXECUTION ===\nBatch: {batch_file.name}\n")
             lf.write(f"Started: {datetime.now().isoformat()}\nCommand: {cmd}\n")
-            lf.write(f"BgWaitCeilingMs: {ceiling_ms} (route timeout {route_timeout_s}s, margin {BG_WAIT_MARGIN_S}s)\n{'='*60}\n\n")
+            lf.write(f"BgWaitCeilingMs: {ceiling_ms} (route timeout {route_timeout_s}s, margin {BG_WAIT_MARGIN_S}s)\n")
+            lf.write(f"Foreground: {foreground}\n{'='*60}\n\n")
             lf.flush()
             proc = subprocess.Popen(cmd, shell=True, executable="/bin/bash",
                 stdout=lf, stderr=subprocess.STDOUT, cwd=str(project),
@@ -888,9 +917,11 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         time.sleep(3)
         try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError: pass
+        _toni_trailer(out_log, f"-1 (TIMEOUT after {route_timeout_s // 60}m — SIGTERM, SIGKILL)")
         return -1, str(out_log)
     except Exception as e:
         log.error(f"Toni error: {e}")
+        _toni_trailer(out_log, f"-2 ({type(e).__name__}: {e})")
         return -2, str(out_log)
 
 # ═══════════════════════════════════════════════════════
@@ -938,6 +969,11 @@ MERGE_CONFLICT_VERDICT = "MERGE CONFLICT"
 # [ORCH-HANDBACK-GUARD-1] greppable in the FINAL STATUS gate field. Not a GateOutcome: no gate ran.
 # Neither product nor environment — the executor said it had not finished.
 INCOMPLETE_VERDICT = "INCOMPLETE(executor)"
+# [ORCH-TIMEOUT-HOLD-1] likewise Status.INCOMPLETE, not a GateOutcome: the executor did not exit 0 and
+# left work on the tree — fire_toni killed it at the route timeout (-1), or anything else (-2, a
+# signal, a non-zero exit). No gate ran; the work sits on its branch for a person to salvage.
+INCOMPLETE_TIMEOUT_VERDICT = "INCOMPLETE(timeout)"
+INCOMPLETE_EXECUTOR_ERROR_VERDICT = "INCOMPLETE(executor-error)"
 HANDBACK_GUARD_CONFIG = ORCH_DIR / "config" / "handback-guard.json"
 
 
@@ -1095,17 +1131,19 @@ def _log_tamper_outcome(archive: Path, repo_path: Path, report: TamperReport):
 
 def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
                        gate_collection: Optional[str], unit_collection: Optional[str] = None,
-                       tampered: Optional[str] = None, incomplete: Optional[str] = None) -> str:
+                       tampered: Optional[str] = None, incomplete: Optional[str] = None,
+                       incomplete_verdict: str = INCOMPLETE_VERDICT) -> str:
     """[ORCH-2] `PASS (7 files/18 tests, 6.6s)` when the SIT summary parsed; the prior wording
     (`PASS` / verdict label / `not run`) when it did not.
     [ORCH-3] appends ` | unit: <baseline> → <branch>` when the unit baseline gate ran.
     [ORCH-10] a tampered run never ran a gate, and says so in a way that cannot be misread
     as the ordinary ungated `not run`.
-    [ORCH-HANDBACK-GUARD-1] likewise an incomplete route: `incomplete` is "<rule> at line <n>"."""
+    [ORCH-HANDBACK-GUARD-1] likewise an incomplete route: `incomplete` is "<rule> at line <n>".
+    [ORCH-TIMEOUT-HOLD-1] or "exit <ec>", under its own `incomplete_verdict`."""
     if tampered:
         return f"not run ({TAMPER_VERDICT} — route ref moved)"
     if incomplete:
-        return f"not run ({INCOMPLETE_VERDICT} — {incomplete})"
+        return f"not run ({incomplete_verdict} — {incomplete})"
     s = gate_error or gate_outcome or "not run"
     if gate_collection:
         s = f"{s} ({gate_collection})"
@@ -3690,6 +3728,7 @@ class HandbackHold:
     verdict: str            # INCOMPLETE_VERDICT | GateOutcome.BLOCKED_ENV.value
     label: str              # "<rule> at line <n>" | the unjudgeable reason
     error: str              # the Result.error line; for INCOMPLETE it quotes the matched line
+    source: str = "HANDBACK GUARD"   # the git-note prefix; "EXECUTOR EXIT" for _executor_exit_hold
 
 
 def _handback_hold(out_log: str) -> Optional[HandbackHold]:
@@ -3720,6 +3759,26 @@ def _handback_hold(out_log: str) -> Optional[HandbackHold]:
     log.error(f"🛡 handback-guard: BLOCKED — {reason} ({out_log})")
     return HandbackHold(Status.BLOCKED, GateOutcome.BLOCKED_ENV.value, reason,
                         f"{GateOutcome.BLOCKED_ENV.value} — handback guard: {reason}")
+
+
+def _executor_exit_hold(ec: int, branch: str) -> Optional[HandbackHold]:
+    """[ORCH-TIMEOUT-HOLD-1] P-MERGE: merged(r) ⇒ ec(r) == 0 ∧ handback(r) CLEAN ∧ gates(r) PASS. None
+    ⇒ exit 0, and the handback guard judges next. An executor that did not exit 0 but left work on
+    the tree is INCOMPLETE — exit -1 (fire_toni's timeout kill) ⇒ INCOMPLETE(timeout), any other ⇒
+    INCOMPLETE(executor-error) — and is held exactly like a handback hold: the work is committed on
+    its branch, no gate runs, nothing merges. Salvage stays possible and is an operator act; the
+    error names the command that starts it. One `🛡 executor-exit:` line either way (P-SAY)."""
+    if ec == 0:
+        log.info("🛡 executor-exit: CLEAN — exit 0")
+        return None
+    verdict = INCOMPLETE_TIMEOUT_VERDICT if ec == -1 else INCOMPLETE_EXECUTOR_ERROR_VERDICT
+    why = f"killed at the {TONI_TIMEOUT // 60}m route timeout" if ec == -1 else "the executor did not exit 0"
+    error = (f"{verdict} — executor exit {ec} ({why}) with work on the tree; no gate run, nothing "
+             f"merged. Salvage is an operator act — inspect: cd {PROJECT_ROOT} && git log --oneline "
+             f"{MERGE_TARGET}..{branch}")
+    log.error(f"⛔ {error}")
+    log.error(f"🛡 executor-exit: HOLD — {verdict}: exit {ec} with work on {branch}")
+    return HandbackHold(Status.INCOMPLETE, verdict, f"exit {ec}", error, source="EXECUTOR EXIT")
 
 
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
@@ -3896,10 +3955,13 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # staged/unstaged changes in the tree). The post-merge BUILD GATE remains
     # the quality arbiter, so this cannot merge broken code — it only stops a
     # bad exit code from throwing away good code. ec is still recorded.
+    # S7-CORE-16 [ORCH-TIMEOUT-HOLD-1]: the work is still never thrown away, but it no longer merges:
+    # a non-zero exit with work on the tree is INCOMPLETE (_executor_exit_hold) — committed on its
+    # branch, never gated. The meta-fire worktree is a route branch too and is measured the same way.
     if tamper is not None:
         # [ORCH-10] S2: the work-produced signals all read the wrong ref now. Do not compute them.
         _produced_work = False
-    elif worktree is None and branch_name:
+    elif (worktree is None and branch_name) or (worktree is not None and IS_META_FIRE):
         _staged = subprocess.run("git status --porcelain", shell=True,
             capture_output=True, text=True, cwd=str(proj)).stdout.strip()
         _ahead = subprocess.run(f"git rev-list --count {MERGE_TARGET}..HEAD",
@@ -3913,7 +3975,12 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # [ORCH-HANDBACK-GUARD-1] T2.1: judge the executor's closing words once, here. A tampered
     # route is not judged — TAMPERED already stops it. A hold keeps `status` PASSED until its
     # lane below has committed the work onto the route branch, then replaces the gate.
-    hold = _handback_hold(out_log) if (tamper is None and status == Status.PASSED) else None
+    # [ORCH-TIMEOUT-HOLD-1] a non-zero exit is held on the exit code alone: the closing words of an
+    # executor that was killed, or that failed, are not asked (the guard is not engaged).
+    hold = None
+    if tamper is None and status == Status.PASSED:
+        hold = (_executor_exit_hold(ec, branch_name or f"{BRANCH_PREFIX}-{batch_file.stem}")
+                or _handback_hold(out_log))
     if tamper is not None:
         # [ORCH-10] S2: not `passed`, and not `failed(product)` either — the run was handed a
         # repo it no longer recognises, so it has no opinion about the product at all.
@@ -3924,10 +3991,6 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             _log_tamper_outcome(SIT_ARCHIVE_DIR, proj, tamper)
         except Exception as e:
             log.warning(f"⚠️  {TAMPER_VERDICT}: could not persist outcome: {e}")
-    if ec != 0 and _produced_work:
-        log.warning(f"⚠️  Toni exited non-zero (ec={ec}) but produced work "
-                    f"(staged/ahead) — treating as PASSED; build gate will verify. "
-                    f"(claude-code 2.1.123 exit-code regression)")
     mig_after = get_migrations()
     new_mig = sorted(mig_after - mig_before)
     if new_mig:
@@ -4015,7 +4078,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                         unit_collection = verdict.unit_collection
                     if verdict is None:
                         subprocess.run(
-                            f'git notes add -m "HANDBACK GUARD: {hold.verdict} — {hold.label}"',
+                            f'git notes add -m "{hold.source}: {hold.verdict} — {hold.label}"',
                             shell=True, capture_output=True, cwd=str(proj)
                         )
                         subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
@@ -4162,7 +4225,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # distinct from `passed` and from `FAIL(product)`, and greppable either way.
     incomplete = hold.label if hold is not None and status == Status.INCOMPLETE else None
     log.info(f"🏁 FINAL STATUS: {status.value} | gate: "
-             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label, incomplete)}")
+             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label, incomplete, hold.verdict if hold else INCOMPLETE_VERDICT)}")
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),

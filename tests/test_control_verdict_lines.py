@@ -43,9 +43,12 @@ C = {
     "clock-plausibility": "_judge_leg",
     "sit-isolation": "_sit_isolate",
     "unit-confirm": "_unit_confirm_new_files",
+    # ORCH-TIMEOUT-HOLD-1 (brief 2): a sixth control, found by this guard as `_*_hold` with no line
+    "executor-exit": "_executor_exit_hold",
 }
 # the canon_assert predicates behind C: every call site must sit in a function that speaks
-C_PREDICATES = {"check_handback_invariants", "check_bg_ceiling_invariants", "check_clock_plausibility"}
+C_PREDICATES = {"check_handback_invariants", "check_bg_ceiling_invariants", "check_clock_plausibility",
+                "check_foreground_invariants"}
 # a report-only CLI over the same predicate is not a route control: it prints its own verdicts
 REPORT_ONLY = {"handback_scan"}
 # "a control", by name: `_*_hold`, or `guard` as an underscore-delimited word
@@ -274,6 +277,24 @@ class TestUnitConfirm:
             o = orchestrator.run_unit_gate(tmp_path, "main", archive_path=tmp_path / "archive")
         assert o.passed
         assert shields(caplog, "unit-confirm") == []
+
+
+# ═══════════════════════════════════════════════════════
+# executor-exit (ORCH-TIMEOUT-HOLD-1)
+# ═══════════════════════════════════════════════════════
+class TestExecutorExit:
+
+    def test_pass_path_says_clean(self, caplog):
+        with caplog.at_level(logging.INFO, logger="orch"):
+            assert orchestrator._executor_exit_hold(0, "orch-x") is None
+        assert one(caplog, "executor-exit", "CLEAN") == "🛡 executor-exit: CLEAN — exit 0"
+
+    @pytest.mark.parametrize("ec,verdict", [(-1, "INCOMPLETE(timeout)"), (-2, "INCOMPLETE(executor-error)")])
+    def test_hold_path_says_hold(self, caplog, ec, verdict):
+        with caplog.at_level(logging.INFO, logger="orch"):
+            h = orchestrator._executor_exit_hold(ec, "orch-x")
+        assert h.status is orchestrator.Status.INCOMPLETE and h.verdict == verdict
+        assert one(caplog, "executor-exit", "HOLD") == f"🛡 executor-exit: HOLD — {verdict}: exit {ec} with work on orch-x"
 
 
 # ═══════════════════════════════════════════════════════

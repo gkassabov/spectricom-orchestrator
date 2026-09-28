@@ -201,7 +201,7 @@ def test_G2_bound_table(T, ms):
     assert orchestrator.bg_wait_ceiling_ms(T) == ms
     assert 0 < ms < 1000 * T
     env = orchestrator.toni_child_env(T, base={})
-    assert env == {V: str(ms)}
+    assert env[V] == str(ms)  # ORCH-FOREGROUND-1 adds three keys beside it: tests/test_foreground.py
     assert check_bg_ceiling_invariants("x", env, T) == []
 
 
@@ -226,7 +226,8 @@ def test_G3_overrides_and_preserves(inherited):
     env = orchestrator.toni_child_env(1800, base=base)
     assert env[V] == "1500000"
     assert env["PATH"] == "/usr/bin" and env["ANTHROPIC_API_KEY"] == "sk-test"
-    assert set(env) == set(base)
+    assert set(env) == set(base) | {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "BASH_DEFAULT_TIMEOUT_MS",
+                                    "BASH_MAX_TIMEOUT_MS"}  # ORCH-FOREGROUND-1's three, and nothing else
     assert base == snapshot
     assert dict(os.environ) == environ_before
     assert env is not base
