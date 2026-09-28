@@ -1212,12 +1212,14 @@ def fhash(p: Path) -> str:
     return hashlib.md5(p.read_bytes()).hexdigest()
 
 def write_running(batch_file: Path, brief_count: int, log_file: str = ""):
-    """Write running.json so dashboard knows what's executing."""
+    """Write running.json so dashboard knows what's executing. [QUEUE-PAUSE-OPAQUE] With the pid, so
+    a marker a killed route leaves behind is judged dead by the queue daemon (P-STALE), not waited on."""
     RUNNING_FILE.write_text(json.dumps({
         "batch_file": batch_file.name,
         "briefs": brief_count,
         "started": datetime.now().isoformat(),
-        "log_file": log_file
+        "log_file": log_file,
+        "pid": os.getpid(),
     }, indent=2))
 
 def clear_running():
