@@ -1,0 +1,88 @@
+=== TONI EXECUTION ===
+Batch: 52-seed-test-isolation-1-the-oracle-tells-the-truth.md
+Started: 2026-09-27T14:54:53.182163
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-5-5 --effort high "Read briefs/52-seed-test-isolation-1-the-oracle-tells-the-truth.md and execute all briefs in order."
+============================================================
+
+I finished SEED-TEST-ISOLATION-1 and committed it as `4b02d0bf`. The unit-baseline checker came back clean on two full AFTER runs (runs 2 and 4). I needed all 4 allowed runs to get there, and made two changes to the brief's plan, both below. I stopped after this brief, as CLAUDE.md Rule 1 requires; briefs 53 and 54 have not been started.
+
+## §7 — What I found and left
+
+**1. The diagnosis holds. It was a timeout, not a shared-server race.**
+- **No shared state:** each seed test builds its own `MockClient`, and with no override that constructor creates a new `FhirRouter` and `MemoryRepository`, so no repository is shared.
+- **AC-01:** the checker exits 1 with exactly 3 B1s, on S-FN, S-PI and S-PA. Their durations are 32,135 / 31,651 / 31,812 ms.
+- **Every failure is a timeout:** each red, whether archived or reproduced here, reads `Error: STACK_TRACE_ERROR`. None is an assertion failure.
+
+**The brief's busy-loop count was badly off, so I recalibrated it.**
+- At 168 loops (7 × 24 cores), all **4** seed tests failed, S-PF included. S-FN took 337,730 ms: ~54× slower than scoped, not ~5×.
+- At that level even a 100 s ceiling could never pass AC-06. It confirms the diagnosis rather than contradicting it.
+- AC-06 already treats the loop count as tunable, so I dropped to 48 loops (2 × nproc), the recipe `vite.config.ts` already documents. That gave exactly the expected shape: 3 of 12 red, S-PF green.
+- The rest of the starvation runs used 48 loops. The achieved slowdown is 87,788 / 6,211 = **14.1×**, above the required 5.2×.
+
+**I raised the constant from 100_000 to 110_000.**
+- In AFTER run 1, S-PA took 35,655 ms, above the 33,333 bound (100,000 / 3).
+- Applying §2's rule: ceil(3 × 35,655 / 10,000) × 10,000 = **110,000**. I updated the derivation comment to match.
+
+**2. B1s outside the seed set, recorded and not fixed:**
+
+| AFTER run | Test | Failure |
+|---|---|---|
+| 1 | `TaskStatusPanel` › "shows menu dropdown when badge is clicked" | `Error: Unable to find role="menuitem"` (Mantine dropdown in the DOM) |
+| 1 | `AdminClinicalConfigurationPage` › AC-L34-03 | `STACK_TRACE_ERROR`; the default reporter says "Test timed out in 15000ms" |
+| 1 | `AdminClinicalConfigurationPage` › AC-L34-04 | same timeout |
+| 3 | `EncounterCompose` › BUG-v4-008 | `Unable to find an element with the text: /Auto-saved 30m ago/` |
+| 3 | `RefillsPage` › "renders rows when draft refills are present" | `Unable to find an element with the text: Jane Doe` |
+
+**3. AC-L34-03 against its 15,000 ms ceiling:**
+
+| Run | Duration (ms) | Share of ceiling |
+|---|---|---|
+| BEFORE | 12,160 | 81% |
+| AFTER 1 | 15,096 | **failed** |
+| AFTER 2 | 14,154 | 94% |
+| AFTER 3 | 11,938 | 80% |
+| AFTER 4 | 13,391 | 89% |
+
+AC-L34-04 also timed out in run 1, so it belongs on BASELINE-HEADROOM-1's list too.
+
+**4. Parts of §0 that didn't match what I read:**
+- **`after.json`:** S-PA **passed** at 30,218 ms, and in my BEFORE run it passed at 30,042 ms. Under starvation the timer fires late, so passing or failing is not strictly "crossed 30 s".
+- **`seed-longevity-cohort.test.ts`:** it has **5** `30_000` lines (127, 150, 165, 177, 202), not 2. All 8 out-of-scope sites are untouched.
+- **AC-08 line numbers:** after the change the `new MockClient()` lines are 40 / 86 / 53, shifted +1 by the new import. Before, they were 39 / 85 / 52 as the brief says.
+
+## What shipped
+- **New file:** `src/test-utils/seed-test-timeout.ts` exports `SEED_LONGEVITY_PANEL_TEST_TIMEOUT_MS = 110_000`. Its comment gives both derivations and names SEED-UPSERT-COST-1 as the successor.
+- **Edits:** one import line plus the four timeout arguments in `seed-longevity-function.test.ts:60`, `seed-longevity-panel.test.ts:99,117` and `seed-longevity-partner.test.ts:83`.
+- **Checks:** the diff contains only those lines, so no assertion line changed. The declared set, the checker, `package.json` and `vite.config.ts` have empty diffs.
+- **AC-07:** each file passes alone (3 / 6 / 3 tests) and all three together (12/12). **The combined run was already green before the change**, so it shows isolation, not a repair.
+
+| run | time (EDT) | Test Files | Tests failed | checker | S-FN / S-PI / S-PF / S-PA ms |
+|---|---|---|---|---|---|
+| recorded (AC-01) | 13:45:16 | — | 6 | 1 / 3×B1 | 32135 / 31651 / 12144 / 31812 |
+| starved BEFORE, 168 loops | 14:55:39 | — | 4 of 12 | — | 337730 / 313374 / 116418 / 314401 |
+| starved BEFORE, 48 loops (AC-02) | 15:04:56 | — | 3 of 12 | — | 77473 / 71072 / 25737 / 77428 |
+| starved AFTER, 48 loops (AC-06) | 15:12:49 | — | 0 (exit 0) | — | 87788 / 75962 / 35507 / 69980 |
+| whole BEFORE (AC-03) | 15:07:08 | 2 failed / 868 passed / 1 skipped | **N_before = 4** | 1 / B1 on S-FN | 31807 / 29630 / 12828 / 30042 |
+| whole AFTER 1 (discarded) | 15:15:46 | 3 failed / 867 passed | 6 | 1 / 3×B1, none in seed files | 34080 / 34700 / 13172 / 35655 |
+| whole AFTER 2 ✅ | 15:21:28 | 1 failed / 869 passed | **N_after = 3** | 0 / CLEAN | 31802 / 30843 / 12229 / 30848 |
+| whole AFTER 3 (discarded) | 15:26:47 | 3 failed / 867 passed | 5 | 1 / 2×B1, none in seed files | 31785 / 29594 / 12520 / 31321 |
+| whole AFTER 4 ✅ | 15:32:13 | 1 failed / 869 passed | **N_after = 3** | 0 / CLEAN | 31615 / 30060 / 11855 / 30476 |
+
+- **Clean runs:** in runs 2 and 4, the only failed file is `seed-hrt-scenarios`, with exactly its 3 declared tests. The other 870 files passed, and the seed set stayed under the 36,667 bound (110,000 / 3). Both runs' failures were also in the BEFORE failed set.
+- **Timezone:** America/New_York throughout.
+- **Build checks:** `npx tsc --noEmit` exit 0; `npm run build` exit 0.
+
+## The consequence
+- **Product behaviour changed:** none. The diff against `seed-hrt-scenarios.test.ts` and `seed-longevity-panel.ts` is empty.
+- **The commissioning hypothesis was false.** There was no shared-state race, and no isolation change was made. The fix is a longer per-test timeout.
+- **What a human will notice:** a genuinely hung seed test in these three files now takes up to 110 s to report, not 30 s. Passing runs are unchanged.
+- **The cost is not reduced.** Each seed-twice test still takes ~30–36 s in a whole run, and the margin shrinks as the suite grows. SEED-UPSERT-COST-1 is the real fix.
+- **Left out on purpose:** the other `30_000` sites, `vite.config.ts`, and a headroom invariant (B5, for BASELINE-HEADROOM-1).
+- **A whole run can still go red:** 2 of 4 AFTER runs had unrelated load-flake B1s.
+- **Reading hazard, pasteable:** "A vitest 4.1.4 timeout appears in the JSON report's `failureMessages` as `Error: STACK_TRACE_ERROR` pointing at the `test(` line, never as 'timed out'; only the default reporter prints 'Test timed out in Nms'."
+
+The evidence files are in `test-results/s52-*.json` and `/tmp/s52-*` and were not committed. Separately, the Gmail, Google Calendar and Yorsie connectors need authorizing in claude.ai connector settings before they can be used; this brief didn't need them.
+
+============================================================
+Finished: 2026-09-27T15:39:16.995677
+Exit: 0

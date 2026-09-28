@@ -1,0 +1,17 @@
+=== TONI EXECUTION ===
+Batch: 24-l-labs-1-the-flowsheet-grid.md
+Started: 2026-09-20T21:17:05.340580
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-fable-5-1 --effort high "Read briefs/24-l-labs-1-the-flowsheet-grid.md and execute all briefs in order."
+============================================================
+
+The whole-repo unit run is going in the background and will notify me on exit. To avoid CPU starvation skewing it, I'm holding the build and SIT gate until it finishes.
+
+Status so far:
+
+- **Built**: pure flowsheet model, G1 to G5 added to the oracle, the single grid component, the rebuilt Labs tab, button-and-modal external-result entry, register re-pointed.
+- **Verified**: type check 0 errors, lint 0 errors, 150 scoped tests green, zero raw hex in every touched file.
+- **Pending**: whole-repo baseline, `npm run build`, SIT gate in halves, commit.
+
+============================================================
+Finished: 2026-09-20T21:51:53.646020
+Exit: 0

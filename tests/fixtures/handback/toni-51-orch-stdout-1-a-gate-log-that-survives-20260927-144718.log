@@ -1,0 +1,73 @@
+=== TONI EXECUTION ===
+Batch: 51-orch-stdout-1-a-gate-log-that-survives.md
+Started: 2026-09-27T14:47:18.684180
+Command: cd /tmp/orch-fire-20260927-144718 && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-5-5 --effort high "Read briefs/51-orch-stdout-1-a-gate-log-that-survives.md and execute all briefs in order."
+============================================================
+
+# ORCH-STDOUT-1 handback
+
+ORCH-STDOUT-1 is done and committed as `3e34fbf` on `orch-orch-51-orch-stdout-1-a-gate-log-that-survives`. The daemon no longer sends a route's output into a pipe that nobody reads. Each route's full stdout and stderr now goes to its own log file, and the queue-state record names that file. The full suite passes: 509 passed, 0 failed.
+
+## §7 · Found and left alone
+- **Stale citation in `orchestrator.py`.** `orchestrator.py:1396` (the brief said `:1392`) still cites `queue_daemon.py:325` for `current_process.wait()`. That call is now in `_run_route` at `queue_daemon.py:481`. The brief keeps `orchestrator.py` out of scope, so I didn't edit it.
+- **Saved config overrides the code defaults.** `_load_state` (`queue_daemon.py:136`) loads the `config` saved in `queue-state.json` over the code's defaults. So `max_consecutive` stays at the saved 10 instead of the new 25, and the same happens to `timeout_seconds` and every other key. This needs your ruling.
+- **Tests write into `logs/`.** Test files that `import orchestrator` write `logs/orch-<ts>.log` into the repo they run from.
+- **Raw gate output is still not saved.** `npm run sit:gate` and `npm test` still run with `capture_output=True`. That is the successor brief, ORCH-GATELOG-2.
+- **Cancelling a route records it twice. This was already true before this change.** `cancel_current` records a `-9` entry, then `run_loop`'s own wait returns `-15` and records a second failed entry for the same brief. Both entries now name the same log, and the log shows both trailers. I left the exit codes alone, as the brief requires.
+- **The timeout kill only hits the top process.** It kills the process it started, which is `python3` because bash hands over to the last command. If `orchestrator.py` has started its own children, they are not killed. This was already the case; `fire_toni` handles it with `killpg`, the daemon doesn't.
+- **Where the check sits in `canon_assert.py`.** The brief wanted it directly after `check_branch_freshness_invariants` *and* directly before `# ── verdict building`. ORCH-CONFLICT-1 has since added a block between those two, so both can't hold. I put it just before `# ── verdict building` (`canon_assert.py:705`).
+
+## What shipped
+- **T1 · the check** (`canon_assert.py`): `GateLogViolation` (:717), `_gate_log_reason` (:730) and `check_gate_log_invariants` (:753). A log that can't be read counts as a violation on purpose, and the docstring explains why.
+- **T2 · per-route log files** (`queue_daemon.py`):
+  - `LOG_DIR` (:38), `_repo_config` (:76, now the only reader of `repos.yaml`), `_log_subdir` (:100) and `route_log_path` (:105).
+  - `_run_route` (:481) gives the child an open file as stdout and writes a header and trailer on every exit path.
+  - The command now runs `python3 -u` (:424).
+  - `log_file` is set on the running batch (:432), on each recorded entry (:448) and on the cancelled entry (:272). The brief only asked for the path to be copied; I also had `cancel_current` append an `Exit: -9 (cancelled by user)` trailer, because AC-SO-06 requires the trailer to state the exit code.
+  - All log writes append rather than overwrite, so the cancel trailer and `_run_route`'s trailer both survive.
+- **T3 · the two non-test callers**: the post-route check in `run_loop` (:469), and `find_missing_gate_logs` (:323) behind a new `check-logs` command (:559). `check` itself is unchanged.
+- **T4 · tests**: `tests/test_queue_gate_log.py`, 23 tests. It never imports `orchestrator`. It replaces `time` and `subprocess` only inside `queue_daemon`, not globally, so `subprocess.wait`'s own sleep isn't affected.
+
+## Red counts
+- **AC-SO-02** (read-only, live `queue-state.json` at `updated_at 14:47:18`): 30 completed + 8 failed = 38 entries → **38 violations, all `no-log-recorded`**, and 0 entries carry `log_file`.
+- **AC-SO-03** (unmodified `queue_daemon.py`): **5 failed, 0 passed**.
+  - huge-output: `route did not finish cleanly: {... 'exit_code': -1, 'duration_s': 14.1 ...}`. The route timed out, which reproduces the deadlock.
+  - markers: `entry names no log: {'file': '61-markers.md', 'exit_code': 0, ...}`
+  - non-zero exit: `entry names no log: {'file': '63-fails.md', 'exit_code': 3, ...}`
+  - timeout: `entry names no log: {'file': '64-hangs.md', 'exit_code': -1, ...}`
+  - cancel: `the running route never named a log carrying its output (current_batch={'file': '66-cancelled.md', 'started_at': ...})`
+
+  All 5 pass after T2.
+
+## Gate table (AC-SO-10)
+
+| | `pytest -q tests/` |
+|---|---|
+| merge-base `df71188` | **486 passed, 0 failed** (17.7 s) |
+| branch `3e34fbf` | **509 passed, 0 failed** (18.2–19.0 s) = 486 + 23 |
+
+- The baseline is 486, not the brief's 454, because ORCH-CONFLICT-1 and ORCH-TALLY-1 landed after `23ab07f`.
+- The new file takes 2.5 s on its own.
+- **AC-SO-09:** `tests/test_queue_retire.py` passes with no edits. The diff against the merge-base touches only `canon_assert.py`, `queue_daemon.py` and `tests/test_queue_gate_log.py`.
+- **AC-SO-11:** I listed every file under `~/spectricom-orchestrator/logs/` with its modification time before and after the new test file ran: 2182 files both times, identical, **0 new files**.
+
+## AC-SO-08 · the two callers
+1. `run_loop` runs the check on every entry it records (the dashboard starts it via `start_daemon_thread`).
+2. `python3 queue_daemon.py check-logs` calls `find_missing_gate_logs()`. Run read-only against the live state now, it reports `ORCH-STDOUT-1: 38 recorded route(s) without a readable log (38 no-log-recorded)`.
+
+## Consequences (D-S7CORE13-03)
+1. **A new log file per route.** Every daemon-fired route now writes `logs/<log_subdir>/orch-<stem>-<ts>.log`, next to `toni-<stem>-<ts>.log`. There is no rotation. The largest file the tests produced was 328 210 bytes (the 320 KiB case). A typical real route should be about 6 KB, plus any `print` output and tracebacks.
+2. **Entries gain `log_file`.** Entries recorded before this merge don't have it and never will.
+3. **`check-logs` fails on the existing history by design.** It will report every older entry until they drop out of the capped lists: the last 30 for `completed`, up to 15 for `failed`. A `no-log-recorded` on an entry dated after the merge means a regression; any other reason means a disk problem.
+4. **I did not restart the live daemon.** It's the process running this route (`python3 -u queue_daemon.py`, PID 1457330), and a restart would have killed it. It keeps the old code until you restart it. The first route after the restart is where AC-SO-02 turns green in production.
+5. **Crash reasons are now kept.** A crashing route's uncaught traceback lands in its log, so the next `exit_code: 1` has a reason on disk. The 8 existing failed entries never will.
+6. **`python3 -u` changes timing only.** The child's `print()` output reaches the file line by line instead of block by block, which is also why output printed before a timeout kill survives (the timeout test checks this). Nothing else about the command changed.
+7. **Open questions for you:**
+   - Route 42 has `logs/orch-20260927-113718.log` and a toni log, but no entry in `queue-state.json`. Only four routes dated today are recorded (43–46). Was route 42 daemon-fired?
+   - Please confirm the correction in §1 matches what you were looking for. The gate verdict lines and GATE-SIT-2's isolation evidence *were* already on disk. What was actually lost was output written outside the logger, and any link from the queue record to its log.
+
+Gmail, Google Calendar and Yorsie MCP aren't connected in this session. Authorise them in claude.ai connector settings if a later brief needs them; none was needed here.
+
+============================================================
+Finished: 2026-09-27T14:53:47.114575
+Exit: 0

@@ -1,0 +1,26 @@
+=== TONI EXECUTION ===
+Batch: toni-brief-s6s57-on-scribe-s2s4-ollama-depth-01.md
+Started: 2026-06-10T22:19:16.102223
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "Read briefs/toni-brief-s6s57-on-scribe-s2s4-ollama-depth-01.md and execute all briefs in order."
+============================================================
+
+Brief complete. Per CLAUDE.md Rule 1, stopping after this single brief.
+
+## Summary
+
+Hardened the S2 (`extractCondition`) and S4 (`extractOrders`) extractors on the **Ollama path** only — Groq/Mock contracts untouched.
+
+**Changes:**
+- `src/lib/llm/extract-json.ts` — added `sanitizeConditionResult` and `sanitizeOrderCandidates` (reusing the existing parse-resilience home): drop malformed entries lacking a usable code, dedup by primary code/text, clamp enum fields (`detectedIntent`/`suggestedVerificationStatus`/`kind`), coerce confidence, empty-safe on non-array/non-object input; orders re-sorted favorites-first.
+- `src/lib/llm/providers/condition-extract-keywords.ts` — added `buildConditionResultFromKeywords` (deterministic keyword fallback mirroring Mock's behavior).
+- `src/lib/llm/providers/order-extract-keywords.ts` — added `buildOrdersFromKeywords` (keyword fallback over transcript+plan, favorites-first).
+- `src/lib/llm/providers/ollama-provider.ts` — strengthened both prompts (JSON-only, no fences, non-empty codes, no dupes, explicit empty case) and wired: parse → sanitize → if empty, backstop via keyword detection; on parse failure, keyword fallback instead of returning bare empty.
+- Added 6 tests covering keyword fallback (parse-failure + clean-empty) and sanitize/dedup/malformed-drop for both extractors.
+
+**Closure verification:** `tsc --noEmit` 0 errors · 85 tests pass (ollama-provider, extract-json, MockLLMProvider) · `npm run build` exit 0.
+
+**Note:** The empty-result backstop will surface keyword-matched candidates even when the model deliberately returns `no-intent`/`[]`. I judged this in-scope for the brief's "extractor depth / demo-on-Ollama solid" goal, but flagging it since it's a behavior choice rather than pure parse-resilience.
+
+============================================================
+Finished: 2026-06-10T22:26:25.289722
+Exit: 0

@@ -1,0 +1,11 @@
+=== TONI EXECUTION ===
+Batch: 31-l-surfacing-1-render-what-is-already-stored.md
+Started: 2026-09-21T10:48:22.229116
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-fable-5-1 --effort high "Read briefs/31-l-surfacing-1-render-what-is-already-stored.md and execute all briefs in order."
+============================================================
+
+That notification is the first 95 s wait finishing. It was already consumed: half B and the two re-run files both ran after it and passed. Nothing further to do. The brief is complete and committed as `5296def7`.
+
+============================================================
+Finished: 2026-09-21T11:08:59.525958
+Exit: 0

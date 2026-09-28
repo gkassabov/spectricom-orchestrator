@@ -1,0 +1,89 @@
+{
+  "_comment": "ORCH-HANDBACK-GUARD-1 (S7-CORE-15). Read by canon_assert.load_outstanding_work_rules. Each regex is compiled with re.IGNORECASE and tested against every line of a fire_toni log's executor output; evidence names the corpus logs (logs/clinical-mp, logs/orchestrator) it matches. A new phrasing is a new entry here plus a re-run of `orchestrator.py handback-scan`. Missing or invalid file => every route BLOCKED(environment).",
+  "outstanding_work": [
+    {
+      "id": "background",
+      "regex": "\\b(?:going|running|still running|is running|are running|still in progress) in(?:to)? the background\\b",
+      "evidence": [
+        "toni-24-l-labs-1-the-flowsheet-grid-20260920-211705.log",
+        "toni-30-vitals-ui-1-function-stops-being-a-wall-of-inputs-20260921-101044.log",
+        "toni-38-p9-compose-1-one-predicate-for-programme-blocks-20260921-150436.log",
+        "toni-54-surface-truth-1-counts-and-columns-20260927-174452.log",
+        "toni-toni-batch-s6s75-hrt-avs-uterus-emphasis-01-20260629-091217.log",
+        "toni-toni-batch-s7core6-l2-0-reconciled-panel-rows-01-20260910-172345.log",
+        "toni-toni-batch-s7core7-drk-q10-q11-panel-rulings-01-20260911-190755.log",
+        "toni-toni-batch-s7core7-pcfg-02b-thresholds-as-config-01-20260911-144901.log",
+        "toni-toni-batch-s7core7-pcfg-02c-vocabularies-as-config-01-20260911-152729.log"
+      ]
+    },
+    {
+      "id": "waiting",
+      "regex": "(?:^|[.;:!]\\s+|\\bI'?m |\\bI am |\\bam )waiting (?:for|on)\\b",
+      "evidence": [
+        "toni-34-cache-guard-1-a-write-invalidates-its-own-reads-20260921-123217.log",
+        "toni-36-intake-1-the-questionnaire-follows-the-visit-20260921-140313.log",
+        "toni-40-meds-ui-2-one-prescribe-control-two-honest-halves-20260926-045329.log",
+        "toni-53-l-rx-safety-1-no-doseless-active-order-20260927-155403.log",
+        "toni-toni-batch-s6s67-sched-approval-discoverability-01-20260620-144042.log",
+        "toni-toni-batch-s6s75-hrt-doc-template-seed-01-20260628-205129.log",
+        "toni-toni-batch-s7core6-sit-t1-longevity-integration-01-20260910-185338.log",
+        "toni-toni-batch-s7core7-drk-q10-q11-panel-rulings-01-20260911-190755.log",
+        "toni-toni-batch-s7core9-red-1-llm-env-isolation-01-20260914-113727.log",
+        "toni-toni-batch-s7core9-red-5-flake-class-and-last-reds-01-20260915-041929.log"
+      ]
+    },
+    {
+      "id": "will-resume",
+      "regex": "\\bI'?ll (?:pick (?:\\w+ )?up|follow up|commit once|await|continue as soon|report once|be re-invoked)\\b|\\bI'?ll finish\\b[^.\\n]*\\b(?:when|once)\\b|\\bwill (?:notify|re-invoke) me\\b",
+      "evidence": [
+        "toni-10-rm-i-013-indication-gated-labs-20260918-091707.log",
+        "toni-24-l-labs-1-the-flowsheet-grid-20260920-211705.log",
+        "toni-30-vitals-ui-1-function-stops-being-a-wall-of-inputs-20260921-101044.log",
+        "toni-34-cache-guard-1-a-write-invalidates-its-own-reads-20260921-123217.log",
+        "toni-37-meds-dup-count-1-the-collapse-must-say-how-many-20260921-143130.log",
+        "toni-38-p9-compose-1-one-predicate-for-programme-blocks-20260921-150436.log",
+        "toni-40-meds-ui-2-one-prescribe-control-two-honest-halves-20260926-045329.log",
+        "toni-54-surface-truth-1-counts-and-columns-20260927-174452.log",
+        "toni-toni-batch-s6s71-section-personalization-entry-mode-01-20260624-105638.log",
+        "toni-toni-batch-s6s75-hrt-avs-uterus-emphasis-01-20260629-091217.log",
+        "toni-toni-batch-s6s75-hrt-doc-template-seed-01-20260628-205129.log",
+        "toni-toni-batch-s6s76-avs-hrt-fold-01-20260630-085236.log",
+        "toni-toni-batch-s7core10-mock-1-strict-mock-and-server-exercise-01-20260915-191252.log",
+        "toni-toni-batch-s7core4-l11-loinc-correction-01-20260909-150642.log",
+        "toni-toni-batch-s7core6-l1-2-trajectory-cds-01-20260910-165049.log",
+        "toni-toni-batch-s7core6-l2-0-reconciled-panel-rows-01-20260910-172345.log",
+        "toni-toni-batch-s7core7-pcfg-02b-thresholds-as-config-01-20260911-144901.log",
+        "toni-toni-batch-s7core9-red-1-llm-env-isolation-01-20260914-113727.log"
+      ]
+    },
+    {
+      "id": "in-flight",
+      "regex": "\\b(?:suite|run|re-?run|gates?|baseline|vitest|tests?|half|batch(?:es)?)\\b[^.\\n]{0,60}?\\b(?:still (?:running|in progress|executing)|in flight)\\b",
+      "evidence": [
+        "toni-25-careplan-dup-1-warn-never-silently-duplicate-20260920-221243.log",
+        "toni-38-p9-compose-1-one-predicate-for-programme-blocks-20260921-150436.log",
+        "toni-toni-batch-s6s71-section-personalization-entry-mode-01-20260624-105638.log",
+        "toni-toni-batch-s6s75-hrt-doc-template-seed-01-20260628-205129.log",
+        "toni-toni-batch-s7core6-l2-1-reconciled-partner-results-01-20260910-182757.log",
+        "toni-toni-batch-s7core7-drk-q10-q11-panel-rulings-01-20260911-190755.log",
+        "toni-toni-batch-s7core7-pcfg-02b-thresholds-as-config-01-20260911-144901.log",
+        "toni-toni-batch-s7core7-pcfg-02c-vocabularies-as-config-01-20260911-152729.log"
+      ]
+    },
+    {
+      "id": "pending-bullet",
+      "regex": "^\\W*pending\\W*:",
+      "evidence": [
+        "toni-24-l-labs-1-the-flowsheet-grid-20260920-211705.log",
+        "toni-37-meds-dup-count-1-the-collapse-must-say-how-many-20260921-143130.log"
+      ]
+    },
+    {
+      "id": "cli-bg-ceiling",
+      "regex": "^Background tasks still running after \\d+s; terminating\\.",
+      "evidence": [
+        "toni-toni-batch-s7core7-drk-q10-q11-panel-rulings-01-20260911-190755.log"
+      ]
+    }
+  ]
+}

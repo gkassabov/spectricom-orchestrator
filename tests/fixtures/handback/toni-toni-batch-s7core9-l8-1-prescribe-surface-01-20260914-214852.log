@@ -1,0 +1,43 @@
+=== TONI EXECUTION ===
+Batch: toni-batch-s7core9-l8-1-prescribe-surface-01.md
+Started: 2026-09-14T21:48:52.405155
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-5 --effort high "Read briefs/toni-batch-s7core9-l8-1-prescribe-surface-01.md and execute all briefs in order."
+============================================================
+
+Brief complete and committed at `c4f76f2`. Stopping here per Rule 1.
+
+## What landed
+
+**Half A — the prescribe surface** (`src/components/healthspan/PrescribeInterventionSection.tsx`, 480 lines: card + section, one file, the `ExternalResultEntrySection` house shape).
+
+- **AC-L8-01/02** — mounted on `PatientPage.tsx:196` (Timeline tab, after `ExternalResultEntrySection`). The greps the brief names now return 7 non-test matches and 1 file respectively.
+- **AC-L8-03** — one grouped `NativeSelect` over `CORE_INTERVENTIONS`; groups are derived from the routes the shipped list contains. Id-literal sweep across all four new files: **0 matches**.
+- **AC-L8-04** — a `'drug'` row renders the agent field and `prescribe-submit` stays disabled (whitespace-only too) until an agent is named.
+- **AC-L8-05** — `prescribeByRoute` dispatches on `iv.route` only; a route with no shipped entry point throws by name rather than being re-routed.
+- **AC-L8-06/07/08 + 09/10** — each refusal test asserts the clean case **first**, then the refusal. Refusals render in an in-place alert (not a toast) carrying the shipped strings — the stop's own `label`/`citation` from `PLATFORM_SEED_VOCABULARY`, the FDA 503A citation, the consent gate's own reason — with the action disabled and `persistedCount` proving nothing was written.
+- **AC-L8-11** — the section loads the range table and passes it as the cadence table; with nothing configured the surface prints the cadence key and "no monitoring cadence is configured", and the test asserts no date matches anywhere on the card. A positive control proves the absence is real.
+- Hard-stop signals are collected as a **tri-state control per declared stop** (Not assessed / Present / Not present), defaulting to unknown. Without it the hard-stop refusal could never fire live and §6's SIT spec would be undrivable — flagging it as the one shape judgement I made.
+
+**Half B** — `prompt-serializers.test.ts:116` now asserts the shipped `PROBLEM LIST` block (and `not.toContain('Conditions:')`), with a comment naming the OBS-S6S68 chip-routing decision. `buildScribeContext` untouched. `src/lib/llm/**`: **23 files, 403 tests, 0 failures** (the brief said 22 files; there are 23 on this base).
+
+## Gates
+
+- `npx tsc --noEmit` → **0 errors**
+- `npm run build` → **exit 0**
+- `npm test` → completes; **no new failing file**. Scoped re-runs with and without my changes give the identical 4 red files / 17 red tests: `seed-hrt-scenarios` + `seed-intervention-vocabulary` (Dr. K's two synth reds, as the brief predicted) plus `task-helpers.test.ts` (5) and `TasksQueuePage.test.tsx` (8), which are also baseline reds the brief didn't mention. `ConsentTab` / `SchedulePage` / `CarePlanAssignDialog` appear only in whole-repo runs and pass scoped — load flakes.
+- `eslint` on the five touched files → clean.
+- New tests: 12 card + 3 section, all passing.
+
+## STOP-and-report: a live blocker the SIT spec found
+
+`sit/integration/longevity-prescribe-surface.integration.test.ts` ran against live Medplum and is **RED on the supplement route**, for a real product defect outside this route's scope guard:
+
+`assignSupplementPlan` (`src/lib/clinical/supplements/supplement-protocol-crud.ts:70-80`) builds `CarePlan.activity[0]` with **both** `reference` and `detail`, violating FHIR invariant **cpl-3**. MockClient enforces no invariants so every unit suite is green; the live server 400s the CarePlan entry while the ServiceRequest in the same transaction still commits (non-atomic), leaving an orphan ServiceRequest and no plan. It had no UI consumer until this brief, so mounting the surface is what exposed it.
+
+I did **not** fix it — it's outside §1's affected surface — and I did not weaken the assertion to green. The spec's header documents the diagnosis; the lifestyle and drug routes were verified landing live in the same session and have their own green tests. This needs a one-line follow-up brief. (It's the second instance of the cpl-3 pattern; `materializeCarePlan` has the same bug per the existing note, which I've extended.)
+
+Two smaller flags: the brief's §3.4 says "Lucide icons", but the repo has no `lucide-react` and the house pattern uses `@tabler/icons-react` — I followed the house pattern. And the section renders only for an enrolled patient (`useLongevityRowData`), matching D-S7CORE5-03 and the other two L capture surfaces; say the word if the prescribe surface should instead be unconditional.
+
+============================================================
+Finished: 2026-09-14T22:11:37.949966
+Exit: 0

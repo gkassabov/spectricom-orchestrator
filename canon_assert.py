@@ -48,13 +48,14 @@ core_brief_set() and nowhere else.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Optional
+from typing import Iterable, Mapping, Optional, Sequence
 
 HERE = Path(__file__).resolve().parent
 DOC_SWEEP = HERE / "doc-sweep.sh"
@@ -777,6 +778,138 @@ def check_gate_log_invariants(entries: Iterable[Mapping[str, object]]) -> list[G
                                     exit_code=e.get("exit_code"),
                                     log_file=log_file if log_file else None, reason=reason))
     return out
+
+
+# ── ORCH-HANDBACK-GUARD-1 · the handback invariant (S7-CORE-15 · [TONI-BACKGROUND-EXIT]) ──────
+# The executor sometimes starts a long verification in the background and ends its turn. `claude`
+# exits 0, fire_toni writes `Exit: 0`, and the route went on to commit, gate and merge a coherent
+# tree that was missing its last step — build, tsc, unit and SIT all ask "is this tree sound", and
+# a tree missing its last step answers yes to all four. This one asks what none of them does:
+#
+#     the executor's own closing words do not advertise outstanding work
+#
+# 27 of the 829 fire_toni logs dated up to route 54 advertise it; at least 10 of those merged.
+# The phrase set is CONFIG (config/handback-guard.json), never source: this module holds the
+# shape, the resolver and its None fallback. A phrasing never seen before is not caught until a
+# rule is added there — the known weakness of a blocklist, stated rather than hidden.
+
+TONI_HEADER = "=== TONI EXECUTION ==="
+TONI_RULE = "=" * 60        # fire_toni's header and trailer rules
+_HANDBACK_LINE_MAX = 160
+
+
+@dataclass(frozen=True)
+class OutstandingWorkRule:
+    id: str                  # e.g. "background"
+    pattern: "re.Pattern[str]"
+
+
+@dataclass(frozen=True)
+class HandbackViolation:
+    """One reason a route's executor output does not show that it finished."""
+    log_file: str
+    reason: str              # "outstanding-work" | "log-unreadable" | "no-toni-header"
+    rule: str                # the rule id for outstanding-work, else ""
+    line_no: int             # 1-based line in the log file; 0 when not line-specific
+    line: str                # the matched line, stripped, truncated to 160 chars; "" otherwise
+
+    def __str__(self) -> str:
+        if self.reason != "outstanding-work":
+            return self.reason
+        return f"{self.reason} {self.rule} L{self.line_no}: {self.line}"
+
+
+def load_outstanding_work_rules(path: Path) -> Optional[tuple[OutstandingWorkRule, ...]]:
+    """The resolver for check_handback_invariants' phrase set: `path` is JSON shaped
+    `{"outstanding_work": [{"id": str, "regex": str, "evidence": [str, ...]}, ...]}`, each regex
+    compiled with re.IGNORECASE, in file order.
+
+    None (INSUFFICIENT) when the file is missing or unreadable, is not valid JSON, has no
+    non-empty `outstanding_work` list, has an entry lacking `id` or `regex`, repeats an `id`, or
+    holds a regex that does not compile. The caller maps None to BLOCKED(environment) for every
+    route it is asked to judge: a guard with no rules must not read as a guard that found nothing.
+    JSON, not YAML, so this module stays stdlib-only.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entries = data.get("outstanding_work") if isinstance(data, dict) else None
+    if not isinstance(entries, list) or not entries:
+        return None
+    rules: list[OutstandingWorkRule] = []
+    seen: set[str] = set()
+    for e in entries:
+        rid = e.get("id") if isinstance(e, dict) else None
+        rx = e.get("regex") if isinstance(e, dict) else None
+        if not isinstance(rid, str) or not rid or not isinstance(rx, str) or not rx or rid in seen:
+            return None
+        seen.add(rid)
+        try:
+            rules.append(OutstandingWorkRule(id=rid, pattern=re.compile(rx, re.IGNORECASE)))
+        except re.error:
+            return None
+    return tuple(rules)
+
+
+def _executor_output(lines: Sequence[str]) -> range:
+    """Indices (0-based) of the executor output in a fire_toni log's `lines`: strictly after the
+    first 60-`=` rule following the header, strictly before the LAST 60-`=` rule that is
+    followed within 3 lines by a line starting `Exit:` — or to end of file when there is no
+    such trailer (fire_toni's timeout and exception paths write none)."""
+    start = next((i for i in range(1, len(lines)) if lines[i].strip() == TONI_RULE), None)
+    if start is None:
+        return range(0)
+    end = len(lines)
+    for j in range(len(lines) - 1, start, -1):
+        if lines[j].strip() == TONI_RULE and any(l.startswith("Exit:") for l in lines[j + 1:j + 4]):
+            end = j
+            break
+    return range(start + 1, end)
+
+
+def check_handback_invariants(log_file: Path, rules: Sequence[OutstandingWorkRule]) -> list[HandbackViolation]:
+    """[ORCH-HANDBACK-GUARD-1] EMPTY WHEN CLEAN. The set is the executor output of ONE fire_toni
+    log: every non-blank line strictly after the first 60-`=` rule that follows the
+    `=== TONI EXECUTION ===` header, and strictly before the last 60-`=` rule followed within 3
+    lines by `Exit:` (fire_toni's normal-path trailer); with no such trailer the output runs to
+    end of file. EXCLUDED: the header block, the trailer block, blank lines.
+
+      * the file cannot be opened or read (OSError, not found included) ⇒ one `log-unreadable`;
+      * line 1 does not start with the header ⇒ one `no-toni-header`;
+      * otherwise AT MOST ONE violation per rule — the first output line it matches, in file
+        order. Every rule is tested against every output line on its own, so `^` anchors at
+        the line start. Violations are returned in file order.
+
+    Empty executor output is NOT a violation: it advertises nothing (ORCH-HANDBACK-GUARD-2's
+    question, not this one's).
+
+    UNREADABLE IS A VIOLATION HERE, ON PURPOSE — the opposite of _landed's rule, for a different
+    reason than check_gate_log_invariants'. _landed's violations authorise a destructive action;
+    this predicate's authorise only a REFUSAL TO MERGE, and a route with no readable closing
+    words has given no evidence that it finished. The caller maps log-unreadable and
+    no-toni-header to BLOCKED(environment), never to INCOMPLETE(executor): fire_toni creates
+    the log before it spawns the child, so a missing one is an environment fault by construction.
+
+    The phrase set is config (load_outstanding_work_rules), never a literal in this module.
+    """
+    name = str(log_file)
+    try:
+        text = Path(log_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [HandbackViolation(name, "log-unreadable", "", 0, "")]
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith(TONI_HEADER):
+        return [HandbackViolation(name, "no-toni-header", "", 0, "")]
+    out: list[HandbackViolation] = []
+    for rule in rules:
+        for i in _executor_output(lines):
+            line = lines[i]
+            if line.strip() and rule.pattern.search(line):
+                out.append(HandbackViolation(name, "outstanding-work", rule.id, i + 1,
+                                             line.strip()[:_HANDBACK_LINE_MAX]))
+                break
+    return sorted(out, key=lambda v: v.line_no)
 
 
 # ── verdict building ─────────────────────────────────────────────────────────────────────

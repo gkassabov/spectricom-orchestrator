@@ -33,7 +33,8 @@ import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
 # ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
 # shared with the tests; canon_assert imports nothing from here.
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
-from canon_assert import QueueRepo, check_branch_freshness_invariants, check_route_landed_invariants
+from canon_assert import (QueueRepo, check_branch_freshness_invariants, check_handback_invariants,
+                          check_route_landed_invariants, load_outstanding_work_rules)
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
 PREFIRE_BYPASS = False
@@ -452,6 +453,9 @@ class Status(str, Enum):
     # [ORCH-10] Neither `passed` nor `failed`: the route's own git state moved under it,
     # so nothing the run observed about the product can be trusted. See TAMPER_VERDICT.
     TAMPERED="tampered"
+    # [ORCH-HANDBACK-GUARD-1] Neither `passed` nor `failed`: the executor's own closing words said
+    # it had not finished, so no gate was run and nothing merged. See INCOMPLETE_VERDICT.
+    INCOMPLETE="incomplete"
 
 @dataclass
 class Brief:
@@ -889,6 +893,10 @@ TAMPER_VERDICT = "TAMPERED"  # greppable in the FINAL STATUS line and in orchest
 # [ORCH-CONFLICT-1] greppable in the FINAL STATUS gate field. Not a GateOutcome: the gate said PASS
 # and was right; it is the merge that followed it that did not land.
 MERGE_CONFLICT_VERDICT = "MERGE CONFLICT"
+# [ORCH-HANDBACK-GUARD-1] greppable in the FINAL STATUS gate field. Not a GateOutcome: no gate ran.
+# Neither product nor environment — the executor said it had not finished.
+INCOMPLETE_VERDICT = "INCOMPLETE(executor)"
+HANDBACK_GUARD_CONFIG = ORCH_DIR / "config" / "handback-guard.json"
 
 
 def _git_read(cmd: str, cwd: Path) -> str:
@@ -1045,14 +1053,17 @@ def _log_tamper_outcome(archive: Path, repo_path: Path, report: TamperReport):
 
 def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
                        gate_collection: Optional[str], unit_collection: Optional[str] = None,
-                       tampered: Optional[str] = None) -> str:
+                       tampered: Optional[str] = None, incomplete: Optional[str] = None) -> str:
     """[ORCH-2] `PASS (7 files/18 tests, 6.6s)` when the SIT summary parsed; the prior wording
     (`PASS` / verdict label / `not run`) when it did not.
     [ORCH-3] appends ` | unit: <baseline> → <branch>` when the unit baseline gate ran.
     [ORCH-10] a tampered run never ran a gate, and says so in a way that cannot be misread
-    as the ordinary ungated `not run`."""
+    as the ordinary ungated `not run`.
+    [ORCH-HANDBACK-GUARD-1] likewise an incomplete route: `incomplete` is "<rule> at line <n>"."""
     if tampered:
         return f"not run ({TAMPER_VERDICT} — route ref moved)"
+    if incomplete:
+        return f"not run ({INCOMPLETE_VERDICT} — {incomplete})"
     s = gate_error or gate_outcome or "not run"
     if gate_collection:
         s = f"{s} ({gate_collection})"
@@ -1063,7 +1074,7 @@ def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
 def notify(result: Result):
     e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else
         ("🚨" if result.status == Status.TAMPERED else "❌"))
-    status_label = "passed (no changes)" if result.no_changes else result.status.value
+    status_label = "passed (no changes)" if result.no_changes and result.status == Status.PASSED else result.status.value
     msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
     if result.tampered:
         # [ORCH-10] the gate is named even though none ran — silence here is what made the
@@ -2731,6 +2742,42 @@ def flaky_report(repo_filter: str = ""):
     print(f"{'═'*60}\n")
 
 
+_LOG_TS_RE = re.compile(r"-(\d{8}-\d{6})\.log$")
+
+
+def handback_scan(paths: list[str], until: Optional[str] = None) -> int:
+    """[ORCH-HANDBACK-GUARD-1] the `handback-scan` subcommand: check_handback_invariants over
+    fire_toni logs, with the same rules _run_batch_inner judges by. Each PATH is a file or a
+    directory (its `toni-*.log`, non-recursive); no PATH ⇒ LOG_DIR/<log_subdir> for every repo in
+    config/repos.yaml. `until` (YYYYMMDD-HHMMSS) keeps only logs whose filename timestamp is <= it,
+    which pins a corpus. Read-only. Returns 1 if any violation, 2 if the rules do not resolve."""
+    rules = load_outstanding_work_rules(HANDBACK_GUARD_CONFIG)
+    if rules is None:
+        print(f"handback guard unconfigured: {HANDBACK_GUARD_CONFIG} is missing or invalid")
+        return 2
+    if not paths:
+        repos = load_repo_config()["repos"]
+        paths = [str(LOG_DIR / r.get("log_subdir", n)) for n, r in repos.items()]
+    files: list[Path] = []
+    for raw in paths:
+        p = Path(raw).expanduser()
+        files.extend(sorted(p.glob("toni-*.log")) if p.is_dir() else [p])
+    if until:
+        files = [f for f in files if (m := _LOG_TS_RE.search(f.name)) and m.group(1) <= until]
+    counts = {"outstanding-work": 0, "no-toni-header": 0, "log-unreadable": 0, "clean": 0}
+    per_rule = {r.id: 0 for r in rules}
+    for f in files:
+        found = check_handback_invariants(f, rules)
+        for v in found:
+            print(f"FAIL {f}: {v}")
+            if v.reason == "outstanding-work":
+                per_rule[v.rule] += 1
+        counts[found[0].reason if found else "clean"] += 1
+    print(f"{len(files)} logs scanned: " + ", ".join(f"{n} {k}" for k, n in counts.items())
+          + "; per rule: " + ", ".join(f"{k} {n}" for k, n in per_rule.items()))
+    return 1 if len(files) != counts["clean"] else 0
+
+
 def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
     """Rehydrate a stored measurement. `error` stays None and `output` empty: this is a real
     measurement that completed, and it has no output to classify."""
@@ -3405,6 +3452,47 @@ def sit_report_aggregate(since: Optional[str] = None):
 # ═══════════════════════════════════════════════════════
 # BATCH RUNNER
 # ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+# [ORCH-HANDBACK-GUARD-1] A ROUTE THAT SAYS IT IS UNFINISHED DOES NOT MERGE
+# ═══════════════════════════════════════════════════════
+# The executor sometimes starts a long verification in the background and ends its turn:
+# `claude` exits 0 and the route went on to commit, gate and merge a coherent tree missing its
+# last step. 27 of 829 fire_toni logs up to route 54 advertise outstanding work; at least 10
+# merged. The predicate and its rules live in canon_assert / config/handback-guard.json.
+@dataclass(frozen=True)
+class HandbackHold:
+    """Why a route's merge is withheld before any gate runs."""
+    status: Status          # INCOMPLETE (the executor said so) | BLOCKED (the guard could not judge)
+    verdict: str            # INCOMPLETE_VERDICT | GateOutcome.BLOCKED_ENV.value
+    label: str              # "<rule> at line <n>" | the unjudgeable reason
+    error: str              # the Result.error line; for INCOMPLETE it quotes the matched line
+
+
+def _handback_hold(out_log: str) -> Optional[HandbackHold]:
+    """Resolve the rules once and judge the route's fire_toni log once. None ⇒ nothing outstanding
+    is advertised and the route goes on to its gates as before. Unjudgeable (rules unresolved,
+    log unreadable, no fire_toni header) ⇒ BLOCKED(environment): fail-closed, never INCOMPLETE."""
+    rules = load_outstanding_work_rules(HANDBACK_GUARD_CONFIG)
+    if rules is None:
+        reason = "handback-guard-unconfigured"
+    else:
+        found = check_handback_invariants(Path(out_log), rules)
+        if not found:
+            return None
+        if found[0].reason == "outstanding-work":
+            for v in found:
+                log.error(f"⛔ {INCOMPLETE_VERDICT}: {v.rule} at line {v.line_no}: \"{v.line}\"")
+            v = found[0]
+            return HandbackHold(
+                Status.INCOMPLETE, INCOMPLETE_VERDICT, f"{v.rule} at line {v.line_no}",
+                f"{INCOMPLETE_VERDICT} — executor output advertises outstanding work: "
+                f"{v.rule} at line {v.line_no}: \"{v.line}\"")
+        reason = found[0].reason
+    log.error(f"⛔ {GateOutcome.BLOCKED_ENV.value} — handback guard: {reason} ({out_log})")
+    return HandbackHold(Status.BLOCKED, GateOutcome.BLOCKED_ENV.value, reason,
+                        f"{GateOutcome.BLOCKED_ENV.value} — handback guard: {reason}")
+
+
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     # HOOK-1 / D-S7CORE4-02 — assertions checked at the moment of action.
     if not PREFIRE_BYPASS and not prefire.report(batch_file):
@@ -3477,6 +3565,14 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
                                                   batch_file=batch_file)
                     if merged:
                         cleanup_worktree(meta_wt)
+                elif result is not None and result.status == Status.INCOMPLETE:
+                    # [ORCH-HANDBACK-GUARD-1] no gate ran, so gate_outcome is None: name the verdict here
+                    # rather than fall through to the generic "Self-mod fire failed".
+                    log.error(
+                        f"⛔ Self-mod merge WITHHELD — {result.error}. "
+                        f"Branch preserved: {meta_branch}. Worktree preserved: {meta_wt}. "
+                        f"Re-fire, or after review: cd {ORCH_DIR} && git merge --ff-only {meta_branch}"
+                    )
                 elif result is not None and result.gate_outcome not in (None, GateOutcome.PASS.value):
                     log.error(
                         f"⛔ Self-mod merge WITHHELD — {result.gate_outcome}: {result.error}. "
@@ -3585,6 +3681,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     else:
         _produced_work = (ec == 0)
     status = Status.PASSED if (ec == 0 or _produced_work) else Status.FAILED
+    # [ORCH-HANDBACK-GUARD-1] T2.1: judge the executor's closing words once, here. A tampered
+    # route is not judged — TAMPERED already stops it. A hold keeps `status` PASSED until its
+    # lane below has committed the work onto the route branch, then replaces the gate.
+    hold = _handback_hold(out_log) if (tamper is None and status == Status.PASSED) else None
     if tamper is not None:
         # [ORCH-10] S2: not `passed`, and not `failed(product)` either — the run was handed a
         # repo it no longer recognises, so it has no opinion about the product at all.
@@ -3608,7 +3708,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     pw_ok, pw_cnt = (None, 0)
     # [ORCH-10] S2: a tampered run runs no gate — Playwright included. Its result would
     # describe a tree the route does not own, and a red one would overwrite the verdict.
-    if RUN_PLAYWRIGHT and ec == 0 and worktree is None and tamper is None:
+    if RUN_PLAYWRIGHT and ec == 0 and worktree is None and tamper is None and hold is None:
         pw_ok, pw_cnt = run_playwright()
         if not pw_ok: status = Status.FAILED
 
@@ -3674,11 +3774,27 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     # MERGE_TARGET tip untouched, branch preserved for review.
                     # (2026-09-09: merge-then-gate let a red sit:gate land on main.)
                     # Gate set is per-repo via PRE_MERGE_GATES (clinical-mp: build → SIT, S6S47).
-                    verdict = run_pre_merge_gates(proj, branch_name)
-                    gate_outcome = verdict.outcome.value
-                    gate_collection = verdict.collection
-                    unit_collection = verdict.unit_collection
-                    if verdict.outcome is not GateOutcome.PASS:
+                    # [ORCH-HANDBACK-GUARD-1] T2.3: a held route is committed above (the failed-batch
+                    # branch below would check out MERGE_TARGET WITHOUT committing, dragging the work
+                    # into the target's checkout), then gets no gate and no merge. Its status is set
+                    # after the lanes, from the hold.
+                    verdict = None
+                    if hold is None:
+                        verdict = run_pre_merge_gates(proj, branch_name)
+                        gate_outcome = verdict.outcome.value
+                        gate_collection = verdict.collection
+                        unit_collection = verdict.unit_collection
+                    if verdict is None:
+                        subprocess.run(
+                            f'git notes add -m "HANDBACK GUARD: {hold.verdict} — {hold.label}"',
+                            shell=True, capture_output=True, cwd=str(proj)
+                        )
+                        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                        log.error(
+                            f"⛔ {hold.verdict} — {MERGE_TARGET} NOT merged, no gate run. Branch preserved: "
+                            f"{branch_name}. {hold.error}"
+                        )
+                    elif verdict.outcome is not GateOutcome.PASS:
                         gate_error = verdict.label
                         subprocess.run(
                             f'git notes add -m "PRE-MERGE GATE: {gate_outcome} — {verdict.gate}: {verdict.signal}"',
@@ -3758,6 +3874,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     no_change_run = True
                     subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
                     subprocess.run(f"git branch -D {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                    if hold is not None:
+                        # [ORCH-HANDBACK-GUARD-1] nothing to merge, but still not `passed` (set below).
+                        log.error(f"⛔ {hold.verdict} — produced no changes and said it had not finished. "
+                                  f"{hold.error}")
             else:
                 # Failed batch — switch back to merge target, leave branch for inspection
                 subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
@@ -3771,17 +3891,30 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         # `proj`. Gate it HERE so the Result carries the verdict BEFORE run_batch decides
         # whether to call _self_mod_auto_merge (--ff-only). Red ⇒ run_batch withholds the merge.
         meta_branch = f"{BRANCH_PREFIX}-{batch_file.stem}"
-        try:
-            verdict = run_pre_merge_gates(proj, meta_branch)
-        except Exception as e:
-            verdict = _classify_gate_failure("build", str(e), proj, -1)
-            log.error(f"⛔ Pre-merge gate raised on {meta_branch}: {e} → {verdict.label}")
-        gate_outcome = verdict.outcome.value
-        gate_collection = verdict.collection
-        unit_collection = verdict.unit_collection
-        if verdict.outcome is not GateOutcome.PASS:
-            gate_error = verdict.label
-            status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
+        if hold is not None:
+            # [ORCH-HANDBACK-GUARD-1] T2.4: no gate; run_batch merges only `passed` (set below).
+            log.error(f"⛔ {hold.verdict} — no gate run, self-mod merge withheld. "
+                      f"Branch preserved: {meta_branch}. {hold.error}")
+        else:
+            try:
+                verdict = run_pre_merge_gates(proj, meta_branch)
+            except Exception as e:
+                verdict = _classify_gate_failure("build", str(e), proj, -1)
+                log.error(f"⛔ Pre-merge gate raised on {meta_branch}: {e} → {verdict.label}")
+            gate_outcome = verdict.outcome.value
+            gate_collection = verdict.collection
+            unit_collection = verdict.unit_collection
+            if verdict.outcome is not GateOutcome.PASS:
+                gate_error = verdict.label
+                status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
+
+    if hold is not None and status == Status.PASSED:
+        # [ORCH-HANDBACK-GUARD-1] every lane above, and any it does not name (no route branch, a
+        # parallel worktree, a git automation error): a held route is never reported `passed`.
+        # BLOCKED(environment) is a GateOutcome and fills the gate field; INCOMPLETE is not.
+        status, gate_error = hold.status, hold.error
+        if hold.status is Status.BLOCKED:
+            gate_outcome = hold.verdict
 
     # [ORCH-CONFLICT-1] the landed invariant: a route-lane `passed` that produced changes has its
     # tip on MERGE_TARGET and leaves the repo not mid-merge. Acted on, not just logged — this
@@ -3798,8 +3931,9 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
 
     # [ORCH-10] AC-O10-05: `tampered` in the status field and `TAMPERED` in the gate field —
     # distinct from `passed` and from `FAIL(product)`, and greppable either way.
+    incomplete = hold.label if hold is not None and status == Status.INCOMPLETE else None
     log.info(f"🏁 FINAL STATUS: {status.value} | gate: "
-             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label)}")
+             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label, incomplete)}")
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),
@@ -3844,7 +3978,7 @@ def run_queue(files: list[Path], force: bool = False, skip_deps: bool = False):
         save_state(state)
         # [ORCH-10] TAMPERED halts too: the working directory is not the one the route was
         # handed, so firing the next batch in it would compound the damage, not survive it.
-        if r.status in (Status.FAILED, Status.BLOCKED, Status.TAMPERED):
+        if r.status in (Status.FAILED, Status.BLOCKED, Status.TAMPERED, Status.INCOMPLETE):
             rem = len(files)-i-1
             if rem: log.error(f"⛔ Queue HALTED ({r.gate_outcome or r.status.value}) — {rem} batches skipped")
             break
@@ -4243,6 +4377,11 @@ def main():
     fkp = sp.add_parser("flaky", help="Report the accumulated flaky-file tail (read-only)")
     fkp.add_argument("--repo", default="", help="Narrow the report to one repo (from config/repos.yaml)")
 
+    hsp = sp.add_parser("handback-scan",
+                        help="Check fire_toni logs for executor output that advertises outstanding work (read-only)")
+    hsp.add_argument("paths", nargs="*", help="toni-*.log files or directories (default: every repo's log dir)")
+    hsp.add_argument("--until", default=None, help="Only logs whose filename timestamp is <= YYYYMMDD-HHMMSS")
+
     a = ap.parse_args()
 
     # OI-026 A3: resolve repo — --repo CLI > ## Repo: header > default
@@ -4335,6 +4474,9 @@ def main():
 
     elif a.cmd == "flaky":
         flaky_report(getattr(a, "repo", "") or "")
+
+    elif a.cmd == "handback-scan":
+        sys.exit(handback_scan(a.paths, a.until))
 
     else:
         ap.print_help()

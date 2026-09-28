@@ -1,0 +1,11 @@
+=== TONI EXECUTION ===
+Batch: 53-l-rx-safety-1-no-doseless-active-order.md
+Started: 2026-09-27T15:54:03.367805
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-5-5 --effort high "Read briefs/53-l-rx-safety-1-no-doseless-active-order.md and execute all briefs in order."
+============================================================
+
+Memory recorded. Waiting for the final-tree baseline run to complete.
+
+============================================================
+Finished: 2026-09-27T16:07:26.853596
+Exit: 0

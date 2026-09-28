@@ -103,7 +103,7 @@ def fire(route, monkeypatch, executor, gate=orchestrator.GateOutcome.PASS):
 
     monkeypatch.setattr(orchestrator, "run_pre_merge_gates", _fake_gate)
     monkeypatch.setattr(orchestrator, "fire_toni",
-                        lambda target, proj: (executor(proj), "toni-test.log"))
+                        lambda target, proj: (executor(proj), (lambda p: p.write_text(f"=== TONI EXECUTION ===\n{'=' * 60}\n\nDone.\n\n{'=' * 60}\nExit: 0\n") and str(p))(route.proj.parent / "toni-test.log")))
     route.result = orchestrator._run_batch_inner(
         route.brief, route.proj, orchestrator.datetime.now(), worktree=None
     )

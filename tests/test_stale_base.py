@@ -127,7 +127,7 @@ def fire(route, monkeypatch, executor, gate=orchestrator.GateOutcome.PASS):
 
     def _toni(target, proj):
         route.sample()
-        return executor(proj), "toni-test.log"
+        return executor(proj), (lambda p: p.write_text(f"=== TONI EXECUTION ===\n{'=' * 60}\n\nDone.\n\n{'=' * 60}\nExit: 0\n") and str(p))(route.proj.parent / "toni-test.log")
 
     monkeypatch.setattr(orchestrator, "run_pre_merge_gates", _fake_gate)
     monkeypatch.setattr(orchestrator, "fire_toni", _toni)

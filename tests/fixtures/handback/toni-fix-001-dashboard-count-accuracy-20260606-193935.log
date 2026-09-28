@@ -1,0 +1,28 @@
+=== TONI EXECUTION ===
+Batch: fix-001-dashboard-count-accuracy.md
+Started: 2026-06-06T19:39:35.359305
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-4-8 --effort high "Read briefs/fix-001-dashboard-count-accuracy.md and execute all briefs in order."
+============================================================
+
+Brief fix-001 complete and committed (`0eeff3d`). This was the only brief in the file — per Rule 1 (one brief per session, no chaining), I'm stopping here and returning control.
+
+## What I did
+
+**Premise (STOP-FIRST):** Confirmed TRUE — the dashboard re-derived counts via different queries than its source surfaces:
+- Unsigned notes: dashboard used `useHomeAwaitingFinalize` (Encounter-based) vs `/Inbox/notes` (`Composition`, status=preliminary, author=provider).
+- Pending refills: dashboard used `useHomeInboxRefills` (extra `intent=order` + `requester=Patient/` filter) vs `/refills` (`MedicationRequest` status=draft, panel-scoped, deduped).
+
+**Fix (single source of truth):**
+- Extracted the canonical `/Inbox/notes` query into `src/hooks/useInboxUnsignedNotes.ts` and the `/refills` query into `src/hooks/useRefillsQueue.ts`.
+- Refactored `InboxNotesPage` and `RefillsPage` to consume those hooks (behavior-preserving — page-only context resolution/rendering stays in `RefillsPage`).
+- Pointed `ProviderDashboardPage` at the same two hooks, so the cards now read the exact source-surface counts.
+
+**Preserved:** the 4 correct cards, all 6 deep-links, config-gating, and the Home hooks (`useHomeAwaitingFinalize`/`useHomeInboxRefills` still used by Home sections — untouched). Left a one-line BUG-026 comment for the out-of-scope Home refill-parity gap.
+
+**Tests:** added `ProviderDashboardPage.test.tsx` (asserts unsigned/refill cards source from the shared hooks) and query-shape tests for both new hooks.
+
+**Closure:** `tsc --noEmit` clean · target + refills/inbox/home suites pass (74 tests) · `npm run build` green. One unrelated pre-existing failure in `PortalHomePage.test.tsx` (untouched file, imports none of my changes).
+
+============================================================
+Finished: 2026-06-06T19:54:13.066981
+Exit: 0

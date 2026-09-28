@@ -1,0 +1,38 @@
+=== TONI EXECUTION ===
+Batch: 46-date-8-the-residual-set-closed-by-predicate.md
+Started: 2026-09-27T13:04:14.545907
+Command: cd /home/gkassa/spectricom-clinical-mp && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-5-5 --effort high "Read briefs/46-date-8-the-residual-set-closed-by-predicate.md and execute all briefs in order."
+============================================================
+
+DATE-8 is done and committed as `d033c6db`. Following Rule 1, I stopped there; I did not start the new untracked briefs 49 and 50. `npx tsc --noEmit` and `npm run build` both exit 0. All three changed test files pass. The date predicate still returns an empty list under UTC, New York and Sydney for every default clock. The full handback is in `briefs/46-date-8-the-residual-set-closed-by-predicate.handback.md`.
+
+**What changed**
+- **Patient list, Last visit column (`PatientListPage.formatDate`):** it now shows the local day a visit started. A visit at 23:00 local no longer shows as the next day west of Greenwich, and one at 00:30 no longer shows as the previous day east of it. An unreadable value is still returned unchanged.
+- **Pre-visit brief:** a patient message is dated by the local day it was sent. A follow-up is overdue only once its due day has passed locally, the same rule the Tasks queue uses. The two now agree on every Task in the tests.
+- **Date checker:** two new checks, T7 for the Last visit column and T8 for the pre-visit brief. The tests prove the old versions of both sites fail them and the new versions pass.
+- **One fixture moved:** in `previsit-brief-generator.test.ts`, a message time changed from `2026-06-18T00:00Z` to `T12:00Z`, because midnight UTC is 17 June in New York. The assertion is unchanged.
+
+**Where the brief was wrong or I went beyond it**
+- **The old overdue bug was not only west of Greenwich.** `Date.parse(due) < now` flagged a follow-up overdue for its whole due day in every zone, UTC included. So with the fix reverted, UTC did not stay green as the brief expected: 2 tests went red there (8 red in total, 4 in New York). The old version of the pre-visit brief is also not harmless on UTC in the checker, so I assert it fails there too instead of asserting it passes.
+- **Unreadable due dates:** the old code showed a dangling `due ` with no date, not "no due detail" as the brief said. It now shows nothing.
+- **Impossible dates:** Node reads `new Date('2026-02-30')` as 2 March. The old list showed that as `2026-03-02`, and the old brief marked it overdue. Both now reject it.
+- **One extra check:** I added a 00:30 message case to T8. With only the 23:00 case the old code passes in Sydney.
+- **The code base had moved:** HEAD was `536a633a` (BASELINE-0), not `62b27309`. None of the six files I changed differ between the two, and the starting counts matched.
+- **Repo-wide `toISOString().slice(0, 10)` count went from 54 to 55, not 52.** I removed the two in the product code (non-test count 38 → 36). The old-version fixtures the brief asked for add three, including one comment.
+
+**Full test run** (finished 13:15 EDT, `TZ` unset, machine zone America/New_York): 5 tests failed in 3 files, none of them mine.
+- 3 are the known `seed-hrt-scenarios` failures, identical at 62b27309.
+- 2 are `seed-longevity` 30-second timeouts. Both pass when their files run alone, and a full run at 62b27309 fails the same two, so they are load flakes, not a halt.
+
+**Found and left:**
+- `task-helpers.getDueDate` has its own date parser. A year-only or year-month value falls through to UTC.
+- The Tasks queue and the pre-visit brief still differ on which field is the due date: the queue falls back to `executionPeriod.end`.
+- They also differ on which statuses count as open: the brief includes `ready` and `on-hold`.
+
+These are listed as follow-up candidates alongside the four the brief already named. The field and status question is yours to decide.
+
+The site isn't COMPLETE until a person checks both screens in a browser. Separately, Gmail, Google Calendar and Yorsie MCP need authorising in your claude.ai connector settings before they can be used.
+
+============================================================
+Finished: 2026-09-27T13:23:05.982176
+Exit: 0
