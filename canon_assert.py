@@ -51,6 +51,7 @@ import argparse
 import json
 import re
 import stat
+import statistics
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -978,6 +979,91 @@ def check_bg_ceiling_invariants(site: str, env: Optional[Mapping[str, str]],
         return _v("ceiling-not-positive")
     if ms >= 1000 * route_timeout_s:
         return _v("ceiling-not-below-route-timeout")
+    return []
+
+
+# ── GATE-CLOCK-1 · the clock a verdict stands on (S7-CORE-16) ──────────────────────────────
+# Route 59's first fire timed its unit branch leg at 15 867.9 s of WALL time across a ~4 h host
+# sleep; its second fire timed the same suite at 336.7 s. The gate read only time.time(), so a red
+# from that leg would have been a product verdict about a machine that was asleep. For every gate
+# leg l the orchestrator times, with its three clocks read at start and end and H the recorded
+# PLAUSIBLE wall durations of the same (repo, leg kind):
+#
+#     plausible(l) ⇔ |Δwall − Δmonotonic| ≤ CLOCK_WALL_JUMP_S               (no NTP / Hyper-V step)
+#                  ∧ (Δboottime unknown ∨ Δboottime − Δmonotonic ≤ CLOCK_SUSPEND_S)  (no kernel suspend)
+#                  ∧ (|H| < CLOCK_HISTORY_MIN ∨ Δwall ≤ CLOCK_OUTLIER_FACTOR · median(H))
+#
+# The caller maps an implausible RED leg to BLOCKED(environment) `clock-implausible` — a sleep can
+# manufacture failures — keeps an implausible GREEN leg green, saying so (it cannot manufacture
+# passes), and never records an implausible leg's duration into H.
+
+CLOCK_WALL_JUMP_S = 60.0
+CLOCK_SUSPEND_S = 60.0
+CLOCK_OUTLIER_FACTOR = 5.0
+CLOCK_HISTORY_MIN = 3
+
+
+@dataclass(frozen=True)
+class LegClocks:
+    """The three clocks, read together at one instant."""
+    wall: float                 # time.time()
+    monotonic: float            # time.monotonic()
+    boottime: Optional[float]   # time.clock_gettime(CLOCK_BOOTTIME); None where unavailable
+
+
+@dataclass(frozen=True)
+class ClockViolation:
+    """One gate leg whose clocks do not support the duration it reports."""
+    leg_kind: str               # e.g. "unit-branch"
+    reason: str                 # wall-jump | suspended | outlier-vs-history
+    d_wall: float
+    d_monotonic: float
+    d_boottime: Optional[float]
+    median: Optional[float]     # outlier-vs-history only: the median it was judged against
+
+    def __str__(self) -> str:
+        if self.reason == "wall-jump":
+            why = f"Δwall {self.d_wall:.1f}s vs Δmonotonic {self.d_monotonic:.1f}s (> {CLOCK_WALL_JUMP_S:g}s apart)"
+        elif self.reason == "suspended":
+            why = (f"Δboottime {self.d_boottime:.1f}s vs Δmonotonic {self.d_monotonic:.1f}s "
+                   f"(suspended > {CLOCK_SUSPEND_S:g}s)")
+        else:
+            why = f"Δwall {self.d_wall:.1f}s > {CLOCK_OUTLIER_FACTOR:g} × median {self.median:.1f}s of its history"
+        return f"{self.leg_kind} {self.reason}: {why}"
+
+
+def check_clock_plausibility(leg_kind: str, clocks_start: LegClocks, clocks_end: LegClocks,
+                             history: Sequence[float]) -> list[ClockViolation]:
+    """[GATE-CLOCK-1] EMPTY WHEN PLAUSIBLE. Pure: no I/O and no clock read — the caller reads the
+    clocks and the history. The set is ONE leg of kind `leg_kind`; `history` is the recorded
+    plausible wall durations of the same (repo, leg kind). At most one violation — the FIRST that
+    applies, in this order:
+
+      1. wall-jump           — |Δwall − Δmonotonic| > CLOCK_WALL_JUMP_S (either direction);
+      2. suspended           — both boottimes known and Δboottime − Δmonotonic > CLOCK_SUSPEND_S;
+      3. outlier-vs-history  — len(history) >= CLOCK_HISTORY_MIN and
+                               Δwall > CLOCK_OUTLIER_FACTOR × median(history).
+
+    Fewer than CLOCK_HISTORY_MIN samples ⇒ clause 3 does not apply; no default median is invented.
+    A missing boottime (non-Linux) skips clause 2 only.
+    """
+    d_wall = clocks_end.wall - clocks_start.wall
+    d_mono = clocks_end.monotonic - clocks_start.monotonic
+    d_boot = (None if clocks_start.boottime is None or clocks_end.boottime is None
+              else clocks_end.boottime - clocks_start.boottime)
+
+    def _v(reason: str, median: Optional[float] = None) -> list[ClockViolation]:
+        return [ClockViolation(leg_kind=leg_kind, reason=reason, d_wall=d_wall, d_monotonic=d_mono,
+                               d_boottime=d_boot, median=median)]
+
+    if abs(d_wall - d_mono) > CLOCK_WALL_JUMP_S:
+        return _v("wall-jump")
+    if d_boot is not None and d_boot - d_mono > CLOCK_SUSPEND_S:
+        return _v("suspended")
+    if len(history) >= CLOCK_HISTORY_MIN:
+        median = statistics.median(history)
+        if d_wall > CLOCK_OUTLIER_FACTOR * median:
+            return _v("outlier-vs-history", median)
     return []
 
 

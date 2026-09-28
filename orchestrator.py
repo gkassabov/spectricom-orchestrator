@@ -34,8 +34,10 @@ import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
 # shared with the tests; canon_assert imports nothing from here.
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
 # TONI-BG-CEILING-1: the executor wait-ceiling invariant, asserted at fire_toni's spawn.
-from canon_assert import (BG_WAIT_CEILING_VAR, QueueRepo, check_bg_ceiling_invariants,
-                          check_branch_freshness_invariants, check_handback_invariants,
+# GATE-CLOCK-1: the clock-plausibility predicate, asserted at the end of every gate leg.
+from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, ClockViolation, LegClocks,
+                          QueueRepo, check_bg_ceiling_invariants, check_branch_freshness_invariants,
+                          check_clock_plausibility, check_handback_invariants,
                           check_route_landed_invariants, load_outstanding_work_rules)
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
@@ -326,6 +328,14 @@ UNIT_GATE_SKIP_BASELINE_WHEN_GREEN = True
 # S7-CORE-9 [ORCH-7] AC-O7-04: named once is noise; named this many times is a file to
 # quarantine. Never inline a number at a call site (CLAUDE.md).
 UNIT_FLAKY_QUARANTINE_THRESHOLD = 2
+# S7-CORE-16 [GATE-CLOCK-1]: the PLAUSIBLE wall durations of every gate leg, per (repo, leg kind) —
+# the history behind canon_assert.check_clock_plausibility's outlier clause. Kept in the gate-record
+# store (the archive dir beside orchestrator-sit-log.json and orchestrator-unit-log.json, gitignored):
+# neither of those records a per-leg duration with the clocks that make it trustworthy, and the
+# build gate records nothing at all. An implausible leg is never written here.
+GATE_DURATIONS_FILE = "gate-durations.json"
+GATE_DURATIONS_VERSION = 1
+GATE_DURATIONS_KEEP = 20   # newest plausible samples kept per (repo, leg kind); the median reads them all
 
 # ═══════════════════════════════════════════════════════
 # PRE-MERGE GATE POLICY (S7-CORE-4 [ORCH-1] — gate-then-merge)
@@ -852,8 +862,11 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
     v = check_bg_ceiling_invariants("orchestrator.fire_toni", env, route_timeout_s)
     if v:
         log.error(f"⛔ Toni NOT fired — bg-wait ceiling: {v[0]}")
+        log.error(f"🛡 bg-wait-ceiling: BLOCKED — {v[0].reason}; not fired")
         return -2, str(out_log)
     ceiling_ms = env[BG_WAIT_CEILING_VAR]
+    log.info(f"🛡 bg-wait-ceiling: CLEAN — {BG_WAIT_CEILING_VAR}={ceiling_ms} < {1000 * route_timeout_s} "
+             f"(route timeout {route_timeout_s}s)")
     log.info(f"  BG wait ceiling: {ceiling_ms}ms ({BG_WAIT_CEILING_VAR}; route timeout {route_timeout_s}s, margin {BG_WAIT_MARGIN_S}s)")
     log.info(f"  Log: {out_log}")
     try:
@@ -1532,6 +1545,111 @@ class BuildGateOutcome:
     error: Optional[str] = None
     duration_s: float = 0.0
     output: str = ""  # [ORCH-1] combined stdout+stderr tail for F-20 classification (never logged whole)
+    clock: Optional[ClockViolation] = None  # [GATE-CLOCK-1] the leg's clocks disagree; None = plausible
+
+
+# ── GATE-CLOCK-1 · every gate leg reads three clocks (S7-CORE-16) ───────────────────────────
+# L, the legs the orchestrator times — each judged exactly once, by _judge_leg, as it ends:
+#   build          run_build_gate
+#   sit-run        run_sit_post_merge, when the SIT gate runs in one invocation
+#   sit-batch      _run_sit_batched, once per batch
+#   sit-isolation  _sit_isolate, the alone re-runs after the refill pause (the pause is not measured)
+#   unit-branch    run_unit_gate, the branch leg
+#   unit-baseline  _unit_baseline_measure_or_reuse, only when MEASURED — a cache hit is not a leg
+#   unit-confirm   run_unit_gate, the isolation confirmation of newly-failing files
+# The verdict clause is one rule in _classify_gate_failure; the predicate is canon_assert's.
+def _leg_clocks() -> LegClocks:
+    """[GATE-CLOCK-1] wall, monotonic and boot time, read together. boottime is None where
+    CLOCK_BOOTTIME does not exist (non-Linux) — the suspend clause is then skipped, never guessed."""
+    try:
+        boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        boot = None
+    return LegClocks(wall=time.time(), monotonic=time.monotonic(), boottime=boot)
+
+
+def _gate_durations_load(archive: Path) -> dict:
+    """{repo: {leg kind: [{"at", "d_wall", "d_monotonic"}, ...]}} from the store; {} when absent,
+    unreadable or another version (the history then restarts — it never invents a sample)."""
+    f = archive / GATE_DURATIONS_FILE
+    if not f.exists():
+        return {}
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, ValueError):
+        log.warning(f"⚠️  Gate duration history unreadable at {f} — treated as empty (it will be rewritten)")
+        return {}
+    repos = data.get("repos") if isinstance(data, dict) and data.get("version") == GATE_DURATIONS_VERSION else None
+    return repos if isinstance(repos, dict) else {}
+
+
+def _gate_durations_history(archive: Path, kind: str) -> list:
+    """The recorded plausible wall durations of (ACTIVE_REPO_NAME, kind), oldest first."""
+    samples = ((_gate_durations_load(archive).get(ACTIVE_REPO_NAME) or {}).get(kind)) or []
+    return [float(s["d_wall"]) for s in samples
+            if isinstance(s, dict) and isinstance(s.get("d_wall"), (int, float))]
+
+
+def _gate_durations_record(archive: Path, kind: str, d_wall: float, d_mono: float):
+    """Append one PLAUSIBLE sample to (ACTIVE_REPO_NAME, kind), keeping the newest GATE_DURATIONS_KEEP."""
+    repos = _gate_durations_load(archive)
+    kinds = repos.get(ACTIVE_REPO_NAME)
+    if not isinstance(kinds, dict):
+        kinds = repos[ACTIVE_REPO_NAME] = {}
+    samples = [s for s in (kinds.get(kind) or []) if isinstance(s, dict)]
+    samples.append({"at": datetime.now().isoformat(), "d_wall": round(d_wall, 2), "d_monotonic": round(d_mono, 2)})
+    kinds[kind] = samples[-GATE_DURATIONS_KEEP:]
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / GATE_DURATIONS_FILE).write_text(
+            json.dumps({"version": GATE_DURATIONS_VERSION, "repos": repos}, indent=2))
+    except OSError as e:
+        log.warning(f"⚠️  Gate duration history not written ({e}) — the outlier clause keeps its old history")
+
+
+def _judge_leg(kind: str, clocks: Optional[tuple], archive: Path, *, red: bool,
+               completed: bool = True) -> Optional[ClockViolation]:
+    """[GATE-CLOCK-1] P-CLOCK and P-SAY for ONE leg that ran: exactly one `🛡 clock-plausibility:`
+    line, CLEAN or IMPLAUSIBLE, green or red. The leg's wall duration joins the (repo, kind) history
+    iff it is plausible and ran to completion (a timeout's duration is its budget, not a sample).
+    `clocks` is (start, end) LegClocks; None ⇒ the leg was not measured now (a cache hit, a stub) —
+    not engaged, no line. Returns the violation, or None when plausible."""
+    if clocks is None:
+        return None
+    start, end = clocks
+    history = _gate_durations_history(archive, kind)
+    found = check_clock_plausibility(kind, start, end, history)
+    d_boot = ("n/a (no CLOCK_BOOTTIME)" if start.boottime is None or end.boottime is None
+              else f"{end.boottime - start.boottime:.1f}s")
+    hist = (f"outlier clause against the median of {len(history)} plausible samples"
+            if len(history) >= CLOCK_HISTORY_MIN else
+            f"outlier clause dormant ({len(history)} < {CLOCK_HISTORY_MIN} plausible samples)")
+    if found:
+        v = found[0]
+        what = "red: not a product verdict" if red else "green: stays green"
+        log.warning(f"🛡 clock-plausibility: IMPLAUSIBLE — {v}; Δboottime {d_boot}; {hist} "
+                    f"[{what}; not recorded]")
+        return v
+    d_wall, d_mono = end.wall - start.wall, end.monotonic - start.monotonic
+    log.info(f"🛡 clock-plausibility: CLEAN — {kind} Δwall {d_wall:.1f}s, Δmonotonic {d_mono:.1f}s, "
+             f"Δboottime {d_boot}; {hist}")
+    if completed:
+        _gate_durations_record(archive, kind, d_wall, d_mono)
+    return None
+
+
+def _run_leg(kind: str, archive: Path, cmd: str, **kwargs) -> tuple:
+    """[GATE-CLOCK-1] subprocess.run(cmd, **kwargs) as one timed leg of `kind`: returns
+    (CompletedProcess, ClockViolation | None). A leg that raises — its timeout included — is judged
+    as incomplete and red, the verdict is attached to the exception as `gate_clock`, and the
+    exception propagates to the caller's own handler."""
+    c0 = _leg_clocks()
+    try:
+        r = subprocess.run(cmd, **kwargs)
+    except Exception as e:
+        e.gate_clock = _judge_leg(kind, (c0, _leg_clocks()), archive, red=True, completed=False)
+        raise
+    return r, _judge_leg(kind, (c0, _leg_clocks()), archive, red=r.returncode != 0)
 
 
 def _gate_env_file(repo_path: Path) -> tuple[Optional[str], Optional[Path]]:
@@ -1572,7 +1690,8 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
     log.info(f"🔧 Running build gate [{ACTIVE_REPO_NAME or 'default'}]: {gate_cmd}")
     started = time.time()
     try:
-        r = subprocess.run(
+        r, clock = _run_leg(
+            "build", SIT_ARCHIVE_DIR,
             _gate_shell_cmd(gate_cmd, repo_path), shell=True, capture_output=True, text=True,
             cwd=str(repo_path), timeout=BUILD_GATE_TIMEOUT
         )
@@ -1580,21 +1699,23 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
         passed = r.returncode == 0
         if passed:
             log.info(f"✅ BUILD GATE PASSED ({duration:.1f}s)")
-            return BuildGateOutcome(passed=True, exit_code=0, duration_s=duration)
+            return BuildGateOutcome(passed=True, exit_code=0, duration_s=duration, clock=clock)
         log.error(f"❌ BUILD GATE FAILED (exit {r.returncode}, {duration:.1f}s) — BLOCKING, queue will halt")
         tail = (r.stdout or "")[-800:] + "\n" + (r.stderr or "")[-800:]
         log.error(f"   {tail.strip()[-1000:]}")
         return BuildGateOutcome(passed=False, exit_code=r.returncode,
                                 error=tail.strip()[-1000:], duration_s=duration,
-                                output=((r.stdout or "") + "\n" + (r.stderr or ""))[-20000:])
-    except subprocess.TimeoutExpired:
+                                output=((r.stdout or "") + "\n" + (r.stderr or ""))[-20000:], clock=clock)
+    except subprocess.TimeoutExpired as e:
         duration = time.time() - started
         log.error(f"❌ BUILD GATE TIMEOUT after {duration:.1f}s — BLOCKING")
-        return BuildGateOutcome(passed=False, exit_code=-1, error="timeout", duration_s=duration)
+        return BuildGateOutcome(passed=False, exit_code=-1, error="timeout", duration_s=duration,
+                                clock=getattr(e, "gate_clock", None))
     except Exception as e:
         duration = time.time() - started
         log.error(f"❌ BUILD GATE ERROR: {e} — BLOCKING")
-        return BuildGateOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e))
+        return BuildGateOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e),
+                                clock=getattr(e, "gate_clock", None))
 
 
 # ═══════════════════════════════════════════════════════
@@ -1616,6 +1737,7 @@ class SitIsolation:
     skipped: Optional[str] = None  # why isolation was owed-shaped but not attempted (the cap)
     batches: Optional[int] = None  # how many batches the gate ran, for `batch 2/3`
     alone: dict = field(default_factory=dict)       # file -> `3/3` tests passed alone
+    clock: Optional[ClockViolation] = None          # [GATE-CLOCK-1] the leg's clocks disagree
 
     def where(self, f: str) -> str:
         """`batch 2/3, neighbours: a, b` — the evidence the harness fix needs."""
@@ -1653,6 +1775,8 @@ class SitOutcome:
     detail: Optional[str] = None  # the sentence behind a machinery `error` (never a secret)
     # [GATE-SIT-2] the isolation leg's evidence; None = the leg was not owed (or not batched).
     isolation: Optional[SitIsolation] = None
+    # [GATE-CLOCK-1] the first implausible leg of this gate (run, batch or isolation); None = all plausible.
+    clock: Optional[ClockViolation] = None
 
     @property
     def files_failed(self) -> Optional[int]:
@@ -1846,6 +1970,7 @@ class _SitBatchedRun:
     tallies: dict = field(default_factory=dict)
     batches: int = 0
     mismatch: Optional[str] = None
+    clock: Optional[ClockViolation] = None   # [GATE-CLOCK-1] the first implausible batch leg
 
 
 def _add_count(agg: dict, key: str, val: Optional[int], unknown: set):
@@ -1855,7 +1980,8 @@ def _add_count(agg: dict, key: str, val: Optional[int], unknown: set):
         agg[key] = agg.get(key, 0) + val
 
 
-def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan) -> _SitBatchedRun:
+def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
+                     archive: Optional[Path] = None) -> _SitBatchedRun:
     """[SIT-RATE-1] Run `sit_cmd -- <files>` once per batch, pausing `plan.pause_s` between,
     and add the per-batch vitest summaries up. Every batch runs (no early exit, and a BATCH is
     NEVER re-run — a re-run against an unrefilled budget is dirtier than the first, measured
@@ -1875,8 +2001,9 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan) -> _SitBatche
             time.sleep(plan.pause_s)
         cmd = f"{sit_cmd} -- {' '.join(shlex.quote(f) for f in files)}"
         started = time.time()
-        r = subprocess.run(_gate_shell_cmd(cmd, repo_path), shell=True, capture_output=True,
-                           text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+        r, clock = _run_leg("sit-batch", archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path),
+                            shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+        out.clock = out.clock or clock
         d = time.time() - started
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         c, t = _parse_vitest_summary(raw), _parse_vitest_tallies(raw)
@@ -1935,7 +2062,8 @@ def _sit_failing_files(text: str) -> list:
     return out
 
 
-def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list) -> SitIsolation:
+def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list,
+                 archive: Optional[Path] = None) -> SitIsolation:
     """[GATE-SIT-2] Re-run each failing file ALONE — one `sit_cmd -- <file>` invocation per file,
     in listing order, after ONE refill pause. Copies the [ORCH-6] unit-gate shape: a file that
     passes alone was its batch's (`contaminated`), a file that fails alone is the product's
@@ -1947,6 +2075,7 @@ def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list) -> S
         iso.skipped = (f"{len(files)} failing files exceed the batch size {plan.batch_files} — "
                        f"not contamination-shaped, not re-run")
         log.warning(f"⚠️  SIT gate isolation skipped: {iso.skipped}")
+        log.warning(f"🛡 sit-isolation: SKIPPED — {iso.skipped}")
         return iso
     log.info(f"🔬 SIT gate: {len(files)} failing file(s) — confirming in isolation before verdict: "
              f"{', '.join(files)}")
@@ -1959,6 +2088,7 @@ def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list) -> S
     if plan.pause_s > 0:
         log.info(f"⏸️  SIT batch pause {plan.pause_s}s (rate-limit window refill) before the isolation leg")
         time.sleep(plan.pause_s)
+    c0 = _leg_clocks()   # [GATE-CLOCK-1] the leg is the re-runs; the refill pause measures nothing
     contaminated, confirmed = [], []
     for f in files:
         cmd = f"{sit_cmd} -- {shlex.quote(f)}"
@@ -1995,6 +2125,17 @@ def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list) -> S
     log.info(f"🔬 SIT gate isolation — {len(files)} file(s) in {iso.duration_s:.1f}s; "
              f"contaminated: {', '.join(iso.contaminated) or '(none)'}; "
              f"confirmed: {', '.join(iso.confirmed) or '(none)'}")
+    iso.clock = _judge_leg("sit-isolation", (c0, _leg_clocks()), archive or SIT_ARCHIVE_DIR,
+                           red=bool(iso.error or iso.confirmed), completed=iso.error is None)
+    # [ORCH-HANDBACK-SILENT-PASS] P-SAY: exactly one verdict line per engagement, on every path.
+    if iso.error:
+        log.error(f"🛡 sit-isolation: BLOCKED — {iso.error}: {iso.detail}")
+    elif iso.confirmed:
+        log.error(f"🛡 sit-isolation: FAIL — confirmed failing alone: {', '.join(iso.confirmed)}; "
+                  f"contaminated: {', '.join(iso.contaminated) or '(none)'}")
+    else:
+        log.info(f"🛡 sit-isolation: CLEAN — every failing file passed alone (batch contamination): "
+                 f"{', '.join(iso.contaminated)}")
     return iso
 
 
@@ -2039,17 +2180,19 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
 
     try:
         if plan is None:
-            r = subprocess.run(
+            r, clock = _run_leg(
+                "sit-run", archive,
                 _gate_shell_cmd(sit_cmd, repo_path), shell=True, capture_output=True, text=True,
                 cwd=str(repo_path), timeout=SIT_TIMEOUT
             )
             raw = (r.stdout or "") + "\n" + (r.stderr or "")
             counts, tallies = _parse_vitest_summary(raw), _parse_vitest_tallies(raw)
         else:
-            b = _run_sit_batched(sit_cmd, repo_path, plan)
+            b = _run_sit_batched(sit_cmd, repo_path, plan, archive)
             r = subprocess.CompletedProcess(sit_cmd, b.returncode, stdout=b.stdout, stderr=b.stderr)
             raw = b.red_output or (b.stdout + "\n" + b.stderr)
             counts, tallies, batches, batch_mismatch = b.counts, b.tallies, b.batches, b.mismatch
+            clock = b.clock
         duration = time.time() - started
         # S6S47: baseline-aware. Block only on NEW failures, not pre-existing
         # known-failing specs (BUG-018/BUG-026). Parse failing spec basenames
@@ -2081,7 +2224,8 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
             named = set(_sit_failing_files(raw))
             suspects = [f for f in plan.files if _norm_test_path(f) in named]
             if suspects:
-                isolation = _sit_isolate(sit_cmd, repo_path, plan, suspects)
+                isolation = _sit_isolate(sit_cmd, repo_path, plan, suspects, archive)
+                clock = clock or isolation.clock
         error, detail = None, None
         if batch_mismatch:
             # AC-SR-05: the batches do not add up to the suite. Not a verdict about anything.
@@ -2138,7 +2282,7 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration,
                           error=error, detail=detail, output="" if passed else raw[-20000:],
                           tests_failed=tests_failed, tests_skipped=tallies.get("skipped"),
-                          batches=batches, isolation=isolation, **counts)
+                          batches=batches, isolation=isolation, clock=clock, **counts)
 
     except subprocess.TimeoutExpired:
         duration = time.time() - started
@@ -2149,7 +2293,8 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         duration = time.time() - started
         log.warning(f"⚠️  SIT ERROR: {e} — advisory only")
         _log_sit_outcome(archive, repo_path, False, -1, duration, None, error=str(e))
-        return SitOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e))
+        return SitOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e),
+                          clock=getattr(e, "gate_clock", None))
 
 
 # ═══════════════════════════════════════════════════════
@@ -2186,6 +2331,9 @@ class UnitSuiteRun:
     failing_files: tuple = ()      # sorted, repo-relative; the SET half of the §2.1 comparison
     output: str = ""               # combined stdout+stderr tail, for F-20 classification
     error: Optional[str] = None    # "timeout" | subprocess error text
+    # [GATE-CLOCK-1] (start, end) LegClocks of THIS execution; None ⇒ not measured now (cache, stub).
+    clocks: Optional[tuple] = None
+    clock: Optional[ClockViolation] = None   # set by _judge_leg when the clocks disagree
 
     @property
     def collection(self) -> Optional[str]:
@@ -2270,6 +2418,14 @@ class UnitGateOutcome:
     # [ORCH-6] AC-O6-02/06: newly-failing files that PASSED the isolation confirmation —
     # order/load-dependent, not a regression. Never empty on a FAIL(product) verdict alone.
     flaky_files: tuple = ()
+    confirm: Optional[UnitSuiteRun] = None   # [GATE-CLOCK-1] the confirmation leg, when it ran
+
+    @property
+    def clock(self) -> Optional[ClockViolation]:
+        """[GATE-CLOCK-1] the first implausible leg this gate measured NOW — branch, baseline,
+        confirm. A cached baseline carries no clocks and is never judged."""
+        return next((r.clock for r in (self.branch, self.baseline, self.confirm)
+                     if r is not None and r.clock is not None), None)
 
     @property
     def collection(self) -> Optional[str]:
@@ -2484,6 +2640,7 @@ def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None
     `timeout` defaults to the budget for this leg (see _unit_suite_timeout); the parameter
     exists so a caller can be explicit, not so the derivation can be bypassed."""
     started = time.time()
+    c0 = _leg_clocks()   # [GATE-CLOCK-1] judged by the caller, which knows the leg kind
     budget = timeout or _unit_suite_timeout(ref)
     try:
         # [ORCH-9] S2/S3: NOT _gate_shell_cmd. The declared env_file belongs to the BUILD and
@@ -2502,13 +2659,13 @@ def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         parsed = _parse_unit_summary(raw)
         return UnitSuiteRun(ref=ref, exit_code=r.returncode, duration_s=time.time() - started,
-                            output=raw[-20000:], **parsed)
+                            output=raw[-20000:], clocks=(c0, _leg_clocks()), **parsed)
     except subprocess.TimeoutExpired:
         return UnitSuiteRun(ref=ref, exit_code=-1, duration_s=time.time() - started,
-                            error="timeout", output="timeout")
+                            error="timeout", output="timeout", clocks=(c0, _leg_clocks()))
     except Exception as e:
         return UnitSuiteRun(ref=ref, exit_code=-1, duration_s=time.time() - started,
-                            error=str(e), output=str(e))
+                            error=str(e), output=str(e), clocks=(c0, _leg_clocks()))
 
 
 def _run_unit_baseline(repo_path: Path, sha: str, cmd: str) -> UnitSuiteRun:
@@ -2587,10 +2744,18 @@ def _unit_confirm_new_files(repo_path: Path, test_cmd: str, ref_label: str,
     ref = f"{UNIT_CONFIRM_REF_PREFIX} {ref_label}"
     run = _run_unit_suite(cmd, repo_path, ref)
     if run.error or run.runner is None or run.failures is None:
+        # [ORCH-HANDBACK-SILENT-PASS] P-SAY: exactly one verdict line per engagement, on every path.
+        log.error(f"🛡 unit-confirm: BLOCKED — confirmation-unmeasurable: "
+                  f"{run.error or run.collection or 'no parseable summary'} ({', '.join(new_files)})")
         return None, None, run
     still_failing = set(run.failing_files) & set(new_files)
     flakes = tuple(sorted(set(new_files) - still_failing))
     regressions = tuple(sorted(still_failing))
+    if regressions:
+        log.error(f"🛡 unit-confirm: FAIL — still failing alone: {', '.join(regressions)}; "
+                  f"flaky: {', '.join(flakes) or '(none)'}")
+    else:
+        log.info(f"🛡 unit-confirm: CLEAN — every newly-failing file passed alone (flaky): {', '.join(flakes)}")
     return flakes, regressions, run
 
 
@@ -2877,6 +3042,14 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
              f"(budget {_unit_suite_timeout(UNIT_BASELINE_REF_PREFIX)}s)")
     run = _run_unit_baseline(repo_path, base_sha, cmd)
     log.info(f"🧬 Unit gate baseline run — {run.describe}")
+    run.clock = _judge_leg("unit-baseline", run.clocks, archive, red=run.exit_code != 0,
+                           completed=run.error is None)
+    if run.clock is not None and _unit_is_measurement(run):
+        # [GATE-CLOCK-1] a baseline measured across a clock jump is used for THIS verdict (whose red
+        # the classifier then refuses as a product verdict) but never cached: every later route off
+        # this base would otherwise compare against it without re-measuring.
+        return run, "measured", (f"measured now at {base_sha[:7]}; NOT cached — its clocks are "
+                                 f"implausible ({run.clock})")
     if _unit_is_cacheable(run):
         _unit_cache_store(archive, repo_name, base_sha, cmd, run)
         return run, "measured", f"measured now at {base_sha[:7]} and cached for later routes off this base"
@@ -2955,6 +3128,10 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     log.info(f"🧪 Unit baseline gate [{ACTIVE_REPO_NAME}]: {test_cmd} — branch {label} vs merge-base {base_sha[:7]}")
     branch_run = _run_unit_suite(test_cmd, repo_path, label)
     log.info(f"🧪 Unit gate branch run — {branch_run.describe}")
+    archive = archive_path or SIT_ARCHIVE_DIR
+    branch_run.clock = _judge_leg("unit-branch", branch_run.clocks, archive,
+                                  red=branch_run.exit_code != 0 or bool(branch_run.failures),
+                                  completed=branch_run.error is None)
 
     baseline_run = None
     baseline_note = None
@@ -3033,13 +3210,17 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     # logged and cached below, but it never appears in the boolean that decides the verdict.
     worse_count = branch_run.failures > baseline_run.failures
 
-    flakes, regressions = (), ()
+    flakes, regressions, confirm_run = (), (), None
     if new_files:
         # S7-CORE-9 [ORCH-6] decisions 1/2: a single pair of whole-suite runs is not enough
         # evidence for FAIL(product) — confirm the suspect set in isolation before deciding.
         log.info(f"🔬 Unit gate: {len(new_files)} newly-failing file(s) — confirming in "
                  f"isolation before verdict: {', '.join(new_files)}")
         flakes, regressions, confirm_run = _unit_confirm_new_files(repo_path, test_cmd, label, new_files)
+        if confirm_run is not None:
+            confirm_run.clock = _judge_leg("unit-confirm", confirm_run.clocks, archive,
+                                           red=flakes is None or bool(regressions),
+                                           completed=confirm_run.error is None)
         if flakes is None:
             # decision 4: fail closed. A confirmation pass that did not complete is not
             # evidence of health — never PASS, never FAIL(product).
@@ -3053,7 +3234,8 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
             log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not FAIL(product)")
             return _finish(UnitGateOutcome(passed=False, signal="confirmation-unmeasurable", detail=detail,
                                            env=True, ran=True, branch=branch_run, baseline=baseline_run,
-                                           baseline_note=baseline_note, baseline_source=baseline_source))
+                                           baseline_note=baseline_note, baseline_source=baseline_source,
+                                           confirm=confirm_run))
         log.info(f"🔬 Unit gate confirmation — {confirm_run.describe}; "
                  f"flake: {', '.join(flakes) or '(none)'}; regression: {', '.join(regressions) or '(none)'}")
         if flakes and baseline_source in ("cache", "measured"):
@@ -3075,7 +3257,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         return _finish(UnitGateOutcome(passed=False, signal="regression", detail=detail,
                                        ran=True, branch=branch_run, baseline=baseline_run,
                                        baseline_note=baseline_note, baseline_source=baseline_source,
-                                       flaky_files=flakes))
+                                       flaky_files=flakes, confirm=confirm_run))
 
     verdict = ("equal to" if branch_run.failures == baseline_run.failures else "below")
     detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
@@ -3095,7 +3277,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}; baseline {baseline_note}")
     return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run, baseline=baseline_run,
                                    baseline_note=baseline_note, baseline_source=baseline_source,
-                                   detail=detail, flaky_files=flakes))
+                                   detail=detail, flaky_files=flakes, confirm=confirm_run))
 
 
 def _unit_done(o: UnitGateOutcome, started: float, repo_path: Path,
@@ -3197,7 +3379,8 @@ _GATE_FAIL_FILE_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(\S+)", re.MULTILINE)
 def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: int,
                            tests_failed: Optional[int] = None,
                            files_failed: Optional[int] = None,
-                           isolation: Optional[SitIsolation] = None) -> GateVerdict:
+                           isolation: Optional[SitIsolation] = None,
+                           clock: Optional[ClockViolation] = None) -> GateVerdict:
     """PDLC F-20: BLOCKED(environment) vs FAIL(product) for a red gate. Only the F-20 tables
     decide. The matched token is quoted (≤80 chars); the gate output is never echoed whole.
 
@@ -3218,7 +3401,13 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
          this function's inputs, like rules 1 and 2 (`isolation`, the SIT gate's SitIsolation).
          An unreadable isolation measurement ⇒ BLOCKED(environment) `isolation-unmeasurable`;
          any file confirmed failing alone ⇒ FAIL(product); only contaminated files ⇒ PASS
-         `batch-contamination`, named. No isolation, or a skipped one ⇒ the product fall-through."""
+         `batch-contamination`, named. No isolation, or a skipped one ⇒ the product fall-through.
+
+    S7-CORE-16 [GATE-CLOCK-1], the last clause before the product verdict:
+      4. A red whose gate timed a leg across a clock jump, a suspend or a > 5× outlier (`clock`,
+         the gate's first implausible leg) ⇒ BLOCKED(environment) `clock-implausible`: the
+         measurement is not evidence about the product. It never touches rules 1-3's own
+         BLOCKED or PASS results — a sleep can manufacture failures, it cannot manufacture passes."""
     text = _ANSI_RE.sub("", output or "")
     for sid, rx, desc in _ENV_BLOCK_SIGNALS_RE:
         m = rx.search(text)
@@ -3244,6 +3433,7 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
                            f"exit {exit_code} with 0 failed assertions and {n} file(s) down at setup{which} "
                            f"— environment by construction [ORCH-11]")
     seen = "" if tests_failed is None else f" ({tests_failed} failed assertions)"
+    product = f"no F-20 environment signal in gate output{seen} — product verdict stands"
     if isolation is not None and not isolation.skipped:
         if isolation.error:
             log.info(f"🔎 F-20 {gate} gate: signal 'isolation-unmeasurable' matched — {isolation.detail}")
@@ -3251,18 +3441,20 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
         if isolation.confirmed:
             also = (f"; contaminated (passed alone, not counted): {', '.join(isolation.contaminated)}"
                     if isolation.contaminated else "")
-            return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}",
-                               f"no F-20 environment signal in gate output{seen}; confirmed failing alone: "
-                               f"{', '.join(isolation.confirmed)}{also} — product verdict stands")
-        if isolation.contaminated:
+            product = (f"no F-20 environment signal in gate output{seen}; confirmed failing alone: "
+                       f"{', '.join(isolation.confirmed)}{also} — product verdict stands")
+        elif isolation.contaminated:
             why = "; ".join(
                 f"{f} failed in batch {isolation.batch_of.get(f, '?')}/{isolation.batches or '?'} beside "
                 f"{', '.join(isolation.neighbours.get(f, ())) or 'no other file'} — passed alone "
                 f"({isolation.alone.get(f, '?')})" for f in isolation.contaminated) + "; no product failure"
             log.info(f"🔎 F-20 {gate} gate: signal 'batch-contamination' — {why}")
             return GateVerdict(GateOutcome.PASS, gate, "batch-contamination", why)
-    return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}",
-                       f"no F-20 environment signal in gate output{seen} — product verdict stands")
+    if clock is not None:
+        log.info(f"🔎 F-20 {gate} gate: signal 'clock-implausible' matched — {clock}")
+        return GateVerdict(GateOutcome.BLOCKED_ENV, gate, "clock-implausible",
+                           f"{clock} — a red measured on that clock is not a product verdict")
+    return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}", product)
 
 
 def sit_verdict_violations(so: SitOutcome, v: GateVerdict) -> list[str]:
@@ -3329,7 +3521,8 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
         if gate == "build":
             bg = run_build_gate(repo_path)
             if not bg.passed:
-                v = _classify_gate_failure("build", bg.output or bg.error or "", repo_path, bg.exit_code)
+                v = _classify_gate_failure("build", bg.output or bg.error or "", repo_path, bg.exit_code,
+                                           clock=bg.clock)
                 log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                 return v
         elif gate == "sit":
@@ -3352,7 +3545,7 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                         # [ORCH-11] the tallies travel with the output: rule 1 is decided here.
                         v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code,
                                                    tests_failed=so.tests_failed, files_failed=so.files_failed,
-                                                   isolation=so.isolation)
+                                                   isolation=so.isolation, clock=so.clock)
                         v.collection = sit_collection
                     # [GATE-SIT-2] the invariant is an oracle, not a fourth rule: it never changes v.
                     for msg in sit_verdict_violations(so, v):
@@ -3381,9 +3574,11 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
             # A regression is a product verdict unless the F-20 tables see an environment
             # signal in the suite output — same classifier the build and SIT gates use.
             v = _classify_gate_failure("unit", (uo.branch.output if uo.branch else "") or uo.detail or "",
-                                       repo_path, uo.branch.exit_code if uo.branch else -1)
+                                       repo_path, uo.branch.exit_code if uo.branch else -1, clock=uo.clock)
             if v.outcome is GateOutcome.FAIL_PRODUCT:
                 v.signal, v.detail = uo.signal, uo.detail
+            elif v.signal == "clock-implausible":
+                v.detail = f"{v.detail} (the red: {uo.detail})"
             v.collection, v.unit_collection = sit_collection, unit_collection
         log.error(f"⛔ Pre-merge gate{where}: {v.label}")
         return v
@@ -3507,17 +3702,22 @@ def _handback_hold(out_log: str) -> Optional[HandbackHold]:
     else:
         found = check_handback_invariants(Path(out_log), rules)
         if not found:
+            # [ORCH-HANDBACK-SILENT-PASS] P-SAY: a control that passes says so — absence then means "not engaged".
+            log.info(f"🛡 handback-guard: CLEAN — no outstanding work advertised ({len(rules)} rules, {out_log})")
             return None
         if found[0].reason == "outstanding-work":
             for v in found:
                 log.error(f"⛔ {INCOMPLETE_VERDICT}: {v.rule} at line {v.line_no}: \"{v.line}\"")
             v = found[0]
+            log.error(f"🛡 handback-guard: HOLD — {INCOMPLETE_VERDICT}: {v.rule} at line {v.line_no} "
+                      f"({len(found)} rule(s) matched, {out_log})")
             return HandbackHold(
                 Status.INCOMPLETE, INCOMPLETE_VERDICT, f"{v.rule} at line {v.line_no}",
                 f"{INCOMPLETE_VERDICT} — executor output advertises outstanding work: "
                 f"{v.rule} at line {v.line_no}: \"{v.line}\"")
         reason = found[0].reason
     log.error(f"⛔ {GateOutcome.BLOCKED_ENV.value} — handback guard: {reason} ({out_log})")
+    log.error(f"🛡 handback-guard: BLOCKED — {reason} ({out_log})")
     return HandbackHold(Status.BLOCKED, GateOutcome.BLOCKED_ENV.value, reason,
                         f"{GateOutcome.BLOCKED_ENV.value} — handback guard: {reason}")
 

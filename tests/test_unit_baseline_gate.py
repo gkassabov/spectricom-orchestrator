@@ -2013,8 +2013,10 @@ def _def_body(src: str, name: str) -> str:
 class TestOrchTally1ChangedNoGateOrSitSemantics:
     """AC-T1-09 — a reporting fix: the SIT gate and the unit gate's decisions are untouched."""
 
-    @pytest.mark.parametrize("name", ["_sit_tests_failed", "_run_sit_batched",
-                                      "run_sit_post_merge", "run_unit_gate"])
+    # S7-CORE-16 [GATE-CLOCK-1] times every gate leg inside _run_sit_batched, run_sit_post_merge and
+    # run_unit_gate, so those three moved on purpose after ORCH-TALLY-1; tests/test_gate_clock.py
+    # pins what they decide now.
+    @pytest.mark.parametrize("name", ["_sit_tests_failed"])
     def test_ac_t1_09_the_function_is_byte_identical_to_the_base(self, name):
         r = subprocess.run(["git", "-C", str(REPO_ROOT), "show", f"{ORCH_TALLY1_BASE}:orchestrator.py"],
                            capture_output=True, text=True)
