@@ -1595,7 +1595,8 @@ class BuildGateOutcome:
 #   sit-batch      _run_sit_batched, once per batch
 #   sit-isolation  _sit_isolate, the alone re-runs after the refill pause (the pause is not measured)
 #   unit-branch    run_unit_gate, the branch leg
-#   unit-baseline  _unit_baseline_measure_or_reuse, only when MEASURED — a cache hit is not a leg
+#   unit-baseline  _unit_baseline_measure_or_reuse, only when MEASURED — a cache hit is not a leg;
+#                  an implausible one is re-measured once, a second leg (BASELINE-TRUST-1)
 #   unit-confirm   run_unit_gate, the isolation confirmation of newly-failing files
 # The verdict clause is one rule in _classify_gate_failure; the predicate is canon_assert's.
 def _leg_clocks() -> LegClocks:
@@ -2451,7 +2452,8 @@ class UnitGateOutcome:
     baseline: Optional[UnitSuiteRun] = None
     branch: Optional[UnitSuiteRun] = None
     baseline_note: Optional[str] = None  # how the baseline was obtained, or why there isn't one
-    # [ORCH-5] AC-O5-05: "measured" | "cache" | "ancestor-cache" | "unmeasurable" | None.
+    # [ORCH-5] AC-O5-05: "measured" | "cache" | "ancestor-cache" | "unmeasurable" | None;
+    # [BASELINE-TRUST-1] "implausible" — measured twice, both legs on an implausible clock.
     # The verdict must never leave "was this measured now, or read off disk?" unanswered.
     baseline_source: Optional[str] = None
     duration_s: float = 0.0
@@ -3066,9 +3068,15 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
                                     repo_name: str) -> tuple:
     """Get the baseline for `base_sha`. Returns (UnitSuiteRun|None, source, note).
 
-    `source` is one of "cache" | "measured" | "ancestor-cache" | "unmeasurable" and reaches
-    the verdict verbatim (AC-O5-05) — the operator is never left guessing whether a number
-    was measured just now or read off disk."""
+    `source` is one of "cache" | "measured" | "ancestor-cache" | "unmeasurable" | "implausible"
+    and reaches the verdict verbatim (AC-O5-05) — the operator is never left guessing whether a
+    number was measured just now or read off disk.
+
+    [BASELINE-TRUST-1] P-BASE: reached only past the [ORCH-5] green fast path, so every PASS it
+    feeds is a comparison. A baseline leg on an implausible clock is never compared against and
+    never cached: it is measured ONCE more, and a second implausible leg is "implausible" — the
+    gate's BLOCKED(environment) `baseline-clock-implausible`. Exactly one `🛡 baseline-trust:`
+    line per call (P-SAY)."""
     hit = _unit_cache_lookup(archive, repo_name, base_sha, cmd)
     if hit:
         run = _unit_run_from_cache(hit, f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]}")
@@ -3076,6 +3084,8 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
                 f"{base_sha[:7]}, {run.collection or 'collection unknown'} in {run.duration_s:.1f}s; "
                 f"not re-run (the baseline for a commit does not change)")
         log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} — {run.collection}; no baseline run")
+        log.info(f"🛡 baseline-trust: CLEAN — cache hit at {base_sha[:7]}: no leg measured now, so no "
+                 f"clock to judge; since GATE-CLOCK-1 only a plausible leg is cached")
         return run, "cache", note
 
     log.info(f"🧬 Unit baseline: cache MISS for {base_sha[:7]} — measuring "
@@ -3084,24 +3094,41 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
     log.info(f"🧬 Unit gate baseline run — {run.describe}")
     run.clock = _judge_leg("unit-baseline", run.clocks, archive, red=run.exit_code != 0,
                            completed=run.error is None)
-    if run.clock is not None and _unit_is_measurement(run):
-        # [GATE-CLOCK-1] a baseline measured across a clock jump is used for THIS verdict (whose red
-        # the classifier then refuses as a product verdict) but never cached: every later route off
-        # this base would otherwise compare against it without re-measuring.
-        return run, "measured", (f"measured now at {base_sha[:7]}; NOT cached — its clocks are "
-                                 f"implausible ({run.clock})")
+    trust, again = "measured on a plausible clock", ""
+    if run.clocks is None:
+        trust = f"no leg ran ({run.error or 'not measured'}), so no clock to judge"
+    if run.clock is not None:
+        # [BASELINE-TRUST-1] a sleep can manufacture baseline failures, and each one would pass a
+        # branch failure off as debt: the masked regression route 61 found. Discard the leg and
+        # measure once more; whatever follows stands on the re-measure alone.
+        first = run
+        log.warning(f"🧬 Unit baseline: the leg at {base_sha[:7]} is implausible ({first.clock}) — "
+                    f"discarded, not compared, not cached; re-measuring once")
+        run = _run_unit_baseline(repo_path, base_sha, cmd)
+        log.info(f"🧬 Unit gate baseline re-measure — {run.describe}")
+        run.clock = _judge_leg("unit-baseline", run.clocks, archive, red=run.exit_code != 0,
+                               completed=run.error is None)
+        if run.clock is not None:
+            note = (f"measured twice at {base_sha[:7]}, both legs implausible (first: {first.clock}; "
+                    f"re-measure: {run.clock}); NOT compared against, NOT cached")
+            log.error(f"🛡 baseline-trust: BLOCKED — baseline-clock-implausible: {note} — never PASS, "
+                      f"never FAIL(product)")
+            return run, "implausible", note
+        trust = f"re-measured once on a plausible clock (first leg discarded: {first.clock})"
+        again = f" — re-measured once, the first leg was implausible ({first.clock})"
+    log.info(f"🛡 baseline-trust: CLEAN — unit-baseline at {base_sha[:7]} {trust}")
     if _unit_is_cacheable(run):
         _unit_cache_store(archive, repo_name, base_sha, cmd, run)
-        return run, "measured", f"measured now at {base_sha[:7]} and cached for later routes off this base"
+        return run, "measured", f"measured now at {base_sha[:7]} and cached for later routes off this base{again}"
     if _unit_is_measurement(run):
         # It ran and collected something, but the summary gave no failure count. That is the
         # [ORCH-3] `comparison-unavailable` path — let it reach its own verdict, uncached.
         return run, "measured", (f"measured now at {base_sha[:7]}; NOT cached — the summary "
-                                 f"yielded no failure count")
+                                 f"yielded no failure count{again}")
 
     # The fresh measurement failed outright. Decision 3: an ancestor we DID measure is usable
     # — said out loud — and if there is none, the block stands.
-    why = run.error or run.collection or "no measurement"
+    why = (run.error or run.collection or "no measurement") + again
     anc = _unit_cache_ancestor(repo_path, archive, repo_name, base_sha, cmd)
     if anc:
         anc_run = _unit_run_from_cache(anc, f"{UNIT_BASELINE_REF_PREFIX} {anc['sha'][:7]} (ancestor)")
@@ -3215,6 +3242,16 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
 
     def _finish(o: UnitGateOutcome) -> UnitGateOutcome:
         return _unit_done(o, started, repo_path, archive_path)
+
+    if baseline_source == "implausible":
+        # [BASELINE-TRUST-1] P-BASE: the branch has failures, so any verdict here is a comparison,
+        # and neither baseline leg's clock supports one — never PASS, never FAIL(product).
+        detail = (f"the BASELINE at {base_sha[:7]} cannot be trusted — {baseline_note}; the branch's "
+                  f"{branch_run.failures} failure(s) were compared against nothing")
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not PASS, not FAIL(product)")
+        return _finish(UnitGateOutcome(passed=False, signal="baseline-clock-implausible", detail=detail,
+                                       env=True, ran=True, branch=branch_run, baseline=baseline_run,
+                                       baseline_note=baseline_note, baseline_source=baseline_source))
 
     if baseline_source == "unmeasurable" or baseline_run is None or not _unit_is_measurement(baseline_run):
         # AC-O5-04: a timeout here means the MEASUREMENT failed, not the product. Say that in

@@ -45,6 +45,8 @@ C = {
     "unit-confirm": "_unit_confirm_new_files",
     # ORCH-TIMEOUT-HOLD-1 (brief 2): a sixth control, found by this guard as `_*_hold` with no line
     "executor-exit": "_executor_exit_hold",
+    # BASELINE-TRUST-1 (route 67): a seventh, one line per baseline the unit gate needs
+    "baseline-trust": "_unit_baseline_measure_or_reuse",
 }
 # the canon_assert predicates behind C: every call site must sit in a function that speaks
 C_PREDICATES = {"check_handback_invariants", "check_bg_ceiling_invariants", "check_clock_plausibility",

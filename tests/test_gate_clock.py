@@ -421,11 +421,12 @@ class TestHistory:
         assert gate.samples("unit-branch") == [300.0 + i for i in range(2, keep + 2)]
 
     def test_an_implausible_baseline_is_not_cached(self, gate):
+        # BASELINE-TRUST-1: an implausible baseline leg is re-measured once; both implausible here
         gate.suite.script("branch", BRANCH_59, 1, SECOND_FIRE)
         gate.suite.script("baseline", BASE_59[4], 1, FIRST_FIRE)
-        gate.suite.script("confirm", CONFIRM_59, 1, (7.4, 7.4, 7.4))
+        gate.suite.script("baseline", BASE_59[4], 1, FIRST_FIRE)
         v = gate.run()
-        assert (v.outcome, v.signal) == (orchestrator.GateOutcome.BLOCKED_ENV, "clock-implausible"), v.label
+        assert (v.outcome, v.signal) == (orchestrator.GateOutcome.BLOCKED_ENV, "baseline-clock-implausible"), v.label
         assert "unit-baseline wall-jump" in v.detail
         cache = gate.archive / orchestrator.UNIT_BASELINE_CACHE_FILE
         entries = json.loads(cache.read_text())["entries"] if cache.exists() else {}
