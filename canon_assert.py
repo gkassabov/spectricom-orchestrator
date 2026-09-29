@@ -1145,6 +1145,28 @@ def check_clock_plausibility(leg_kind: str, clocks_start: LegClocks, clocks_end:
     return []
 
 
+# ── EXECUTOR-DEFAULT-1 · the pipeline's one default executor (S7-CORE-16 · D-S7CORE15-01) ──────
+# The model and effort a route runs with when nothing more specific names one. Defined here, once,
+# because both processes that need a default already import this module: the orchestrator (the
+# direct path) and the queue daemon (a brief with no `#!queue model=… effort=…` header). The daemon
+# never loads the orchestrator module, whose load writes a log. Precedence, highest first: the brief's
+# `#!queue` header (daemon) or --model/--effort (direct), then TONI_MODEL / TONI_EFFORT in the
+# process environment, then these. A value persisted in queue-state.json is not on that list: no
+# operator command sets it, it only records what an earlier daemon ran with — which is how an old
+# default outlived itself (L-8).
+
+DEFAULT_EXECUTOR_MODEL = "claude-opus-5-5"
+DEFAULT_EXECUTOR_EFFORT = "high"
+EXECUTOR_ENV = {"model": "TONI_MODEL", "effort": "TONI_EFFORT"}
+
+
+def executor_default(env: Mapping[str, str]) -> tuple[str, str]:
+    """[EXECUTOR-DEFAULT-1] (model, effort) for a route that names neither: TONI_MODEL /
+    TONI_EFFORT from `env` where set and non-empty, else DEFAULT_EXECUTOR_MODEL / _EFFORT."""
+    return (env.get(EXECUTOR_ENV["model"]) or DEFAULT_EXECUTOR_MODEL,
+            env.get(EXECUTOR_ENV["effort"]) or DEFAULT_EXECUTOR_EFFORT)
+
+
 # ── verdict building ─────────────────────────────────────────────────────────────────────
 @dataclass
 class Verdict:

@@ -29,8 +29,9 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # QUEUE-RETIRE-1: one implementation of the trunk invariant, shared by the boot path and the
 # tests. It lives with the other boot asserts; nothing here reimplements it.
-from canon_assert import (GateLogViolation, QueueRepo, Violation, check_gate_log_invariants,
-                          check_queue_trunk_invariants, queue_header)
+from canon_assert import (DEFAULT_EXECUTOR_EFFORT, DEFAULT_EXECUTOR_MODEL, EXECUTOR_ENV,
+                          GateLogViolation, QueueRepo, Violation, check_gate_log_invariants,
+                          check_queue_trunk_invariants, executor_default, queue_header)
 
 ORCH_DIR = Path.home() / "spectricom-orchestrator"
 QUEUE_DIR = ORCH_DIR / "queue"
@@ -71,6 +72,40 @@ def _read_json(path) -> dict:
 def read_persisted_state() -> dict:
     """queue-state.json as the daemon last wrote it — what `status`, `pause` and `resume` read."""
     return _read_json(QUEUE_STATE)
+
+
+# [EXECUTOR-DEFAULT-1] S7-CORE-16 · D-S7CORE15-01. A brief with no `#!queue model=… effort=…` header
+# runs canon_assert's one default, or TONI_MODEL / TONI_EFFORT set at daemon start. queue-state.json
+# persists the model/effort a daemon ran with, but a later daemon never APPLIES them: no command an
+# operator runs sets them, so a persisted value only records what an earlier daemon ran with — the
+# way claude-fable-5-1 outlived its default across restarts (LESSONS S7-CORE-14 L-8). The default
+# wins; the difference is reported once at start.
+EXECUTOR_KEYS = ("model", "effort")
+
+
+def _executor_of(state: dict) -> dict:
+    """The model/effort in a persisted state's `config` — {} when there are none."""
+    cfg = state.get("config")
+    return {k: cfg[k] for k in EXECUTOR_KEYS if k in cfg} if isinstance(cfg, dict) else {}
+
+
+def executor_default_line(persisted: dict, config: dict, env) -> str:
+    """[EXECUTOR-DEFAULT-1] the one `🛡 executor-default:` line a daemon start prints: what a brief
+    with no header fires with, where that came from, and any persisted value it did not use."""
+    default = {"model": DEFAULT_EXECUTOR_MODEL, "effort": DEFAULT_EXECUTOR_EFFORT}
+
+    def _pair(values: dict, keys) -> str:   # `claude-x effort=y`, naming only `keys`
+        return " ".join(values[k] if k == "model" else f"{k}={values[k]}" for k in keys)
+
+    from_env = [f"{EXECUTOR_ENV[k]}={env[EXECUTOR_ENV[k]]}" for k in EXECUTOR_KEYS if env.get(EXECUTOR_ENV[k])]
+    using = (f"using {_pair(config, EXECUTOR_KEYS)} ("
+             + (f"{', '.join(from_env)} set at daemon start" if from_env else "the default") + ")")
+    stale = [k for k in EXECUTOR_KEYS if k in persisted and persisted[k] != default[k]]
+    if not stale:
+        return f"🛡 executor-default: {using}"
+    return (f"🛡 executor-default: persisted {_pair(persisted, stale)} ≠ default {_pair(default, stale)} "
+            f"— {using}; the persisted value is not applied (no command sets it — it records what an "
+            f"earlier daemon ran with, L-8)")
 
 
 def _pid_alive(pid) -> Optional[bool]:
@@ -247,8 +282,8 @@ class QueueDaemon:
             # S7-CORE-11: the daemon predates --repo, --model and --effort, and its
             # 45-minute kill predates routes that legitimately run 40-60 min.
             "repo": os.environ.get("QUEUE_REPO", "clinical-mp"),
-            "model": os.environ.get("TONI_MODEL", "claude-fable-5-1"),
-            "effort": os.environ.get("TONI_EFFORT", "high"),
+            # [EXECUTOR-DEFAULT-1] canon_assert's one default, or TONI_MODEL / TONI_EFFORT at start.
+            **dict(zip(EXECUTOR_KEYS, executor_default(os.environ))),
             # MUST stay ABOVE orchestrator.py's own 180m hard cap, so the orchestrator
             # times out gracefully (branch preserved, fire lock released) instead of
             # this daemon SIGKILLing it mid-route and leaving a stale lock.
@@ -263,6 +298,7 @@ class QueueDaemon:
         self.control_result = None
         self.is_daemon = False
         self._held_markers = set()   # P-STALE: markers already reported HOLD, said once each
+        self.persisted_executor = {}   # [EXECUTOR-DEFAULT-1] read from queue-state.json, never applied
         self.lock = threading.Lock()
         self._ensure_dirs()
         self._load_state()
@@ -278,7 +314,9 @@ class QueueDaemon:
                 data = json.loads(QUEUE_STATE.read_text())
                 self.completed = data.get("completed", [])
                 self.failed = data.get("failed", [])
-                self.config.update(data.get("config", {}))
+                self.persisted_executor = _executor_of(data)
+                self.config.update({k: v for k, v in (data.get("config") or {}).items()
+                                    if k not in EXECUTOR_KEYS})
                 self.consecutive_count = data.get("consecutive_count", 0)
                 ack = data.get("control_ack")
                 self.control_ack = ack if isinstance(ack, int) and not isinstance(ack, bool) else 0
@@ -306,6 +344,8 @@ class QueueDaemon:
             if not self.is_daemon:
                 prior = read_persisted_state()
                 data.update({k: prior.get(k) for k in DAEMON_OWNED_KEYS})
+                # [EXECUTOR-DEFAULT-1] the model/effort on disk are the ones the DAEMON resolved
+                data["config"] = {**self.config, **_executor_of(prior)}
             QUEUE_STATE.write_text(json.dumps(data, indent=2, default=str))
         except Exception:
             pass
@@ -577,6 +617,7 @@ class QueueDaemon:
         print(f"[QUEUE] Config: max={self.config['max_consecutive']}, "
               f"cooldown={self.config['cooldown_seconds']}s, "
               f"stop_on_fail={self.config['stop_on_failure']}")
+        print(executor_default_line(self.persisted_executor, self.config, os.environ))
 
         while self.status != "stopped":
             self._poll_control()
@@ -780,6 +821,7 @@ def main(argv: list) -> int:
         print(status_line(st))
         r = d.get_status()
         r.update({k: st.get(k) for k in DAEMON_OWNED_KEYS})
+        r["config"] = {**r["config"], **_executor_of(st)}   # the daemon's executor, not this process's
         print(json.dumps(r, indent=2, default=str))
     elif cmd in ("pause", "resume"):
         rc, msg = request_control(cmd, reset_consecutive="--reset-consecutive" in argv[1:])

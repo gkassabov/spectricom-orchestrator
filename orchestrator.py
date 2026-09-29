@@ -36,12 +36,13 @@ import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
 # TONI-BG-CEILING-1: the executor wait-ceiling invariant, asserted at fire_toni's spawn.
 # GATE-CLOCK-1: the clock-plausibility predicate, asserted at the end of every gate leg.
 # ORCH-FOREGROUND-1: the executor's foreground-only environment, asserted beside the ceiling.
-from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, DISABLE_BG_TASKS_VAR,
+from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, DEFAULT_EXECUTOR_EFFORT,
+                          DEFAULT_EXECUTOR_MODEL, DISABLE_BG_TASKS_VAR,
                           FOREGROUND_BOUND_VARS, ClockViolation, LegClocks, QueueRepo,
                           check_bg_ceiling_invariants, check_branch_freshness_invariants,
                           check_clock_plausibility, check_foreground_invariants,
                           check_handback_invariants, check_route_landed_invariants,
-                          load_outstanding_work_rules)
+                          executor_default, load_outstanding_work_rules)
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
 PREFIRE_BYPASS = False
@@ -204,9 +205,9 @@ BG_WAIT_MARGIN_S = 300  # TONI-BG-CEILING-1 §2.2: CLI bg-wait ceiling = route t
 
 # Executor model/effort (D-S7CORE3-05, S7-CORE-4 [MODEL-1]).
 # Precedence: CLI --model/--effort > env TONI_MODEL/TONI_EFFORT > default.
-# Requires claude-code CLI >= 2.1.251 for claude-fable-5-1.
-TONI_MODEL = os.environ.get("TONI_MODEL", "claude-fable-5-1")
-TONI_EFFORT = os.environ.get("TONI_EFFORT", "high")
+# [EXECUTOR-DEFAULT-1] the default is canon_assert's DEFAULT_EXECUTOR_MODEL / _EFFORT, the queue
+# daemon's too (D-S7CORE15-01) — no other place in the pipeline names one.
+TONI_MODEL, TONI_EFFORT = executor_default(os.environ)
 TONI_COOLDOWN = 10
 MAX_PARALLEL = 3
 RUN_PLAYWRIGHT = False
@@ -4655,6 +4656,9 @@ def resolve(p: str) -> Path:
         if candidate.exists(): return candidate.resolve()
     raise FileNotFoundError(f"Brief not found: {p}")
 
+EXECUTOR_CMDS = ("run", "queue", "parallel", "watch")   # the subcommands that fire an executor
+
+
 def main():
     ap = argparse.ArgumentParser(description="Spectricom Orchestrator v3.1")
     sp = ap.add_subparsers(dest="cmd")
@@ -4669,8 +4673,8 @@ def main():
     rp.add_argument("--skip-deps", action="store_true", help="Ignore dependency check")
     rp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     rp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
-    rp.add_argument("--model", default="", help="Executor model (default: env TONI_MODEL or claude-fable-5-1)")
-    rp.add_argument("--effort", default="", help="Executor effort (default: env TONI_EFFORT or high)")
+    rp.add_argument("--model", default="", help=f"Executor model (default: env TONI_MODEL or {DEFAULT_EXECUTOR_MODEL})")
+    rp.add_argument("--effort", default="", help=f"Executor effort (default: env TONI_EFFORT or {DEFAULT_EXECUTOR_EFFORT})")
 
     qp = sp.add_parser("queue")
     qp.add_argument("batch_files", nargs="+")
@@ -4679,8 +4683,8 @@ def main():
     qp.add_argument("--skip-deps", action="store_true")
     qp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     qp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
-    qp.add_argument("--model", default="", help="Executor model (default: env TONI_MODEL or claude-fable-5-1)")
-    qp.add_argument("--effort", default="", help="Executor effort (default: env TONI_EFFORT or high)")
+    qp.add_argument("--model", default="", help=f"Executor model (default: env TONI_MODEL or {DEFAULT_EXECUTOR_MODEL})")
+    qp.add_argument("--effort", default="", help=f"Executor effort (default: env TONI_EFFORT or {DEFAULT_EXECUTOR_EFFORT})")
 
     pp = sp.add_parser("parallel")
     pp.add_argument("batch_files", nargs="+")
@@ -4688,8 +4692,8 @@ def main():
     pp.add_argument("--force", action="store_true")
     pp.add_argument("--skip-sit", action="store_true", help="Skip post-merge SIT smoke test")
     pp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
-    pp.add_argument("--model", default="", help="Executor model (default: env TONI_MODEL or claude-fable-5-1)")
-    pp.add_argument("--effort", default="", help="Executor effort (default: env TONI_EFFORT or high)")
+    pp.add_argument("--model", default="", help=f"Executor model (default: env TONI_MODEL or {DEFAULT_EXECUTOR_MODEL})")
+    pp.add_argument("--effort", default="", help=f"Executor effort (default: env TONI_EFFORT or {DEFAULT_EXECUTOR_EFFORT})")
 
     dp = sp.add_parser("deps")
     dp.add_argument("batch_file")
@@ -4755,7 +4759,10 @@ def main():
         TONI_MODEL = a.model
     if getattr(a, 'effort', ''):
         TONI_EFFORT = a.effort
-    log.info(f"Executor: model={TONI_MODEL} effort={TONI_EFFORT}")
+    # [EXECUTOR-DEFAULT-1] only a command that fires an executor names one: a read-only command
+    # (handback-scan, status, deps, …) printing `Executor:` reads as a route that never ran.
+    if a.cmd in EXECUTOR_CMDS:
+        log.info(f"Executor: model={TONI_MODEL} effort={TONI_EFFORT}")
 
     if a.cmd == "run":
         # [ORCH-4]: the lock is per repo — a live fire in a DIFFERENT repo does not refuse
