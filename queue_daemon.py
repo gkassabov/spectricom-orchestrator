@@ -15,6 +15,8 @@ Can also run standalone for testing:
   python3 queue_daemon.py status       # show queue state (line 1: daemon_status, paused_reason, paused_at)
   python3 queue_daemon.py pause        # ask the RUNNING daemon to pause (control file; no restart)
   python3 queue_daemon.py resume [--reset-consecutive]   # ask it to resume
+  python3 queue_daemon.py config <key> <value>   # max_consecutive | cooldown_seconds | stop_on_failure,
+                                                 # no daemon running; anything else is refused, exit 1
   python3 queue_daemon.py check        # boot assert B6: queued briefs whose route already merged
   python3 queue_daemon.py check-logs   # ORCH-STDOUT-1: recorded routes without a readable log
 """
@@ -106,6 +108,49 @@ def executor_default_line(persisted: dict, config: dict, env) -> str:
     return (f"🛡 executor-default: persisted {_pair(persisted, stale)} ≠ default {_pair(default, stale)} "
             f"— {using}; the persisted value is not applied (no command sets it — it records what an "
             f"earlier daemon ran with, L-8)")
+
+
+# [CONFIG-TRUTH-1] S7-CORE-16 · route 67 "Found and left". update_config answered {"ok": True} for every
+# key in config and assigned only three, so `model` was "set" and nothing changed. The three a command
+# can set, each with its parser; every other key is refused and the refusal says where it comes from.
+# A value that does not parse is refused, never coerced — bool("false") is True.
+def _parse_count(value) -> Optional[int]:
+    """A non-negative integer, given as an int or its decimal string; None for anything else."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value >= 0 else None
+    s = value.strip() if isinstance(value, str) else ""
+    return int(s) if s.isascii() and s.isdigit() else None
+
+
+def _parse_flag(value) -> Optional[bool]:
+    """True/False, given as a bool or as `true`/`false` in any case; None for anything else."""
+    if isinstance(value, bool):
+        return value
+    return {"true": True, "false": False}.get(value.strip().lower()) if isinstance(value, str) else None
+
+
+SETTABLE_CONFIG = {"max_consecutive": (_parse_count, "a non-negative integer"),
+                   "cooldown_seconds": (_parse_count, "a non-negative integer"),
+                   "stop_on_failure": (_parse_flag, "true or false")}
+UNSETTABLE_CONFIG = {
+    k: (f"one default in the repo (canon_assert's DEFAULT_EXECUTOR_{k.upper()}, or {EXECUTOR_ENV[k]} at daemon "
+        f"start); a brief's `#!queue {k}=…` header overrides it (EXECUTOR-DEFAULT-1)") for k in EXECUTOR_KEYS}
+UNSETTABLE_CONFIG.update({
+    "repo": ("a brief names its repo in its `#!queue repo=…` header; one that names none runs the daemon's "
+             "default, read at daemon start (queue-state.json, else QUEUE_REPO, else clinical-mp)"),
+    "timeout_seconds": ("the daemon's route kill is queue_daemon.py's default, kept above orchestrator.py's own "
+                        "180-minute cap; it is read at daemon start (queue-state.json, else that default)"),
+})
+
+
+def parse_config(key, value) -> tuple:
+    """(value, None) for a settable key and a value that parses; (None, error) for anything else."""
+    if key not in SETTABLE_CONFIG:
+        why = UNSETTABLE_CONFIG.get(key, f"not a config key (settable: {', '.join(SETTABLE_CONFIG)})")
+        return None, f"{key} is not settable by command: {why}"
+    parse, what = SETTABLE_CONFIG[key]
+    parsed = parse(value)
+    return (parsed, None) if parsed is not None else (None, f"{key}: {value!r} is not {what}; nothing changed")
 
 
 def _pid_alive(pid) -> Optional[bool]:
@@ -472,15 +517,14 @@ class QueueDaemon:
         return {"ok": True, "consecutive_count": 0, "status": self.status}
 
     def update_config(self, key, value):
+        """[CONFIG-TRUTH-1] set one of SETTABLE_CONFIG, or refuse and say why. A refusal writes nothing."""
+        parsed, error = parse_config(key, value)
+        if error:
+            return {"ok": False, "error": error}
         with self.lock:
-            if key in self.config:
-                if key in ("max_consecutive", "cooldown_seconds"):
-                    self.config[key] = int(value)
-                elif key == "stop_on_failure":
-                    self.config[key] = bool(value)
-                self._save_state()
-                return {"ok": True, "config": self.config}
-        return {"ok": False, "error": f"Unknown config key: {key}"}
+            self.config[key] = parsed
+            self._save_state()
+            return {"ok": True, "config": self.config}
 
     def queue_repos(self) -> list[QueueRepo]:
         """The repos this queue's briefs actually name — `#!queue repo=…`, plus the configured
@@ -830,6 +874,26 @@ def main(argv: list) -> int:
     elif cmd == "clear":
         r = d.clear_queue()
         print(json.dumps(r, indent=2))
+    elif cmd == "config" and len(argv) == 3:
+        # [CONFIG-TRUTH-1] a refusal is printed and the exit is 1. This process is not the daemon: a
+        # running one keeps its config in memory and rewrites queue-state.json at its next save, so a
+        # value written here while one may be running would change nothing — refused too, and said.
+        key, value = argv[1:]
+        _, error = parse_config(key, value)
+        st = read_persisted_state()
+        pid = st.get("pid")
+        if error is None and st.get("daemon_status") not in (None, "stopped") and (
+                pid is None or _pid_alive(pid) is not False):
+            error = (f"{key} not set: a daemon may be running (daemon_status={st.get('daemon_status')}, "
+                     f"pid {pid if pid is not None else 'not recorded'}); it keeps its config in memory and "
+                     f"rewrites queue-state.json at its next save, so a value written here would change "
+                     f"nothing — set it while no daemon runs")
+        r = {"ok": False, "error": error} if error else d.update_config(key, value)
+        if r["ok"]:
+            r["config"] = {**r["config"], **_executor_of(read_persisted_state())}   # as `status` shows it
+            r["note"] = "written to queue-state.json; the next daemon start reads it"
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        return 0 if r["ok"] else 1
     elif cmd == "check":
         # Boot assert B6 as a command — the two commands a human used to run by hand,
         # report-only. The daemon retires on start; this one never moves anything.
@@ -854,7 +918,7 @@ def main(argv: list) -> int:
         return 1 if violations else 0
     else:
         print(f"Usage: {sys.argv[0]} [enqueue <file> | status | pause | resume [--reset-consecutive] "
-              f"| check | check-logs | clear]")
+              f"| config <key> <value> | check | check-logs | clear]")
         print(f"  Or run without args to start the daemon loop.")
     return 0
 

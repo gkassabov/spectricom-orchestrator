@@ -2868,10 +2868,21 @@ def _unit_cache_lookup(archive: Path, repo_name: str, sha: str, cmd: str) -> Opt
 def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: UnitSuiteRun):
     """Persist a MEASURED baseline. AC-O5-02: files, tests, failures, duration and the SHA.
     The suite output is deliberately NOT stored — it is only ever used to F-20-classify the
-    BRANCH leg, and keeping 20KB per commit forever buys nothing."""
+    BRANCH leg, and keeping 20KB per commit forever buys nothing.
+
+    [CONFIG-TRUTH-1] only a leg judged plausible reaches this (BASELINE-TRUST-1 returns first on an
+    implausible one), and the entry says so: `clock: "plausible"`. Storing supersedes an unjudged
+    entry at the same key; that entry's [ORCH-6/7] flaky tally is about files, not about this
+    measurement, so it is carried forward."""
+    if run.clock is not None:
+        return   # BASELINE-TRUST-1: never cached — the field below would be false
     archive.mkdir(parents=True, exist_ok=True)
     entries = _unit_cache_load(archive)
-    entries[_unit_cache_key(repo_name, sha, cmd)] = {
+    key = _unit_cache_key(repo_name, sha, cmd)
+    prior = entries.get(key)
+    flaky = ({k: prior[k] for k in ("flaky_files", "flaky_seen") if k in prior}
+             if _unit_cache_entry_matches(prior, repo_name, sha, cmd) else {})
+    entries[key] = {
         "sha": sha, "repo": repo_name, "test_cmd": cmd,
         "measured_at": datetime.now().isoformat(),
         "ref": run.ref, "exit_code": run.exit_code, "duration_s": round(run.duration_s, 2),
@@ -2883,12 +2894,21 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         "tests_skipped": run.tests_skipped, "tests_todo": run.tests_todo,
         "failures_source": run.failures_source,
         "tests_expected_fail": run.tests_expected_fail,   # [ORCH-TALLY-1], additive the same way
+        # [CONFIG-TRUTH-1] additive: an entry without it predates GATE-CLOCK-1 and was never judged
+        "clock": "plausible",
+        **flaky,
     }
     try:
         _unit_cache_file(archive).write_text(
             json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
     except OSError as e:
         log.warning(f"⚠️  Unit baseline cache not written ({e}) — the next route will re-measure")
+
+
+def _unit_cache_judged(e: dict) -> bool:
+    """[CONFIG-TRUTH-1] was this entry's clock judged? Only the store writes `clock`, and only after
+    GATE-CLOCK-1; an entry without it is a miss, superseded one key at a time as it is needed."""
+    return e.get("clock") == "plausible"
 
 
 def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str, flakes: tuple):
@@ -3036,13 +3056,19 @@ def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sh
     This is still a baseline we measured; it is not one we inferred. But it is a baseline for
     an OLDER commit, so the comparison it supports is approximate in both directions, and
     every caller of this is required to say so in the verdict. Nothing here invents a number,
-    and nothing here reads main's tip."""
-    best, best_distance = None, None
+    and nothing here reads main's tip.
+
+    [CONFIG-TRUTH-1] an entry whose clock was never judged is not a candidate — and it cannot be
+    re-measured here, since the measurement at the base has just failed."""
+    best, best_distance, unjudged = None, None, 0
     for e in _unit_cache_load(archive).values():
         if not isinstance(e, dict) or e.get("repo") != repo_name or e.get("test_cmd") != cmd:
             continue
         sha = e.get("sha")
         if not sha or sha == base_sha:
+            continue
+        if not _unit_cache_judged(e):
+            unjudged += 1
             continue
         anc = subprocess.run(
             f"git -C {shlex.quote(str(repo_path))} merge-base --is-ancestor "
@@ -3060,6 +3086,10 @@ def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sh
             continue
         if best_distance is None or distance < best_distance:
             best, best_distance = e, distance
+    if unjudged:
+        log.info(f"♻️  Unit baseline: {unjudged} cached {repo_name} "
+                 f"{'entry predates' if unjudged == 1 else 'entries predate'} GATE-CLOCK-1 (clock never judged) "
+                 f"— not considered as an ancestor baseline")
     if best is not None:
         best = dict(best, ancestor_distance=best_distance)
     return best
@@ -3077,16 +3107,24 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
     feeds is a comparison. A baseline leg on an implausible clock is never compared against and
     never cached: it is measured ONCE more, and a second implausible leg is "implausible" — the
     gate's BLOCKED(environment) `baseline-clock-implausible`. Exactly one `🛡 baseline-trust:`
-    line per call (P-SAY)."""
+    line per call (P-SAY).
+
+    [CONFIG-TRUTH-1] a cached entry is a hit only if its clock was judged (`clock: "plausible"`). One
+    that predates GATE-CLOCK-1 is a miss: measured again, and a plausible leg overwrites it."""
     hit = _unit_cache_lookup(archive, repo_name, base_sha, cmd)
+    if hit and not _unit_cache_judged(hit):
+        log.info(f"♻️  Unit baseline: cached entry at {base_sha[:7]} predates GATE-CLOCK-1 (clock never "
+                 f"judged) — re-measuring")
+        hit = None
     if hit:
         run = _unit_run_from_cache(hit, f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]}")
-        note = (f"read from cache — measured {hit.get('measured_at', '?')[:19]} at "
+        measured_at = hit.get("measured_at", "?")[:19]
+        note = (f"read from cache — measured {measured_at} at "
                 f"{base_sha[:7]}, {run.collection or 'collection unknown'} in {run.duration_s:.1f}s; "
                 f"not re-run (the baseline for a commit does not change)")
         log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} — {run.collection}; no baseline run")
-        log.info(f"🛡 baseline-trust: CLEAN — cache hit at {base_sha[:7]}: no leg measured now, so no "
-                 f"clock to judge; since GATE-CLOCK-1 only a plausible leg is cached")
+        log.info(f'🛡 baseline-trust: CLEAN — cache hit at {base_sha[:7]}, measured {measured_at} on a clock '
+                 f'judged plausible (cache entry "clock": "{hit["clock"]}")')
         return run, "cache", note
 
     log.info(f"🧬 Unit baseline: cache MISS for {base_sha[:7]} — measuring "
