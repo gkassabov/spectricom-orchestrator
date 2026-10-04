@@ -85,6 +85,7 @@ class Fire:
         monkeypatch.setattr(queue_daemon, "REPOS_CONFIG", cfg)
         monkeypatch.setattr(queue_daemon, "LOG_DIR", self.logs, raising=False)
         self.d = queue_daemon.QueueDaemon()
+        self.d.start_running = True  # ORCH-CONTROL-SCOPE-1 C2: these tests fire at start, as --start-running does
         self.d.config.update(repo=GL_REPO, cooldown_seconds=0, timeout_seconds=15,
                              model="m", effort="e")
         # The loop's first idle (queue empty) or paused (stop_on_failure) sleep ends it. Only

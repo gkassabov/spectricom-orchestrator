@@ -1,0 +1,29 @@
+# filename: systemd/spectricom-queue-daemon.service
+# ORCH-CONTROL-SCOPE-1 C7a (S7-CORE-19) — the queue daemon as a systemd USER unit, so a WSL restart
+# restarts it. Shipped, not installed: scripts/install-queue-daemon-unit.sh renders @ORCH_DIR@ (the repo
+# it runs from) and @DAEMON_PATH@ (`daemon_path` in config/repos.yaml) into
+# ~/.config/systemd/user/spectricom-queue-daemon.service and enables it.
+# A boot-started daemon comes up PAUSED (start:queue-non-empty) when work is queued: it fires nothing
+# until `python3 queue_daemon.py resume`. It is never given --start-running here.
+[Unit]
+Description=Spectricom queue daemon (fires queue/ through orchestrator.py; starts paused when work is queued)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ORCH_DIR@
+Environment=PATH=@DAEMON_PATH@
+Environment=PYTHONUNBUFFERED=1
+# D-184: Toni runs on Max OAuth, never the API — orchestrator.py exits 3 if the key is set.
+UnsetEnvironment=ANTHROPIC_API_KEY
+ExecStart=/usr/bin/env -u ANTHROPIC_API_KEY /usr/bin/python3 -u @ORCH_DIR@/queue_daemon.py
+Restart=on-failure
+RestartSec=10
+# A daemon restart must not kill the route it launched: the route holds its own fire lock, and the
+# restarted daemon waits on it (QUEUE-PAUSE-OPAQUE P-STALE clears it only once its pid is dead).
+KillMode=process
+StandardOutput=append:@ORCH_DIR@/logs/queue-daemon.log
+StandardError=append:@ORCH_DIR@/logs/queue-daemon.log
+
+[Install]
+WantedBy=default.target

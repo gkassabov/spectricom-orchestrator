@@ -80,10 +80,11 @@ else
   echo "❌ WATCHDOG not running"
 fi
 
-# Toni activity — in the route's own tree (a meta-fire's worktree, else the lock's repo_path), not a fixed repo
+# Toni activity — in the route's own tree (a Yorsie route's or a meta-fire's worktree, else the lock's
+# repo_path), not a fixed repo. ORCH-CONTROL-SCOPE-1 C4: a `worktree_mode: parallel` route records route_worktree.
 if [[ -f "$ORCH/state/running.json" ]]; then
   branch=$(python3 -c "import json; print(json.load(open('$ORCH/state/running.json'))['branch'])" 2>/dev/null)
-  rpath=$(python3 -c "import json; d=json.load(open('$ORCH/state/running.json')); print(d.get('meta_fire_worktree') or d.get('repo_path') or '')" 2>/dev/null)
+  rpath=$(python3 -c "import json; d=json.load(open('$ORCH/state/running.json')); print(d.get('route_worktree') or d.get('meta_fire_worktree') or d.get('repo_path') or '')" 2>/dev/null)
   mod=$([[ -n "$rpath" ]] && cd "$rpath" && git status -s 2>/dev/null | wc -l || echo "?")
   echo "🔥 TONI branch=$branch | tree=${rpath:-?} | uncommitted files=$mod"
 fi

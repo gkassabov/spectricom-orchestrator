@@ -4,11 +4,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import prefire  # noqa: E402
+import pytest  # noqa: E402
+import yaml  # noqa: E402
+
+KANBAN_LINE = "## Kanban: SCP_Kanban row 1\n"
+
+
+@pytest.fixture(autouse=True)
+def ready_row(tmp_path, monkeypatch):
+    """ORCH-CONTROL-SCOPE-1 C3: every brief here names a READY row of a scratch Kanban, so these tests
+    keep judging A2/A8 alone (A1 has its own in tests/test_control_scope.py)."""
+    canon = tmp_path / "canon"
+    canon.mkdir()
+    (canon / "SCP_Kanban_v0-1.md").write_text("| # | Item | State |\n|---|---|---|\n| 1 | x | **`READY`** |\n")
+    cfg = tmp_path / "repos.yaml"
+    cfg.write_text(yaml.safe_dump({"kanban_dir": str(canon), "repos": {}}))
+    monkeypatch.setattr(prefire, "REPOS_CONFIG", cfg)
 
 
 def w(tmp_path, body: str) -> Path:
     p = tmp_path / "b.md"
-    p.write_text(body, encoding="utf-8")
+    p.write_text(KANBAN_LINE + body, encoding="utf-8")
     return p
 
 

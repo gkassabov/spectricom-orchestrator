@@ -29,7 +29,7 @@ from enum import Enum
 from typing import Mapping, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
+import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A1/A2/A8)
 # ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
 # shared with the tests; canon_assert imports nothing from here.
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
@@ -1346,8 +1346,10 @@ def _refresh_legacy_running_mirror():
 
 def _write_running_marker(batch_file: Path, repo_name: str, repo_path: Path,
                           branch: str, meta_fire_worktree: Optional[Path],
-                          is_self_mod: bool):
-    """Take the fire lock for `repo_name`: state/running-<repo>.json, plus the mirror."""
+                          is_self_mod: bool, route_worktree: Optional[Path] = None):
+    """Take the fire lock for `repo_name`: state/running-<repo>.json, plus the mirror.
+    [ORCH-CONTROL-SCOPE-1] `route_worktree`: the tree a `worktree_mode: parallel` route runs in — the
+    route's tree for qstat.sh, and the daemon's sign that the main checkout was never the route's."""
     marker_dir = _running_marker_dir()
     marker_dir.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({
@@ -1358,6 +1360,7 @@ def _write_running_marker(batch_file: Path, repo_name: str, repo_path: Path,
         "branch": branch,
         "started_at": datetime.now().astimezone().isoformat(),
         "meta_fire_worktree": str(meta_fire_worktree) if meta_fire_worktree else None,
+        "route_worktree": str(route_worktree) if route_worktree else None,
         "is_self_mod": is_self_mod,
     }, indent=2)
     _running_marker_path(repo_name).write_text(payload)
@@ -1491,6 +1494,153 @@ def merge_branch(br: str) -> bool:
     if r.returncode == 0:
         log.info(f"Merged {br}"); return True
     log.error(f"Merge conflict on {br} — MANUAL RESOLUTION NEEDED"); return False
+
+
+def _gate_parallel_branch(wt: Path, br: str) -> "GateVerdict":
+    """[ORCH-CONTROL-SCOPE-1] C5 / ORCH-PARALLEL-GATE-1: the route lane's pre-merge gate, for one
+    `parallel` worker's branch, in its own worktree. The worker's uncommitted output is committed on
+    its branch first — the route lane's `git add -A` — so the gate judges exactly what a merge would
+    bring in. PASS merges; anything else preserves the branch, with a git note, as the route lane does."""
+    subprocess.run("git add -A", shell=True, capture_output=True, cwd=str(wt))
+    if subprocess.run("git diff --cached --quiet", shell=True, capture_output=True, cwd=str(wt)).returncode != 0:
+        r = subprocess.run(f'git commit -m "fix: {br} — parallel worker output"', shell=True,
+                           capture_output=True, text=True, cwd=str(wt))
+        log.info(f"📦 Committed {br}'s uncommitted output before its gate" if r.returncode == 0
+                 else f"⚠️ Commit failed on {br}: {r.stderr.strip()}")
+    try:
+        v = run_pre_merge_gates(wt, br)
+    except Exception as e:
+        v = _classify_gate_failure("build", str(e), wt, -1)
+        log.error(f"⛔ Pre-merge gate raised on {br}: {e} → {v.label}")
+    if v.outcome is not GateOutcome.PASS:
+        subprocess.run(f'git notes add -m "PRE-MERGE GATE: {v.outcome.value} — {v.gate}: {v.signal}"',
+                       shell=True, capture_output=True, cwd=str(wt))
+        log.error(f"⛔ {v.outcome.value} — {MERGE_TARGET} NOT merged. Branch preserved: {br}. {v.label}")
+    return v
+
+
+# ── [ORCH-CONTROL-SCOPE-1] C4 · YORSIE-WORKTREE-1: the single route of a `worktree_mode: parallel` repo ──
+# Yorsie's project_dir is the tree yorsie-dev.service (:5175) serves. Until this, a Yorsie route cut its
+# branch there, the executor wrote there for the whole route and the gate built there: the dev server
+# served a half-written, ungated branch (logs/yorsie/orch-97-*.log, orch-98-*.log: `Project:
+# /home/gkassa/spectricom-dev-pipeline`), although repos.yaml declared `worktree_mode: parallel`.
+# Now the route runs, is gated and merges in <worktree_base>/<route>. The main checkout's branch is never
+# switched, and MERGE_TARGET moves there only by fast-forward, after a PASS.
+ROUTE_NOT_LANDED_VERDICT = "NOT LANDED"
+
+
+def _create_route_worktree(batch_file: Path) -> tuple[Optional[Path], str]:
+    """(<WORKTREE_BASE>/<route>, "") detached at MERGE_TARGET — _run_batch_inner cuts the route branch in
+    it exactly as in a single-stream checkout — or (None, why). A worktree an earlier attempt of the same
+    route left (kept on failure) is never reused or removed: this one gets a `-<ts>` suffix. The
+    git-ignored dependency trees are linked from the main checkout (_link_unit_deps, the unit baseline's
+    rule), so the executor and the gate see the node_modules the dev tree builds with."""
+    if WORKTREE_BASE.resolve() == PROJECT_ROOT.resolve():
+        return None, (f"worktree_mode: parallel needs a worktree_base outside {PROJECT_ROOT} "
+                      f"(config/repos.yaml, repo {ACTIVE_REPO_NAME})")
+    wt = WORKTREE_BASE / batch_file.stem
+    if wt.exists():
+        wt = WORKTREE_BASE / f"{batch_file.stem}-{datetime.now():%Y%m%d-%H%M%S}"
+    try:
+        WORKTREE_BASE.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return None, f"cannot create {WORKTREE_BASE}: {e}"
+    r = subprocess.run(f"git -C {shlex.quote(str(PROJECT_ROOT))} worktree add --detach "
+                       f"{shlex.quote(str(wt))} {shlex.quote(MERGE_TARGET)}",
+                       shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, f"git worktree add {wt} {MERGE_TARGET} failed: {r.stderr.strip()[-300:]}"
+    links = _link_unit_deps(PROJECT_ROOT, wt)
+    log.info(f"🌳 Route worktree: {wt} (from {MERGE_TARGET}; {len(links)} dependency path(s) linked from "
+             f"{PROJECT_ROOT}) — the main checkout is not the route's")
+    return wt, ""
+
+
+def _finish_route_worktree(wt: Path, result: Optional["Result"]):
+    """A route that merged, or changed nothing, leaves no worktree; any other keeps it, named in the log.
+    The dependency links are removed first, so the removal can never reach into the main checkout."""
+    branch = _git_read("git rev-parse --abbrev-ref HEAD", wt) or "?"
+    if result is None or result.status != Status.PASSED:
+        log.warning(f"🌳 Route worktree preserved: {wt} (branch {branch}). After review: "
+                    f"git -C {PROJECT_ROOT} worktree remove {wt}")
+        return
+    env_name, _ = _gate_env_file(PROJECT_ROOT)
+    for rel in list(UNIT_BASELINE_LINK_PATHS) + ([env_name] if env_name else []):
+        if (wt / rel).is_symlink():
+            try:
+                (wt / rel).unlink()
+            except OSError as e:
+                log.warning(f"⚠️ Route worktree: could not unlink {rel}: {e}")
+    subprocess.run(f"git -C {shlex.quote(str(PROJECT_ROOT))} worktree remove --force {shlex.quote(str(wt))}",
+                   shell=True, capture_output=True)
+    subprocess.run(f"git -C {shlex.quote(str(PROJECT_ROOT))} worktree prune", shell=True, capture_output=True)
+    log.info(f"🌳 Route worktree removed: {wt}")
+
+
+def _checkout_holding(branch: str, repo: Path) -> Optional[Path]:
+    """The checkout (main or linked worktree) that has refs/heads/<branch> checked out, or None."""
+    path = None
+    for line in _git_read("git worktree list --porcelain", repo).splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):])
+        elif line == f"branch refs/heads/{branch}" and path is not None:
+            return path
+    return None
+
+
+def _leave_route_branch(proj: Path, route_wt: Optional[Path], detach: bool = False):
+    """The route lane's `git checkout MERGE_TARGET` once a route is done with its branch. A route
+    worktree stays on its branch instead (kept, named, for inspection) — or, `detach`, lets go of it so
+    the branch can be deleted; MERGE_TARGET belongs to the main checkout, which a route never switches."""
+    if route_wt is None:
+        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+    elif detach:
+        subprocess.run("git checkout -q --detach", shell=True, capture_output=True, cwd=str(proj))
+
+
+def _land_from_route_worktree(wt: Path, branch: str, toni_commits: int) -> Optional[str]:
+    """Merge a gated route branch into MERGE_TARGET from its worktree. None when it landed; else the
+    verdict, with the branch checked out again in the kept worktree and MERGE_TARGET untouched.
+
+    The merge is made in the worktree, on a detached HEAD at MERGE_TARGET's tip, so a conflict is met
+    and aborted there, never in the main checkout. MERGE_TARGET then moves by fast-forward only: in the
+    checkout that holds it (`git merge --ff-only`, which refuses rather than overwrite a local change),
+    or by a compare-and-swap `update-ref` when no checkout holds it."""
+    def git(cmd: str, cwd: Path = wt) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(cwd))
+
+    pre = _git_read(f"git rev-parse {MERGE_TARGET}", wt)
+    d = git(f"git checkout -q --detach {MERGE_TARGET}")
+    if d.returncode != 0:
+        git(f"git checkout -q {branch}")
+        return f"{ROUTE_NOT_LANDED_VERDICT} — the route worktree {wt} could not detach at {MERGE_TARGET}: {d.stderr.strip()[-300:]}"
+    r = git(f"git merge {branch} --no-edit -m \"Merge branch '{branch}'\"")
+    if r.returncode != 0:
+        unmerged = git("git diff --name-only --diff-filter=U").stdout.split()
+        a = git("git merge --abort")
+        if a.returncode != 0:
+            log.error(f"❌ git merge --abort failed in {wt}: {a.stderr.strip()}")
+        git(f"git checkout -q {branch}")
+        log.error(f"⚠️ Merge conflict on {branch}, met in the route worktree {wt} — MANUAL RESOLUTION NEEDED")
+        return f"{MERGE_CONFLICT_VERDICT} — {branch} → {MERGE_TARGET} ({', '.join(unmerged)})"
+    merged = _git_read("git rev-parse HEAD", wt)
+    ff_ref = branch if merged == _git_read(f"git rev-parse {branch}", wt) else merged
+    holder = _checkout_holding(MERGE_TARGET, wt)
+    if holder is not None:
+        r, how = git(f"git merge --ff-only {ff_ref}", cwd=holder), f"fast-forwarded in {holder}"
+    else:
+        r = git(f'git update-ref -m "merge {branch}: Fast-forward" refs/heads/{MERGE_TARGET} {merged} {pre}')
+        how = "ref moved (no checkout holds it)"
+    post = _git_read(f"git rev-parse {MERGE_TARGET}", wt)
+    if r.returncode != 0 or (post == pre and toni_commits > 0):
+        git(f"git checkout -q {branch}")
+        where = f"checked out at {holder}" if holder else "checked out nowhere"
+        why = (r.stderr or r.stdout).strip()[-300:] if r.returncode != 0 else f"its tip is unchanged ({pre[:7]})"
+        return (f"{ROUTE_NOT_LANDED_VERDICT} — {MERGE_TARGET} is {where} and did not fast-forward to the merged "
+                f"commit {merged[:7]}: {why}")
+    log.info(f"🔀 Merged {branch} → {MERGE_TARGET} ({pre[:7]} → {post[:7]}) from the route worktree; "
+             f"{MERGE_TARGET} {how}")
+    return None
 
 
 def retire_batch_file(batch_file: Path) -> Optional[Path]:
@@ -3878,7 +4028,7 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
         return Result(batch_file=batch_file.name, status=Status.FAILED,
                       started=_now, finished=_now, duration_s=0.0,
                       exit_code=2, briefs=0,
-                      error='pre-fire assertions failed (A2/A8) — HOOK-1')
+                      error='pre-fire assertions failed (A1/A2/A8) — HOOK-1')
     meta_wt = None
     meta_branch = None
     is_self_mod = IS_META_FIRE and (PROJECT_ROOT.resolve() == ORCH_DIR)
@@ -3918,18 +4068,30 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
         if stale_err is not None:
             return _stale_base_result(batch_file, datetime.now(), 0, stale_err)
 
-    proj = worktree or PROJECT_ROOT
+    # [ORCH-CONTROL-SCOPE-1] C4: a `worktree_mode: parallel` repo's route runs in its own worktree. One
+    # that cannot be made is not fired — never in the main checkout instead.
+    route_wt = None
+    if WORKTREE_MODE == "parallel" and worktree is None and not IS_META_FIRE:
+        route_wt, why = _create_route_worktree(batch_file)
+        if route_wt is None:
+            log.error(f"⛔ ROUTE WORKTREE — {why} — not firing.")
+            _now = datetime.now().isoformat()
+            return Result(batch_file=batch_file.name, status=Status.FAILED, started=_now, finished=_now,
+                          duration_s=0.0, exit_code=2, briefs=0, error=f"route-worktree: {why}")
+
+    proj = worktree or route_wt or PROJECT_ROOT
     started = datetime.now()
     briefs_preview = parse_batch(batch_file)
     write_running(batch_file, len(briefs_preview))
     _write_running_marker(
         batch_file, ACTIVE_REPO_NAME, PROJECT_ROOT,
         meta_branch or f"{BRANCH_PREFIX}-{batch_file.stem}",
-        meta_wt, is_self_mod,
+        meta_wt, is_self_mod, route_worktree=route_wt,
     )
     result = None
     try:
-        result = _run_batch_inner(batch_file, proj, started, worktree)
+        result = _run_batch_inner(batch_file, proj, started, worktree,
+                                  **({"route_wt": route_wt} if route_wt is not None else {}))
     finally:
         clear_running()
         # [ORCH-4]: release THIS repo's lock. Another repo's concurrent fire keeps its own.
@@ -3963,9 +4125,15 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
                     )
             else:
                 cleanup_worktree(meta_wt)
+        if route_wt is not None:
+            _finish_route_worktree(route_wt, result)
     return result
 
-def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=None) -> Result:
+def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=None,
+                     route_wt: Optional[Path] = None) -> Result:
+    # [ORCH-CONTROL-SCOPE-1] C4: `route_wt` is set when proj IS a route worktree (run_batch made it). The
+    # route lane runs unchanged in it — branch cut, executor, commit, gate — except that it never checks
+    # out MERGE_TARGET, and the merge is _land_from_route_worktree.
     briefs_subdir = ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
     target = proj / briefs_subdir / batch_file.name
     if not batch_file.is_relative_to(proj):
@@ -4009,15 +4177,18 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                         stale_err = str(v[0])
                         subprocess.run(f"git checkout {MERGE_TARGET}", shell=True,
                                        capture_output=True, cwd=str(proj))
-                elif retired is not None:
-                    stale_err = (f"could not cut {branch_name} from {MERGE_TARGET} after retiring "
-                                 f"{retired}: {r.stderr.strip()}")
+                elif retired is not None or route_wt is not None:
+                    stale_err = (f"could not cut {branch_name} from {MERGE_TARGET}"
+                                 + (f" after retiring {retired}" if retired else f" in the route worktree {proj}")
+                                 + f": {r.stderr.strip()}")
                 else:
                     log.warning(f"⚠️ Could not create branch: {r.stderr.strip()}. Running on current branch.")
                     branch_name = None
             except Exception as e:
-                if retired is not None:
-                    stale_err = f"could not cut {branch_name} after retiring {retired}: {e}"
+                if retired is not None or route_wt is not None:
+                    stale_err = (f"could not cut {branch_name}"
+                                 + (f" after retiring {retired}" if retired else f" in the route worktree {proj}")
+                                 + f": {e}")
                 else:
                     log.warning(f"⚠️ Branch creation failed: {e}. Running on current branch.")
                     branch_name = None
@@ -4170,7 +4341,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                             f'git notes add -m "{hold.source}: {hold.verdict} — {hold.label}"',
                             shell=True, capture_output=True, cwd=str(proj)
                         )
-                        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                        _leave_route_branch(proj, route_wt)
                         log.error(
                             f"⛔ {hold.verdict} — {MERGE_TARGET} NOT merged, no gate run. Branch preserved: "
                             f"{branch_name}. {hold.error}"
@@ -4182,12 +4353,22 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                             shell=True, capture_output=True, cwd=str(proj)
                         )
                         status = Status.BLOCKED if verdict.outcome is GateOutcome.BLOCKED_ENV else Status.FAILED
-                        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                        _leave_route_branch(proj, route_wt)
                         log.error(
                             f"⛔ {gate_outcome} — {MERGE_TARGET} NOT merged. Branch preserved: {branch_name}. "
                             f"Inspect: cd {proj} && git log --oneline {MERGE_TARGET}..{branch_name} "
                             f"&& git diff {MERGE_TARGET}...{branch_name}"
                         )
+                    elif route_wt is not None:
+                        # [ORCH-CONTROL-SCOPE-1] C4: green gate only, merged FROM the route worktree.
+                        route_tip = _git_read("git rev-parse HEAD", proj) or None
+                        unlanded = _land_from_route_worktree(proj, branch_name, toni_commits)
+                        if unlanded is None:
+                            retire_batch_file(batch_file)   # QUEUE-RETIRE-1, as below
+                            subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                        else:
+                            status = Status.FAILED
+                            gate_error = f"{unlanded}; gate was {gate_outcome}"
                     else:
                         # Merge back to merge target — green gate only
                         # [ORCH-CONFLICT-1] the route branch is still checked out: its tip is the
@@ -4253,7 +4434,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                         "(usually means idempotent re-fire or halt-and-report)."
                     )
                     no_change_run = True
-                    subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                    _leave_route_branch(proj, route_wt, detach=True)
                     subprocess.run(f"git branch -D {branch_name}", shell=True, capture_output=True, cwd=str(proj))
                     if hold is not None:
                         # [ORCH-HANDBACK-GUARD-1] nothing to merge, but still not `passed` (set below).
@@ -4261,12 +4442,12 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                                   f"{hold.error}")
             else:
                 # Failed batch — switch back to merge target, leave branch for inspection
-                subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+                _leave_route_branch(proj, route_wt)
                 log.warning(f"⚠️ Batch failed — branch {branch_name} left for inspection")
         except Exception as e:
             log.warning(f"⚠️ Git automation error: {e}")
             # Ensure we're back on merge target
-            subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
+            _leave_route_branch(proj, route_wt)
     elif worktree is not None and IS_META_FIRE and status == Status.PASSED:
         # S7-CORE-4 [ORCH-1] meta-fire lane: the route branch is the worktree checkout at
         # `proj`. Gate it HERE so the Result carries the verdict BEFORE run_batch decides
@@ -4401,10 +4582,17 @@ def run_parallel(files: list[Path], force: bool = False):
                 r = f.result(); results.append((r, wt))
             except Exception as e:
                 log.error(f"Worker crash: {bf.name} — {e}")
+    # [ORCH-CONTROL-SCOPE-1] C5 / ORCH-PARALLEL-GATE-1: this lane merged with no pre-merge gate. Every
+    # branch is now gated in its own worktree BEFORE any merge — PASS merges; anything else is preserved.
+    branches = {r.batch_file: f"{BRANCH_PREFIX}-{Path(r.batch_file).stem}-w{wts.index(wt)+1}" for r, wt in results}
+    log.info("\nGating each branch before any merge...")
+    green = {r.batch_file for r, wt in sorted(results, key=lambda x: x[0].batch_file)
+             if r.status == Status.PASSED
+             and _gate_parallel_branch(wt, branches[r.batch_file]).outcome is GateOutcome.PASS}
     log.info("\nMerging sequentially...")
     for r, wt in sorted(results, key=lambda x: x[0].batch_file):
-        if r.status == Status.PASSED:
-            br = f"{BRANCH_PREFIX}-{Path(r.batch_file).stem}-w{wts.index(wt)+1}"
+        if r.status == Status.PASSED and r.batch_file in green:
+            br = branches[r.batch_file]
             if merge_branch(br) and RUN_PLAYWRIGHT:
                 ok, _ = run_playwright()
                 if not ok: log.error("PW failed post-merge — stopping"); break
@@ -4818,7 +5006,7 @@ def main():
     global PREFIRE_BYPASS
     if getattr(a, 'force', False):
         PREFIRE_BYPASS = True
-        log.warning('--force: pre-fire assertions (A2/A8) BYPASSED')
+        log.warning('--force: pre-fire assertions (A2/A8) BYPASSED; A1 Kanban READY not checked')
         # S7-CORE-8 [ORCH-3] / AC-O3-11: --force bypasses the PRE-FIRE assertions. It does not,
         # and has never, bypassed the PRE-MERGE gates. State that in the same breath, in the
         # same wording A2/A8 report in, so "ALL safety checks bypassed" is never read as

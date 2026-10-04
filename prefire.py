@@ -9,13 +9,19 @@ as an assertion checked at a decidable moment is not a rule.
 
 The decidable moment for a brief is the fire.  These run inside approval_gate().
 
-ENFORCED (decidable from the brief file alone):
+ENFORCED:
+  A1  Kanban READY  — '## Kanban: <SCP_Kanban|Yorsie_Kanban> row <N>' must be declared, and row N
+                      of the newest <family>_v*.md in the canon dir (`kanban_dir` in
+                      config/repos.yaml) must be READY and not MERGED / COMPLETE / CUT.
+                      [ORCH-CONTROL-SCOPE-1] S7-CORE-18 L-49: five routes (99-103) were enqueued
+                      with no Kanban row; "not decidable from the brief file" was true, and the
+                      brief file now names the row that decides it.
   A2  sizing floor  — '## Estimated runtime:' must be declared and its lower bound
                       must be >= 30 min, unless '## Micro-fire trigger:' names a
                       P0-infra or P1-safety trigger (System Prompt 5.9).
   A8  no skip-sit   — 'skip-sit' must not appear in a feature brief (5.5).
 
-NOT enforced here (not decidable from the brief file): A1 Kanban READY, A3-A7, A9.
+NOT enforced here: A3-A7, A9.
 
 Bypass: orchestrator --force, which already means "ALL safety checks bypassed"
 and logs a warning.  There is deliberately no second, quieter override.
@@ -27,8 +33,19 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
+from canon_assert import disk_family
+
 # System Prompt 5.19.3 — briefs target >= 30 min Toni, ideally 45-90.
 SIZING_FLOOR_MIN = 30
+
+# [ORCH-CONTROL-SCOPE-1] C3 · A1. The canon dir is `kanban_dir` in config/repos.yaml, else this.
+REPOS_CONFIG = Path(__file__).resolve().parent / "config" / "repos.yaml"
+KANBAN_DIR_DEFAULT = Path("/mnt/c/Users/gkass/OneDrive/Documents/Spectricom")
+KANBAN_FAMILIES = ("SCP_Kanban", "Yorsie_Kanban")
+KANBAN_READY = "READY"
+KANBAN_DONE = ("MERGED", "COMPLETE", "CUT")      # any of these in the State cell ⇒ not READY
 
 # How much of the brief header to scan for the declarations.
 _HEADER_CHARS = 6000
@@ -110,9 +127,103 @@ def find_skip_sit(filepath: Path) -> list[str]:
     return hits
 
 
+# ── A1: the Kanban row ───────────────────────────────────────────────────────
+_KANBAN_HEADER = re.compile(r'^##\s*Kanban:\s*(?P<family>\S+)\s+row\s+(?P<row>[A-Za-z]*\d+)\b', re.MULTILINE)
+_KANBAN_HEADER_ANY = re.compile(r'^##\s*Kanban:\s*(?P<text>.*?)\s*$', re.MULTILINE)
+_MD = re.compile(r'[*`]')
+
+
+def kanban_dir() -> Path:
+    """`kanban_dir` in config/repos.yaml, else KANBAN_DIR_DEFAULT. Read per call: tests patch REPOS_CONFIG."""
+    try:
+        named = (yaml.safe_load(REPOS_CONFIG.read_text(encoding="utf-8")) or {}).get("kanban_dir")
+    except Exception:
+        named = None
+    return Path(named) if named else KANBAN_DIR_DEFAULT
+
+
+def parse_kanban_header(filepath: Path) -> Optional[tuple[str, str]]:
+    """(family, row) from the brief's '## Kanban: <family> row <N>' line; None when there is none."""
+    m = _KANBAN_HEADER.search(_read(filepath)[:_HEADER_CHARS])
+    return (m.group("family"), m.group("row")) if m else None
+
+
+def _cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def kanban_states(text: str, row: str) -> list[str]:
+    """The State cell of every table row whose first cell is `row`, markdown stripped. A table's
+    State column is its first header cell naming `state` ("State", "Runtime state", "State at EOS");
+    a table with none is not a Kanban table and is not read."""
+    states, table = [], []
+    for line in text.splitlines() + [""]:
+        if line.lstrip().startswith("|"):
+            table.append(line)
+            continue
+        if len(table) >= 2:
+            head = [_MD.sub("", c).lower() for c in _cells(table[0])]
+            col = next((i for i, h in enumerate(head) if re.search(r"\bstate\b", h)), None)
+            for body in table[2:] if col is not None else []:
+                cells = [_MD.sub("", c).strip() for c in _cells(body)]
+                if cells and cells[0] == row and col < len(cells):
+                    states.append(cells[col])
+        table = []
+    return states
+
+
+def _state_word(state: str) -> str:
+    """What a non-READY State cell says, in one word where it has one: a done token, else its
+    first capitalised status word (BACKLOG, LIVE, RETIRED), else the cell itself."""
+    done = [t for t in KANBAN_DONE if re.search(rf"\b{t}\b", state)]
+    if done:
+        return done[0]
+    word = re.search(r"\b[A-Z][A-Z_-]{2,}\b", state)
+    return word.group(0) if word else (state[:60] or "empty")
+
+
+def check_kanban(filepath: Path) -> tuple[Optional[str], str]:
+    """A1. (failure line, "") or (None, the row it passed on). Never a silent pass: no header, no
+    file, no row ⇒ a failure that says which."""
+    header = parse_kanban_header(filepath)
+    if header is None:
+        named = _KANBAN_HEADER_ANY.search(_read(filepath)[:_HEADER_CHARS])
+        if named:
+            return (f"A1 KANBAN — '## Kanban: {named.group('text')}' names no Kanban row "
+                    f"('<SCP_Kanban|Yorsie_Kanban> row <N>'), not READY"), ""
+        return ("A1 KANBAN — no '## Kanban: <SCP_Kanban|Yorsie_Kanban> row <N>' header; a brief "
+                "fires only from a READY Kanban row"), ""
+    family, row = header
+    if family not in KANBAN_FAMILIES:
+        return (f"A1 KANBAN — '## Kanban: {family} row {row}' names no Kanban family "
+                f"({' or '.join(KANBAN_FAMILIES)}), not READY"), ""
+    canon = kanban_dir()
+    newest = disk_family(canon, re.escape(family), family).newest
+    text = None
+    if newest is not None:
+        try:
+            text = (canon / newest[1]).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = None
+    if text is None:
+        where = f"{newest[1]} unreadable in {canon}" if newest else f"no {family}_v*.md in {canon}"
+        return f"A1 KANBAN — {family} row {row} is unreadable ({where}), not READY", ""
+    states = kanban_states(text, row)
+    if not states:
+        return f"A1 KANBAN — {family} row {row} is missing from {newest[1]}, not READY", ""
+    for state in states:
+        if not re.search(rf"\b{KANBAN_READY}\b", state) or any(re.search(rf"\b{t}\b", state) for t in KANBAN_DONE):
+            return f"A1 KANBAN — {family} row {row} is {_state_word(state)}, not READY", ""
+    return None, f"{family} row {row} READY ({newest[1]})"
+
+
 def check(filepath: Path) -> list[str]:
     """Return a list of assertion failures. Empty list == all checks pass."""
     failures: list[str] = []
+
+    a1, _ = check_kanban(filepath)
+    if a1:
+        failures.append(a1)
 
     estimate = parse_declared_estimate(filepath)
     trigger = parse_microfire_trigger(filepath)
@@ -151,13 +262,14 @@ def report(filepath: Path) -> bool:
     failures = check(filepath)
     bar = "━" * 60
     if not failures:
+        _, row = check_kanban(filepath)
         est = parse_declared_estimate(filepath)
         trig = parse_microfire_trigger(filepath)
         if est is not None:
             detail = "declared %dm (floor %dm)" % (est, SIZING_FLOOR_MIN)
         else:
             detail = "micro-fire: %s" % trig
-        print("  Assertions: ✅ A2/A8 pass — %s" % detail)
+        print("  Assertions: ✅ A1/A2/A8 pass — %s; %s" % (row, detail))
         return True
 
     print("\n%s" % bar)

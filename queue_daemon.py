@@ -10,18 +10,22 @@ D-184: Inherits orchestrator safety gates (rate limiter, deps, approval).
 
 Integrated into orch-dashboard.py v5 as a background thread.
 Can also run standalone for testing:
-  python3 queue_daemon.py              # run daemon
+  python3 queue_daemon.py              # run daemon — PAUSED at start when work is queued (start:queue-non-empty)
+  python3 queue_daemon.py --start-running   # run daemon, firing the queue at once (the pre-C2 start)
   python3 queue_daemon.py enqueue <f>  # copy batch to queue/
-  python3 queue_daemon.py status       # show queue state (line 1: daemon_status, paused_reason, paused_at)
+  python3 queue_daemon.py status [--json]   # show queue state (line 1: daemon_status, paused_reason, paused_at;
+                                            # --json: the JSON alone)
   python3 queue_daemon.py pause        # ask the RUNNING daemon to pause (control file; no restart)
-  python3 queue_daemon.py resume [--reset-consecutive]   # ask it to resume
+  python3 queue_daemon.py resume [--reset-consecutive] [--reason <paused_reason>]   # ask it to resume the pause
+                                       # it is in when asked (or the one named); a pause it was not asked about
+                                       # is not lifted — the request expires (ORCH-CONTROL-SCOPE-1)
   python3 queue_daemon.py config <key> <value>   # max_consecutive | cooldown_seconds | stop_on_failure,
                                                  # no daemon running; anything else is refused, exit 1
   python3 queue_daemon.py check        # boot assert B6: queued briefs whose route already merged
   python3 queue_daemon.py check-logs   # ORCH-STDOUT-1: recorded routes without a readable log
 """
 
-import os, sys, json, time, shutil, threading, subprocess
+import os, sys, json, time, shlex, shutil, threading, subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -55,6 +59,14 @@ CONTROL_ACK_WAIT_S = 15    # how long `pause` / `resume` wait for the acknowledg
 # reset) writes these back as it found them, never its own — it is not the daemon.
 DAEMON_OWNED_KEYS = ("daemon_status", "started_at", "current_batch", "paused_reason", "paused_at",
                      "pid", "control_ack", "control_result")
+
+# [ORCH-CONTROL-SCOPE-1] S7-CORE-18 L-46: a restarted daemon fired the first queued brief at once (95, out
+# of order). A start with work queued is a pause, until an operator resumes it or starts it --start-running.
+START_PAUSED_REASON = "start:queue-non-empty"
+USAGE = ("Usage: python3 queue_daemon.py [--start-running] | enqueue <file> | status [--json] | pause | "
+         "resume [--reset-consecutive] [--reason <paused_reason>] | config <key> <value> | check | check-logs "
+         "| clear\n  With no command it runs the daemon loop: paused at start when work is queued; "
+         "--start-running fires the queue at once.")
 
 
 def control_file() -> Path:
@@ -197,9 +209,13 @@ def status_line(st: dict) -> str:
 
 
 def request_control(action: str, reset_consecutive: bool = False, wait_s: float = CONTROL_ACK_WAIT_S,
-                    poll_s: float = 0.5) -> tuple:
+                    poll_s: float = 0.5, reason: Optional[str] = None) -> tuple:
     """[QUEUE-PAUSE-OPAQUE] P-RESUME, the CLI half of `pause` / `resume [--reset-consecutive]`: write
     one request with the next monotonic id, then wait up to `wait_s` for the daemon's ack.
+
+    [ORCH-CONTROL-SCOPE-1] C1: the request carries the state it was issued against — issued_status,
+    issued_paused_reason, issued_current_batch, as queue-state.json says now — and `reason`, a pause
+    named explicitly (`resume --reason <r>`). The daemon applies a resume only to that pause.
 
     (exit code, message): 0 — acknowledged and the daemon is where it was asked to be, or a stated
     no-op (resume when not paused, pause when paused; nothing is written); 1 — not acknowledged in
@@ -223,6 +239,9 @@ def request_control(action: str, reset_consecutive: bool = False, wait_s: float 
     f.parent.mkdir(parents=True, exist_ok=True)
     tmp = f.with_name(f.name + ".tmp")
     tmp.write_text(json.dumps({"id": rid, "action": action, "reset_consecutive": reset_consecutive,
+                               "reason": reason, "issued_status": status,
+                               "issued_paused_reason": st.get("paused_reason"),
+                               "issued_current_batch": (st.get("current_batch") or {}).get("file"),
                                "requested_at": datetime.now().isoformat(), "requested_by_pid": os.getpid()},
                               indent=2))
     os.replace(tmp, f)
@@ -362,6 +381,7 @@ class QueueDaemon:
         self.persisted_executor = {}   # [EXECUTOR-DEFAULT-1] read from queue-state.json, never applied
         self.persisted_repo = None     # [ORCH-YORSIE-SAFETY-1] the old default's persisted value, never applied
         self.refused = []              # [ORCH-YORSIE-SAFETY-1] briefs refused unfired — not routes
+        self.start_running = False     # [ORCH-CONTROL-SCOPE-1] C2: `--start-running` — fire a queued start at once
         self.lock = threading.Lock()
         self._ensure_dirs()
         self._load_state()
@@ -462,14 +482,16 @@ class QueueDaemon:
         self._save_state()
         return {"ok": True, "queued": src.name, "queue_count": len(self._scan_queue())}
 
-    def _mark_paused(self, reason: str):
+    def _mark_paused(self, reason: str, say: bool = True):
         """[QUEUE-PAUSE-OPAQUE] P-PAUSE: every transition into `paused` says why and since when. The
-        caller saves, holding the lock where it has to — this takes none."""
+        caller saves, holding the lock where it has to — this takes none. `say=False`: the caller prints
+        its own line (a start says once which way it went)."""
         self.status = "paused"
         self.paused_reason = reason
         self.paused_at = datetime.now().isoformat()
         hint = " --reset-consecutive" if reason.startswith("max-consecutive:") else ""
-        print(f"[QUEUE] PAUSED — {reason}. Resume without a restart: python3 queue_daemon.py resume{hint}")
+        if say:
+            print(f"[QUEUE] PAUSED — {reason}. Resume without a restart: python3 queue_daemon.py resume{hint}")
 
     def pause(self, reason: str = "operator"):
         with self.lock:
@@ -612,9 +634,12 @@ class QueueDaemon:
             return
         action, reset = req.get("action"), bool(req.get("reset_consecutive"))
         cap = self.config["max_consecutive"]
+        expired = self._resume_expired(req, rid) if action == "resume" else None
         if action == "pause":
             self.pause("operator")
             result = f"pause → {self.status} ({self.paused_reason})"
+        elif expired:
+            result = expired
         elif action == "resume" and not reset and self.status == "paused" and self.consecutive_count >= cap:
             result = f"resume refused — max-consecutive:{cap} still reached; use `resume --reset-consecutive`"
         elif action == "resume":
@@ -627,6 +652,35 @@ class QueueDaemon:
             self._save_state()
         print(f"[QUEUE] control request {rid}: {result}")
 
+    def _resume_expired(self, req: dict, rid: int) -> Optional[str]:
+        """[ORCH-CONTROL-SCOPE-1] C1 · S7-CORE-18 L-45. None when this resume may be applied; else the
+        result that says why it expired. Request 9 (`resume --reset-consecutive`) was written while
+        route 95 ran; 95 failed, stop_on_failure paused the daemon, and the next poll applied request 9
+        — 96 fired unamended. A request is scoped to the state it was issued against:
+          · it applies only while the daemon's paused_reason (None when not paused) equals the one it
+            was issued under — or, when it names one (`--reason`), the one it names;
+          · a stop-on-failure pause is lifted only by a request issued after that pause began;
+          · a request with no issued state (from a CLI that predates this) cannot be judged: expired."""
+        now = self.paused_reason if self.status == "paused" else None
+        named = req.get("reason")
+        if "issued_status" not in req:
+            issued, ok = "an unrecorded state (a request with no issued_status)", False
+        else:
+            batch, ipr = req.get("issued_current_batch"), req.get("issued_paused_reason")
+            issued = (f"{req.get('issued_status')}" + (f" ({ipr})" if ipr else "") + (f" on {batch}" if batch else "")
+                      + (f" (--reason {named})" if named else ""))
+            ok = (named if named else ipr) == now
+        if ok and now and now.startswith("stop-on-failure:"):
+            try:
+                ok = datetime.fromisoformat(str(req.get("requested_at"))) >= datetime.fromisoformat(str(self.paused_at))
+            except ValueError:
+                ok = False
+            issued += "" if ok else " before that pause began"
+        if ok:
+            return None
+        state = f"paused for {self.paused_reason}" if self.status == "paused" else self.status
+        return f"resume request {rid} expired — issued while {issued}, daemon now {state}; nothing resumed"
+
     def _clear_stale_markers(self):
         """[QUEUE-PAUSE-OPAQUE] P-STALE: a running marker whose PID is dead does not hold a fire. The
         markers are the root running*.json (the legacy file the fire lock is waited on) and
@@ -634,7 +688,8 @@ class QueueDaemon:
         else — for a legacy root file written before it carried one — the pid of the per-repo lock
         naming the same batch. Dead ⇒ renamed aside to `<name>.killed-<ts>` (never deleted) and said
         once. No pid to be had ⇒ kept, and said once: it cannot be judged. Alive, unreadable or
-        mid-write ⇒ left alone."""
+        mid-write ⇒ left alone. Returns [(marker, its contents)] for every marker it cleared."""
+        cleared = []
         state_dir = ORCH_DIR / "state"
         locks = {q: _read_json(q) for q in sorted(state_dir.glob("running*.json"))} if state_dir.is_dir() else {}
         for q in sorted(ORCH_DIR.glob("running*.json")) + list(locks):
@@ -667,6 +722,75 @@ class QueueDaemon:
                 print(f"[QUEUE] could not archive stale marker {q}: {e}")
                 continue
             print(f"[QUEUE] 🛡 stale-running-marker: CLEARED {q} (pid {pid} dead) → {dst.name}")
+            cleared.append((q, data))
+        return cleared
+
+    def _recover_dead_routes(self) -> Optional[str]:
+        """[ORCH-CONTROL-SCOPE-1] C7b · S7-CORE-19: a WSL restart killed the daemon and route 101 with its
+        branch checked out in the clinical-mp tree and work uncommitted. P-STALE renamed the marker and
+        left the tree dirty; the next route cut from that tree would have carried the work along (or run
+        on the dead route's branch when the cut failed). At start, for each marker P-STALE clears, the
+        route's tree is made safe — _recover_dead_route. A route that ran in its own worktree (meta-fire,
+        a `worktree_mode: parallel` route) never had the main checkout, so that checkout is not its to
+        judge. Returns the paused_reason a start must hold, or None."""
+        held, seen = None, set()
+        for _, data in self._clear_stale_markers():
+            name, branch = data.get("repo"), data.get("branch")
+            if not name or not branch or data.get("meta_fire_worktree") or data.get("route_worktree"):
+                continue
+            if (name, branch) in seen:       # state/running.json mirrors the per-repo lock it names
+                continue
+            seen.add((name, branch))
+            held = self._recover_dead_route(name, branch, data.get("batch_id") or branch) or held
+        return held
+
+    def _recover_dead_route(self, name: str, branch: str, route: str) -> Optional[str]:
+        """One dead route's repo, by its repos.yaml entry (never a path the marker names). Clean ⇒
+        nothing to do. Dirty on the route's own branch ⇒ the work is the route's: stash it (untracked
+        included) under a message naming the route, rename the branch `<branch>-died-<ts>`, check out
+        the merge target, and say all three in one line. Dirty on any other branch ⇒ not attributable:
+        left exactly as it is, and the start pauses (`start:dirty-tree:<repo>`). Every step is additive
+        — a stash, a rename, a checkout of a clean tree; nothing is reset, removed or deleted."""
+        repo = repo_route(name)
+        tag = f"[QUEUE] 🛡 dead-route-recovery: {name} —"
+        if repo is None:
+            print(f"{tag} not in {REPOS_CONFIG}; its tree is not inspected")
+            return None
+        path, target, held = repo.path, repo.merge_target, f"start:dirty-tree:{name}"
+
+        def git(args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(f"git -C {shlex.quote(str(path))} {args}", shell=True,
+                                  capture_output=True, text=True)
+
+        status = git("status --porcelain")
+        if status.returncode != 0:
+            print(f"{tag} {path} could not be read ({status.stderr.strip()[-200:]}); not inspected")
+            return None
+        if not status.stdout.strip():
+            return None
+        on = git("symbolic-ref -q --short HEAD").stdout.strip() or "a detached HEAD"
+        if on != branch:
+            print(f"{tag} {path} is dirty on {on}, not on {route}'s branch {branch}; left as it is — PAUSED ({held})")
+            return held
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        msg = f"{route} partial WIP (route process died {ts}), recovered by daemon start"
+        died = f"{branch}-died-{ts}"
+        stash = git(f"stash push -u -m {shlex.quote(msg)}")
+        if stash.returncode != 0 or git("status --porcelain").stdout.strip():
+            print(f"{tag} {path} is dirty on {branch} and `git stash push -u` did not leave it clean "
+                  f"({(stash.stderr or stash.stdout).strip()[-200:]}); left as it is — PAUSED ({held})")
+            return held
+        sha = git("rev-parse refs/stash").stdout.strip()
+        for step, args in (("rename", f"branch -m {shlex.quote(branch)} {shlex.quote(died)}"),
+                           ("checkout", f"checkout -q {shlex.quote(target)}")):
+            r = git(args)
+            if r.returncode != 0:
+                print(f"{tag} {route}'s uncommitted work stashed as {sha[:12]} ({msg}); the {step} after it "
+                      f"failed ({r.stderr.strip()[-200:]}) — PAUSED ({held})")
+                return held
+        print(f"{tag} {route}'s uncommitted work stashed as {sha[:12]} ({msg}); branch {branch} → {died}; "
+              f"{target} checked out in {path}")
+        return None
 
     def _fire_lock_held(self) -> bool:
         """The fire lock the daemon waits on (root running*.json), after P-STALE has cleared the dead."""
@@ -685,8 +809,23 @@ class QueueDaemon:
         if isinstance(pending, int) and not isinstance(pending, bool) and pending > self.control_ack:
             self.control_ack = pending
         self.started_at = datetime.now().isoformat()
-        self.status = "running"
-        self.paused_reason = self.paused_at = None
+        # [ORCH-CONTROL-SCOPE-1] C7b then C2: a dead route's tree is made safe, and a start with work
+        # queued fires nothing until told (L-46) — `resume`, or a start with --start-running.
+        held = self._recover_dead_routes()
+        queued = len(self._scan_queue())
+        if held:
+            self._mark_paused(held, say=False)
+            start = (f"PAUSED ({held}) — a dead route's repo is dirty and was left as it is; nothing fires "
+                     f"until `python3 queue_daemon.py resume`")
+        elif queued and not self.start_running:
+            self._mark_paused(START_PAUSED_REASON, say=False)
+            start = (f"{queued} brief(s) queued — PAUSED ({START_PAUSED_REASON}); nothing fires until "
+                     f"`python3 queue_daemon.py resume` (or a start with --start-running)")
+        else:
+            self.status = "running"
+            self.paused_reason = self.paused_at = None
+            start = (f"--start-running — running; {queued} brief(s) queued fire now" if queued
+                     else "queue empty — running")
         self._save_state()
 
         print(f"[QUEUE] Daemon started. Watching {QUEUE_DIR}")
@@ -695,6 +834,7 @@ class QueueDaemon:
               f"stop_on_fail={self.config['stop_on_failure']}")
         print(executor_default_line(self.persisted_executor, self.config, os.environ))
         print(repo_rule_line(self.persisted_repo, os.environ))
+        print(f"[QUEUE] 🛡 start: {start}")
 
         while self.status != "stopped":
             self._poll_control()
@@ -887,9 +1027,27 @@ def start_daemon_thread(daemon):
     return t
 
 
+def _control_args(cmd: str, args: list) -> Optional[dict]:
+    """[ORCH-CONTROL-SCOPE-1] C6: what `pause` / `resume` take, or None for anything they do not — `--help`
+    and `-h` included (`pause --help` wrote a real pause request). None ⇒ usage, exit 2, nothing written."""
+    if cmd == "pause":
+        return None if args else {}
+    opts, rest = {"reset_consecutive": False, "reason": None}, list(args)
+    while rest:
+        a = rest.pop(0)
+        if a == "--reset-consecutive" and not opts["reset_consecutive"]:
+            opts["reset_consecutive"] = True
+        elif a == "--reason" and opts["reason"] is None and rest and not rest[0].startswith("-"):
+            opts["reason"] = rest.pop(0)
+        else:
+            return None
+    return opts
+
+
 def main(argv: list) -> int:
-    if not argv:
+    if not argv or argv == ["--start-running"]:
         d = QueueDaemon()
+        d.start_running = bool(argv)   # [ORCH-CONTROL-SCOPE-1] C2
         try:
             d.run_loop()
         except KeyboardInterrupt:
@@ -901,17 +1059,23 @@ def main(argv: list) -> int:
     if cmd == "enqueue" and len(argv) > 1:
         r = d.enqueue(argv[1])
         print(json.dumps(r, indent=2))
-    elif cmd == "status":
+    elif cmd == "status" and argv[1:] in ([], ["--json"]):
         # [QUEUE-PAUSE-OPAQUE] P-PAUSE: this process is not the daemon. Line 1 and every daemon field
         # below come from what the daemon persisted, never from this object's own "idle".
+        # [ORCH-CONTROL-SCOPE-1] C6: `--json` prints the JSON alone, for a machine reader.
         st = read_persisted_state()
-        print(status_line(st))
+        if not argv[1:]:
+            print(status_line(st))
         r = d.get_status()
         r.update({k: st.get(k) for k in DAEMON_OWNED_KEYS})
         r["config"] = {**r["config"], **_executor_of(st)}   # the daemon's executor, not this process's
         print(json.dumps(r, indent=2, default=str))
     elif cmd in ("pause", "resume"):
-        rc, msg = request_control(cmd, reset_consecutive="--reset-consecutive" in argv[1:])
+        opts = _control_args(cmd, argv[1:])
+        if opts is None:
+            print(USAGE, file=sys.stderr)
+            return 2
+        rc, msg = request_control(cmd, **opts)
         print(msg)
         return rc
     elif cmd == "clear":
@@ -960,9 +1124,7 @@ def main(argv: list) -> int:
               + (f" ({breakdown})" if violations else ""))
         return 1 if violations else 0
     else:
-        print(f"Usage: {sys.argv[0]} [enqueue <file> | status | pause | resume [--reset-consecutive] "
-              f"| config <key> <value> | check | check-logs | clear]")
-        print(f"  Or run without args to start the daemon loop.")
+        print(USAGE)
     return 0
 
 

@@ -340,6 +340,7 @@ def test_queue_files_an_exit_1_route_as_failed_and_pauses(tmp_path, monkeypatch)
                       ("REPOS_CONFIG", cfg), ("LOG_DIR", tmp_path / "logs")):
         monkeypatch.setattr(queue_daemon, name, val)
     d = queue_daemon.QueueDaemon()
+    d.start_running = True  # ORCH-CONTROL-SCOPE-1 C2: these tests fire at start, as --start-running does
     d.config.update(repo="r", cooldown_seconds=0, timeout_seconds=15, model="m", effort="e", stop_on_failure=True)
     (queue / "b.md").write_text("#!queue repo=r\n\n# b\n")
 

@@ -169,6 +169,7 @@ class Daemon:
         if persisted is not None:
             self.state_file.write_text(json.dumps(persisted))
         self.d = queue_daemon.QueueDaemon()
+        self.d.start_running = True  # ORCH-CONTROL-SCOPE-1 C2: these tests fire at start, as --start-running does
         self.d.config.update(repo="r", cooldown_seconds=0)
         self.cmds = []
 

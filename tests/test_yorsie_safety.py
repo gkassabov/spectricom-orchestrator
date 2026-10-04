@@ -88,6 +88,7 @@ class Daemon:
                           ("LOG_DIR", tmp_path / "logs")):
             monkeypatch.setattr(queue_daemon, name, val)
         self.d = queue_daemon.QueueDaemon()
+        self.d.start_running = True  # ORCH-CONTROL-SCOPE-1 C2: these tests fire at start, as --start-running does
         self.d.config.update(cooldown_seconds=0, timeout_seconds=15, model="m", effort="e",
                              stop_on_failure=True)
         monkeypatch.setattr(queue_daemon, "time", types.SimpleNamespace(sleep=self._stop))
