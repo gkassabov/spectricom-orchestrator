@@ -461,7 +461,8 @@ class TestDaemonStartRetires:
         d, queue, repo = daemon
         (queue / "60-elsewhere.md").write_text("#!queue repo=not-in-config\n")
         _run_route(repo, "orch-t-60-elsewhere")
-        assert [r.name for r in d.queue_repos()] == ["testrepo"]
+        # [ORCH-YORSIE-SAFETY-1] no default repo is added: the only repo named is not configured
+        assert [r.name for r in d.queue_repos()] == []
         assert d.retire_merged_briefs() == 0
         assert (queue / "60-elsewhere.md").is_file()
 

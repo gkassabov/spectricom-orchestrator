@@ -222,16 +222,20 @@ class TestResolves:
         assert f"RESOLVED {OPUS_55} high" in r.stdout.splitlines()
 
     def test_direct_path_run_banner_says_opus_5_5(self, copy):
-        r = copy("orchestrator.py", "run", "no-such-brief.md")
+        # [ORCH-YORSIE-SAFETY-1] a run names its repo; one that names none is refused before the banner
+        r = copy("orchestrator.py", "run", "no-such-brief.md", "--repo", "orchestrator")
         assert f"Executor: model={OPUS_55} effort=high" in r.stderr, r.stderr[-2000:]
 
     def test_direct_path_env_and_flag_still_override(self, copy):
-        r = copy("orchestrator.py", "run", "no-such-brief.md", "--model", "claude-x", TONI_EFFORT="max")
+        r = copy("orchestrator.py", "run", "no-such-brief.md", "--repo", "orchestrator", "--model", "claude-x",
+                 TONI_EFFORT="max")
         assert "Executor: model=claude-x effort=max" in r.stderr, r.stderr[-2000:]
 
-    def test_daemon_no_header_no_env_no_state(self, tmp_path, monkeypatch, capsys):
+    def test_daemon_no_executor_header_no_env_no_state(self, tmp_path, monkeypatch, capsys):
+        # [ORCH-YORSIE-SAFETY-1] a brief with no `#!queue` line at all is refused unfired now
+        # (tests/test_yorsie_safety.py Q1); the least a brief carries is its repo.
         dm = Daemon(tmp_path, monkeypatch)
-        dm.brief("71-no-header", header="# no #!queue line at all")
+        dm.brief("71-no-header", header="#!queue repo=r")
         assert _exec(dm.fire()) == (OPUS_55, "high")
         assert _shield(capsys.readouterr().out) == [f"🛡 executor-default: using {OPUS_55} effort=high (the default)"]
 

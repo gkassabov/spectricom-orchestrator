@@ -565,7 +565,7 @@ class TestOperatorEscapes:
     """AC-O3-11 — --force is reported as a bypass, and what it does NOT bypass is reported too."""
 
     def test_force_logs_the_bypass_and_names_the_unit_gate(self, caplog):
-        argv = ["orchestrator.py", "branches", "list", "--force"]
+        argv = ["orchestrator.py", "branches", "list", "--force", "--repo", "gated-repo"]
         with patch.object(sys, "argv", argv), \
              patch.object(orchestrator, "set_active_repo", return_value="gated-repo"), \
              patch.object(orchestrator, "list_branches"), \
@@ -1032,7 +1032,21 @@ class TestTheSuiteCommandIsNotNarrowed:
                            capture_output=True, text=True)
         if r.returncode != 0:
             pytest.skip("no `main` ref to diff against")
-        assert "test_cmd" not in r.stdout, f"AC-O5-07 violated — test_cmd touched:\n{r.stdout}"
+        assert _changed_test_cmd_lines(r.stdout) == [], f"AC-O5-07 violated — test_cmd touched:\n{r.stdout}"
+
+    def test_negative_control_only_a_changed_line_counts(self):
+        """[ORCH-YORSIE-SAFETY-1] removing `default:` under yorsie's `test_cmd` put that line in the
+        diff as CONTEXT. A context line is not a change; a +/- line naming test_cmd is."""
+        context = '@@ -14,7 +14,6 @@\n     test_cmd: "cd yorsie && npm test"\n-    default: true\n'
+        assert _changed_test_cmd_lines(context) == []
+        changed = context + '-    test_cmd: "npm test"\n+    test_cmd: "npm test -- src/narrow"\n'
+        assert len(_changed_test_cmd_lines(changed)) == 2
+
+
+def _changed_test_cmd_lines(diff: str) -> list:
+    """The added/removed lines of a unified diff that name test_cmd — never its context lines."""
+    return [l for l in diff.splitlines()
+            if l[:1] in "+-" and not l.startswith(("+++", "---")) and "test_cmd" in l]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

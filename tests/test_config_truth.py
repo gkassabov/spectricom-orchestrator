@@ -112,8 +112,9 @@ class TestConfigRefused:
         assert "one default in the repo" in err and f"#!queue {key}=" in err and "EXECUTOR-DEFAULT-1" in err, err
 
     def test_repo_says_where_it_comes_from(self, q):
+        # [ORCH-YORSIE-SAFETY-1] the daemon has no default repo (QUEUE_REPO is no longer read)
         err = q.d.update_config("repo", "orchestrator")["error"]
-        assert "#!queue repo=" in err and "QUEUE_REPO" in err, err
+        assert "#!queue repo=" in err and "no default repo" in err, err
 
     def test_timeout_says_where_it_comes_from(self, q):
         err = q.d.update_config("timeout_seconds", "60")["error"]

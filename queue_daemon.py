@@ -110,6 +110,22 @@ def executor_default_line(persisted: dict, config: dict, env) -> str:
             f"earlier daemon ran with, L-8)")
 
 
+# [ORCH-YORSIE-SAFETY-1] S7-CORE-17 · Yorsie PDLC plan Phase 0. A brief names its repo in its `#!queue repo=…`
+# header or it is refused: moved to queue/failed/ with this reason, nothing fired, and the queue goes on.
+# There is no daemon default — QUEUE_REPO and a persisted `config.repo` (the old "else clinical-mp") are
+# not read; a start reports any it found.
+NO_REPO_REFUSAL = "no repo= in #!queue header — refused, nothing fired"
+
+
+def repo_rule_line(persisted_repo, env) -> str:
+    """[ORCH-YORSIE-SAFETY-1] the one `🛡 repo:` line a daemon start prints: the rule, and any old
+    default this daemon found and does not apply."""
+    old = ([f"queue-state.json repo={persisted_repo}"] if persisted_repo else []) + (
+        [f"QUEUE_REPO={env['QUEUE_REPO']}"] if env.get("QUEUE_REPO") else [])
+    return ("🛡 repo: a brief names its repo in its `#!queue repo=…` header; one that names none is refused to "
+            "failed/, nothing fired" + (f" — {', '.join(old)} not applied (no default repo)" if old else ""))
+
+
 # [CONFIG-TRUTH-1] S7-CORE-16 · route 67 "Found and left". update_config answered {"ok": True} for every
 # key in config and assigned only three, so `model` was "set" and nothing changed. The three a command
 # can set, each with its parser; every other key is refused and the refusal says where it comes from.
@@ -136,8 +152,8 @@ UNSETTABLE_CONFIG = {
     k: (f"one default in the repo (canon_assert's DEFAULT_EXECUTOR_{k.upper()}, or {EXECUTOR_ENV[k]} at daemon "
         f"start); a brief's `#!queue {k}=…` header overrides it (EXECUTOR-DEFAULT-1)") for k in EXECUTOR_KEYS}
 UNSETTABLE_CONFIG.update({
-    "repo": ("a brief names its repo in its `#!queue repo=…` header; one that names none runs the daemon's "
-             "default, read at daemon start (queue-state.json, else QUEUE_REPO, else clinical-mp)"),
+    "repo": ("a brief names its repo in its `#!queue repo=…` header; one that names none is refused to "
+             "queue/failed/ and nothing fires — there is no default repo (ORCH-YORSIE-SAFETY-1)"),
     "timeout_seconds": ("the daemon's route kill is queue_daemon.py's default, kept above orchestrator.py's own "
                         "180-minute cap; it is read at daemon start (queue-state.json, else that default)"),
 })
@@ -326,7 +342,7 @@ class QueueDaemon:
             "stop_on_failure": True,
             # S7-CORE-11: the daemon predates --repo, --model and --effort, and its
             # 45-minute kill predates routes that legitimately run 40-60 min.
-            "repo": os.environ.get("QUEUE_REPO", "clinical-mp"),
+            # [ORCH-YORSIE-SAFETY-1] no "repo" here: a brief names its own or is refused.
             # [EXECUTOR-DEFAULT-1] canon_assert's one default, or TONI_MODEL / TONI_EFFORT at start.
             **dict(zip(EXECUTOR_KEYS, executor_default(os.environ))),
             # MUST stay ABOVE orchestrator.py's own 180m hard cap, so the orchestrator
@@ -344,6 +360,8 @@ class QueueDaemon:
         self.is_daemon = False
         self._held_markers = set()   # P-STALE: markers already reported HOLD, said once each
         self.persisted_executor = {}   # [EXECUTOR-DEFAULT-1] read from queue-state.json, never applied
+        self.persisted_repo = None     # [ORCH-YORSIE-SAFETY-1] the old default's persisted value, never applied
+        self.refused = []              # [ORCH-YORSIE-SAFETY-1] briefs refused unfired — not routes
         self.lock = threading.Lock()
         self._ensure_dirs()
         self._load_state()
@@ -359,9 +377,11 @@ class QueueDaemon:
                 data = json.loads(QUEUE_STATE.read_text())
                 self.completed = data.get("completed", [])
                 self.failed = data.get("failed", [])
+                self.refused = data.get("refused", [])
                 self.persisted_executor = _executor_of(data)
+                self.persisted_repo = (data.get("config") or {}).get("repo")
                 self.config.update({k: v for k, v in (data.get("config") or {}).items()
-                                    if k not in EXECUTOR_KEYS})
+                                    if k not in EXECUTOR_KEYS and k != "repo"})
                 self.consecutive_count = data.get("consecutive_count", 0)
                 ack = data.get("control_ack")
                 self.control_ack = ack if isinstance(ack, int) and not isinstance(ack, bool) else 0
@@ -382,6 +402,7 @@ class QueueDaemon:
                 "queue": [f.name for f in self._scan_queue()],
                 "completed": self.completed[-30:],
                 "failed": self.failed[-15:],
+                "refused": self.refused[-15:],
                 "config": self.config,
                 "consecutive_count": self.consecutive_count,
                 "updated_at": datetime.now().isoformat()
@@ -422,6 +443,7 @@ class QueueDaemon:
                 "queue_count": len(queue_files),
                 "completed": self.completed[-10:],
                 "failed": self.failed[-5:],
+                "refused": self.refused[-5:],
                 "config": self.config,
                 "consecutive_count": self.consecutive_count,
                 "completed_total": len(self.completed),
@@ -527,12 +549,10 @@ class QueueDaemon:
             return {"ok": True, "config": self.config}
 
     def queue_repos(self) -> list[QueueRepo]:
-        """The repos this queue's briefs actually name — `#!queue repo=…`, plus the configured
-        default for the briefs that name nothing. A queue is multi-repo; the trunk invariant is
-        per repo, so it is asked once per repo rather than once per brief."""
-        names = {self.config["repo"]}
-        for f in self._scan_queue():
-            names.add(_parse_batch_header(f).get("repo") or self.config["repo"])
+        """The repos this queue's briefs actually name — `#!queue repo=…`; a brief that names none
+        adds none ([ORCH-YORSIE-SAFETY-1]: it will be refused, not fired). A queue is multi-repo; the
+        trunk invariant is per repo, so it is asked once per repo rather than once per brief."""
+        names = {n for f in self._scan_queue() if (n := _parse_batch_header(f).get("repo"))}
         return [r for r in (repo_route(n) for n in sorted(names)) if r is not None]
 
     def find_merged_briefs(self) -> list[Violation]:
@@ -569,6 +589,18 @@ class QueueDaemon:
         if retired:
             print(f"[QUEUE] {retired} already-merged brief(s) retired before the first batch (B6)")
         return retired
+
+    def _refuse(self, brief: Path, reason: str):
+        """[ORCH-YORSIE-SAFETY-1] move a brief that cannot fire to queue/failed/ and say why. Nothing
+        fired, so it is not a route: no completed/failed entry, no stop_on_failure, no consecutive
+        count. One that will not leave queue/ would be refused again at once, forever — that pauses."""
+        _safe_move(brief, QUEUE_FAILED / brief.name)
+        print(f"[QUEUE] REFUSED: {brief.name} — {reason}")
+        with self.lock:
+            self.refused.append({"file": brief.name, "reason": reason, "refused_at": datetime.now().isoformat()})
+            if brief.exists():
+                self._mark_paused(f"refused-unmovable:{brief.name}")
+            self._save_state()
 
     def _poll_control(self):
         """[QUEUE-PAUSE-OPAQUE] P-RESUME, the daemon half: apply the request `pause` / `resume` left in
@@ -662,6 +694,7 @@ class QueueDaemon:
               f"cooldown={self.config['cooldown_seconds']}s, "
               f"stop_on_fail={self.config['stop_on_failure']}")
         print(executor_default_line(self.persisted_executor, self.config, os.environ))
+        print(repo_rule_line(self.persisted_repo, os.environ))
 
         while self.status != "stopped":
             self._poll_control()
@@ -682,6 +715,11 @@ class QueueDaemon:
 
             next_batch = queue[0]
             batch_name = next_batch.name
+            # [ORCH-YORSIE-SAFETY-1] Y1: a brief names its repo or is refused — before the fire lock and
+            # before current_batch, so nothing fires and the next brief is taken at once.
+            if not _parse_batch_header(next_batch).get("repo"):
+                self._refuse(next_batch, NO_REPO_REFUSAL)
+                continue
             start_time = datetime.now()
 
             with self.lock:
@@ -722,11 +760,16 @@ class QueueDaemon:
             # A batch may name its own model/effort on the first line as
             #   #!queue model=claude-sonnet-4-5 effort=high repo=clinical-mp
             # so a mechanical cleanup route can run Sonnet while RM increments run
-            # Fable, without restarting the daemon (George, 2026-09-16).
-            hdr = _parse_batch_header(next_batch)
+            # Fable, without restarting the daemon (George, 2026-09-16). It MUST name its repo.
+            hdr = _parse_batch_header(next_batch)   # re-read: it may have been edited while it waited
             b_model = hdr.get("model", self.config["model"])
             b_effort = hdr.get("effort", self.config["effort"])
-            b_repo = hdr.get("repo", self.config["repo"])
+            b_repo = hdr.get("repo")
+            if not b_repo:
+                with self.lock:
+                    self.current_batch = None
+                self._refuse(next_batch, NO_REPO_REFUSAL)
+                continue
 
             cmd = (
                 f"cd {ORCH_DIR} && unset ANTHROPIC_API_KEY && "

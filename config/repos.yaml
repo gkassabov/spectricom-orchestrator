@@ -1,7 +1,8 @@
 # OI-026 v3.4 multi-repo config
 # Per spec: OI-026-orchestrator-v3-4-multi-repo-spec-v1-2.md
 # Loaded by orchestrator.py via load_repo_config()
-# Default repo (first with `default: true`) determines yorsie-backward-compat behavior
+# No default repo (ORCH-YORSIE-SAFETY-1, S7-CORE-17): every brief names its repo — `#!queue repo=…`,
+# `## Repo:` or --repo — or is refused. load_repo_config() refuses a `default:` key on any entry.
 
 repos:
   yorsie:
@@ -14,7 +15,9 @@ repos:
     worktree_base: /home/gkassa/yorsie-toni
     briefs_subdir: yorsie/briefs
     test_cmd: "cd yorsie && npm test"
-    default: true
+    # ORCH-YORSIE-SAFETY-1 Y2: Yorsie merges only what builds (`tsc -b && vite build`). PRE_MERGE_GATES
+    # in orchestrator.py gates yorsie with ("build",), env_file None — yorsie/.env is never sourced.
+    build_gate_cmd: "cd yorsie && npm run build"
 
   ai-foundation:
     project_dir: /home/gkassa/spectricom-ai-foundation
@@ -26,7 +29,6 @@ repos:
     briefs_subdir: briefs
     test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
     build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
-    default: false
 
   clinical-mp:
     project_dir: /home/gkassa/spectricom-clinical-mp
@@ -54,7 +56,6 @@ repos:
     sit_list_cmd: "npx vitest list --config vitest.sit.config.ts"
     sit_batch_files: 10
     sit_batch_pause_s: 90
-    default: false
 
   orchestrator:
     project_dir: /home/gkassa/spectricom-orchestrator
@@ -67,7 +68,6 @@ repos:
     briefs_subdir: briefs
     test_cmd: "pytest -q tests/"
     build_gate_cmd: "pytest -q tests/"   # AC-ORCH1-09: meta-fire pre-merge gate (PRE_MERGE_GATES in orchestrator.py)
-    default: false
 
   # Future repos (scaffolded per S5S37 decision #6, NOT LIVE):
   # gateway: (Spectricom Gateway repo, Phase 3+)
@@ -81,7 +81,6 @@ repos:
     worktree_mode: single-stream
     briefs_subdir: briefs
     test_cmd: "echo 'collateral: no automated suite — acceptance per brief section 7 rendered-UI verification'"
-    default: false
 
   norra:
     project_dir: /home/gkassa/norra
@@ -93,4 +92,3 @@ repos:
     briefs_subdir: briefs
     test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
     build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
-    default: false

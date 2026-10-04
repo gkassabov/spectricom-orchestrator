@@ -323,7 +323,7 @@ class TestMarkerSlug:
             assert json.loads((tmp_path / "state" / "running.json").read_text())["batch_id"] == "live"
 
     def test_with_only_dead_locks_the_mirror_still_reports_one(self, tmp_path):
-        """qstat.sh's `❌ QUEUE DEAD | stale PID` branch stays reachable."""
+        """qstat.sh's `❌ ROUTE DEAD | stale PID` branch stays reachable."""
         with patch.object(orchestrator, "ORCH_DIR", tmp_path):
             _marker(tmp_path, "clinical-mp", DEAD_PID, batch="dead")
             orchestrator._refresh_legacy_running_mirror()

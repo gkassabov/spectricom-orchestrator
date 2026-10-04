@@ -36,13 +36,14 @@ import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A2/A8)
 # TONI-BG-CEILING-1: the executor wait-ceiling invariant, asserted at fire_toni's spawn.
 # GATE-CLOCK-1: the clock-plausibility predicate, asserted at the end of every gate leg.
 # ORCH-FOREGROUND-1: the executor's foreground-only environment, asserted beside the ceiling.
+# ORCH-YORSIE-SAFETY-1: a brief's `#!queue repo=…`, read by the one parser the daemon fires with.
 from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, DEFAULT_EXECUTOR_EFFORT,
                           DEFAULT_EXECUTOR_MODEL, DISABLE_BG_TASKS_VAR,
                           FOREGROUND_BOUND_VARS, ClockViolation, LegClocks, QueueRepo,
                           check_bg_ceiling_invariants, check_branch_freshness_invariants,
                           check_clock_plausibility, check_foreground_invariants,
                           check_handback_invariants, check_route_landed_invariants,
-                          executor_default, load_outstanding_work_rules)
+                          executor_default, load_outstanding_work_rules, queue_header)
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
 PREFIRE_BYPASS = False
@@ -92,8 +93,9 @@ REPOS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "repos.yaml"
 QUEUE_DIR = ORCH_DIR / "queue"
 QUEUE_DONE = QUEUE_DIR / "done"
 
-# Per-repo state — populated by set_active_repo() at module load (defaults to yorsie).
-# A3 will re-call set_active_repo() after CLI / brief-header parsing to switch repos pre-fire.
+# Per-repo state — populated by set_active_repo(<name>) once main() has resolved the repo from --repo
+# or the brief's own header. [ORCH-YORSIE-SAFETY-1] there is no default repo: until a repo is named
+# these stay empty, and a command that acts on a repo refuses rather than pick one.
 ACTIVE_REPO_NAME: str = ""
 ACTIVE_REPO_CONFIG: dict = {}
 PROJECT_ROOT: Path = Path()        # set by set_active_repo(); legacy var name preserved
@@ -112,45 +114,46 @@ IS_META_FIRE: bool = False
 def load_repo_config() -> dict:
     """Load ~/spectricom-orchestrator/config/repos.yaml and return parsed dict.
 
-    Validates: file exists, has `repos:` key with at least one entry, exactly one
-    entry has `default: true`. Raises RuntimeError on any violation.
+    Validates: file exists, has `repos:` key with at least one entry, and NO entry carries a
+    `default:` key ([ORCH-YORSIE-SAFETY-1] — there is no default repo; one written back would read
+    as working while nothing honours it). Raises RuntimeError on any violation.
     """
     if not REPOS_CONFIG_PATH.exists():
         raise RuntimeError(f"Repo config not found: {REPOS_CONFIG_PATH}")
     cfg = _yaml.safe_load(REPOS_CONFIG_PATH.read_text())
     if not isinstance(cfg, dict) or "repos" not in cfg or not cfg["repos"]:
         raise RuntimeError(f"Malformed repo config: {REPOS_CONFIG_PATH} (expected 'repos:' map)")
-    defaults = [n for n, r in cfg["repos"].items() if r.get("default")]
-    if len(defaults) != 1:
+    declared = [n for n, r in cfg["repos"].items() if isinstance(r, dict) and "default" in r]
+    if declared:
         raise RuntimeError(
-            f"Repo config must declare exactly one default repo; found {len(defaults)}: {defaults}"
+            f"{REPOS_CONFIG_PATH}: `default:` on {', '.join(declared)} — there is no default repo; every "
+            f"brief names its repo (ORCH-YORSIE-SAFETY-1). Remove the key."
         )
     return cfg
 
 
-def set_active_repo(name: str = "") -> str:
+def set_active_repo(name: str) -> str:
     """Switch active repo and populate module-level state from repos.yaml.
 
     Args:
         name: Repo name (e.g. 'yorsie', 'ai-foundation', 'clinical-mp', 'orchestrator').
-              Empty string → use the default repo from config (yorsie for v3.4.0).
+              Required — [ORCH-YORSIE-SAFETY-1] there is no default repo to fall back to.
 
     Returns:
-        The active repo name (resolved).
+        The active repo name.
 
     Raises:
-        RuntimeError if name is provided but not declared in repos.yaml.
+        RuntimeError if name is empty or not declared in repos.yaml.
     """
     global ACTIVE_REPO_NAME, ACTIVE_REPO_CONFIG
     global PROJECT_ROOT, YORSIE_DIR, BRIEFS_DIR, WORKTREE_BASE
     global BRANCH_PREFIX, MERGE_TARGET, REMOTE, LOG_SUBDIR
     global WORKTREE_MODE, TEST_CMD, IS_META_FIRE
 
+    if not name:
+        raise RuntimeError("no repo named — there is no default repo (ORCH-YORSIE-SAFETY-1)")
     cfg = load_repo_config()
     repos = cfg["repos"]
-
-    if not name:
-        name = next(n for n, r in repos.items() if r.get("default"))
 
     if name not in repos:
         valid = ", ".join(sorted(repos.keys()))
@@ -180,14 +183,17 @@ def set_active_repo(name: str = "") -> str:
     return name
 
 
-# Initial population at module load → defaults to yorsie (backward-compat with v3.3).
-# A3 (CLI parser) will re-call set_active_repo(<name>) before any work if --repo or
-# `## Repo:` header specifies a different target.
-set_active_repo()
+# [ORCH-YORSIE-SAFETY-1] nothing is populated at module load: importing this module used to make
+# yorsie active (`set_active_repo()` here, the v3.3 backward-compat default), so a brief that named
+# no repo landed in Yorsie. main() calls set_active_repo(<name>) once the repo is named.
 
 
 def parse_repo_from_brief(filepath) -> Optional[str]:
-    """Parse ## Repo: <name> from a brief/batch file header."""
+    """The repo a brief names: its `#!queue repo=…` header (what the daemon fires it with, read by
+    canon_assert.queue_header), else a `## Repo: <name>` line; None when it names none."""
+    named = queue_header(Path(filepath)).get("repo")
+    if named:
+        return named
     try:
         content = Path(filepath).read_text(encoding="utf-8")
         m = re.search(r'^## Repo:\s*(\S+)', content[:2000], re.MULTILINE)
@@ -366,6 +372,11 @@ PRE_MERGE_GATES = {
     # the orchestrator's own .env.example declares ANTHROPIC_API_KEY, and sourcing that into the
     # gate shell would trip the CODE-GUARD (exit 3) inside every test that imports orchestrator.
     "orchestrator": {"gates": ("build",), "env_file": None},
+    # ORCH-YORSIE-SAFETY-1 Y2 (S7-CORE-17, Yorsie PDLC plan Phase 0): Yorsie merges only what builds —
+    # build_gate_cmd `cd yorsie && npm run build` (tsc -b && vite build) in repos.yaml, run on the
+    # route's checkout. env_file=None on purpose: the build needs no secrets and yorsie/.env is never
+    # sourced into a gate. No SIT leg yet (Phase 4); the unit leg is its test_cmd, as before.
+    "yorsie":       {"gates": ("build",), "env_file": None},
     # ai-foundation / norra declare build_gate_cmd in repos.yaml but were never wired into the
     # gate lane (a836886 left the clinical-mp-only condition in place). Not widened here —
     # reported as a typed gap for ratification, not changed silently.
@@ -4695,6 +4706,38 @@ def resolve(p: str) -> Path:
     raise FileNotFoundError(f"Brief not found: {p}")
 
 EXECUTOR_CMDS = ("run", "queue", "parallel", "watch")   # the subcommands that fire an executor
+# [ORCH-YORSIE-SAFETY-1] the subcommands that act on ONE repo's tree. Each is named its repo — --repo, or
+# the brief's own header — or refused: there is no default to fall back to. The rest (deps, sit:report,
+# flaky, handback-scan) read orchestrator state only and run without one.
+REPO_CMDS = EXECUTOR_CMDS + ("status", "branches")
+
+
+def _named_repo(a) -> tuple[str, Optional[str]]:
+    """[ORCH-YORSIE-SAFETY-1] (repo, None): --repo, else the one repo every brief argument names.
+    ("", why) when none is named or the briefs disagree — never a default."""
+    if getattr(a, "repo", ""):
+        return a.repo, None
+    one = getattr(a, "batch_file", None)
+    batches = [one] if one else list(getattr(a, "batch_files", None) or [])
+    if not batches:
+        return "", f"{a.cmd}: no repo named — pass --repo <name> (config/repos.yaml); there is no default repo"
+    named, unnamed = set(), []
+    for b in batches:
+        try:
+            n = parse_repo_from_brief(resolve(b))
+        except FileNotFoundError:
+            n, b = None, f"{b} (not found)"
+        if n:
+            named.add(n)
+        else:
+            unnamed.append(b)
+    if unnamed:
+        return "", (f"no repo named for {', '.join(unnamed)} — pass --repo <name>, or name it in the brief "
+                    f"(`#!queue repo=…` or `## Repo:`); there is no default repo")
+    if len(named) > 1:
+        return "", (f"the briefs name different repos ({', '.join(sorted(named))}) — one invocation runs "
+                    f"one repo; pass --repo, or fire them apart")
+    return named.pop(), None
 
 
 def main():
@@ -4702,7 +4745,8 @@ def main():
     sp = ap.add_subparsers(dest="cmd")
     stp = sp.add_parser("status")
     stp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
-    sp.add_parser("watch")
+    wp = sp.add_parser("watch")
+    wp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml)")
 
     rp = sp.add_parser("run")
     rp.add_argument("batch_file")
@@ -4757,20 +4801,18 @@ def main():
 
     a = ap.parse_args()
 
-    # OI-026 A3: resolve repo — --repo CLI > ## Repo: header > default
-    repo_name = getattr(a, 'repo', '') or ''
-    if not repo_name:
-        batch_arg = getattr(a, 'batch_file', None) or (getattr(a, 'batch_files', None) or [None])[0]
-        if batch_arg:
-            try:
-                repo_name = parse_repo_from_brief(resolve(batch_arg)) or ''
-            except FileNotFoundError:
-                pass
-    try:
-        set_active_repo(repo_name)
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr)
+    # OI-026 A3: resolve repo — --repo CLI > the brief's own header. [ORCH-YORSIE-SAFETY-1] no default:
+    # a repo command named none is refused here, before any lock, branch or executor.
+    repo_name, why = _named_repo(a)
+    if why and a.cmd in REPO_CMDS:
+        print(f"⛔ {why} — refused, nothing fired", file=sys.stderr)
         sys.exit(1)
+    if repo_name:
+        try:
+            set_active_repo(repo_name)
+        except RuntimeError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
 
     # HOOK-1: --force is the single documented bypass for the assertions.
     global PREFIRE_BYPASS
