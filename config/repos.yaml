@@ -38,8 +38,8 @@ repos:
     log_subdir: ai-foundation
     worktree_mode: single-stream
     briefs_subdir: briefs
-    test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
-    build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
+    test_cmd: ". venv/bin/activate && PYTHONPATH=. pytest"
+    build_gate_cmd: ". venv/bin/activate && PYTHONPATH=. pytest -q"
 
   clinical-mp:
     project_dir: /home/gkassa/spectricom-clinical-mp
@@ -101,5 +101,5 @@ repos:
     log_subdir: norra
     worktree_mode: single-stream
     briefs_subdir: briefs
-    test_cmd: "source venv/bin/activate && PYTHONPATH=. pytest"
-    build_gate_cmd: "source venv/bin/activate && PYTHONPATH=. pytest -q"
+    test_cmd: ". venv/bin/activate && PYTHONPATH=. pytest"
+    build_gate_cmd: ". venv/bin/activate && PYTHONPATH=. pytest -q"
