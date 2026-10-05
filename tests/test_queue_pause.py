@@ -210,7 +210,10 @@ class TestResume:
         daemon.brief("59-ui-identifier-truth-1")
         t = self._live(daemon, monkeypatch)
         try:
-            assert self._until(lambda: daemon.d.status == "paused"), "stop_on_failure never paused"
+            # paused as the CLI sees it: request_control reads queue-state.json, which the daemon saves
+            # after it flips its own status (ORCH-LANE-1: the pause notice is written in between)
+            assert self._until(lambda: daemon.d.status == "paused" and daemon.state().get("daemon_status") == "paused"), \
+                "stop_on_failure never paused"
             rc, msg = queue_daemon.request_control("resume", wait_s=5.0, poll_s=0.005)
             assert rc == 0, msg
             assert daemon.d.status == "running"

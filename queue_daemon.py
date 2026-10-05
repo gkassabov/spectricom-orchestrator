@@ -13,7 +13,8 @@ Can also run standalone for testing:
   python3 queue_daemon.py              # run daemon — PAUSED at start when work is queued (start:queue-non-empty)
   python3 queue_daemon.py --start-running   # run daemon, firing the queue at once (the pre-C2 start)
   python3 queue_daemon.py enqueue <f>  # copy batch to queue/
-  python3 queue_daemon.py status [--json]   # show queue state (line 1: daemon_status, paused_reason, paused_at;
+  python3 queue_daemon.py status [--json]   # show queue state (line 1: daemon_status, paused_reason, paused_at,
+                                            # and a paused daemon's notice: next brief, the resume command;
                                             # --json: the JSON alone)
   python3 queue_daemon.py pause        # ask the RUNNING daemon to pause (control file; no restart)
   python3 queue_daemon.py resume [--reset-consecutive] [--reason <paused_reason>]   # ask it to resume the pause
@@ -25,7 +26,7 @@ Can also run standalone for testing:
   python3 queue_daemon.py check-logs   # ORCH-STDOUT-1: recorded routes without a readable log
 """
 
-import os, sys, json, time, shlex, shutil, threading, subprocess
+import os, re, sys, json, time, shlex, shutil, threading, subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -59,6 +60,11 @@ CONTROL_ACK_WAIT_S = 15    # how long `pause` / `resume` wait for the acknowledg
 # reset) writes these back as it found them, never its own — it is not the daemon.
 DAEMON_OWNED_KEYS = ("daemon_status", "started_at", "current_batch", "paused_reason", "paused_at",
                      "pid", "control_ack", "control_result")
+# [ORCH-LANE-1] O2 · S7-CORE-19: 104 sat unfired behind `[QUEUE] PAUSED — max-consecutive:10`, a line in the
+# daemon log and nowhere else, until Gemma read that log. Every pause the daemon takes writes its NOTICE
+# here (reason, at, next brief, the exact resume command) and sends it to Slack when a webhook is
+# configured; `status` shows it on line 1; leaving the pause removes it. The daemon is its one writer.
+PAUSE_NOTICE_NAME = "queue-paused.json"
 
 # [ORCH-CONTROL-SCOPE-1] S7-CORE-18 L-46: a restarted daemon fired the first queued brief at once (95, out
 # of order). A start with work queued is a pause, until an operator resumes it or starts it --start-running.
@@ -74,6 +80,54 @@ def control_file() -> Path:
     return ORCH_DIR / "state" / CONTROL_FILE_NAME
 
 
+def pause_notice_file() -> Path:
+    """[ORCH-LANE-1] O2: state/queue-paused.json, resolved per call like control_file()."""
+    return ORCH_DIR / "state" / PAUSE_NOTICE_NAME
+
+
+def resume_command(reason: str) -> str:
+    """[ORCH-LANE-1] O2: the command that lifts THIS pause, runnable as written: from the daemon's dir,
+    naming the pause (`--reason`, so it cannot lift a later one — ORCH-CONTROL-SCOPE-1 C1), and resetting
+    the count when the pause is the count's."""
+    reset = " --reset-consecutive" if reason.startswith("max-consecutive:") else ""
+    return f"cd {shlex.quote(str(ORCH_DIR))} && python3 queue_daemon.py resume{reset} --reason {shlex.quote(reason)}"
+
+
+def pause_notice_text(n: dict) -> str:
+    """[ORCH-LANE-1] O2: the notice as one Slack message."""
+    return (f":double_vertical_bar: Spectricom queue PAUSED — {n.get('reason')} (since {n.get('at')}). "
+            f"Next brief: {n.get('next_brief') or '(queue empty)'}. Nothing fires until: `{n.get('resume')}`")
+
+
+def notify_slack(text: str) -> str:
+    """[ORCH-LANE-1] O2: `text` through slack_notify.send_slack when a webhook is configured — its
+    slack-webhook.json beside the queue, where `slack_notify.py set-webhook` writes it. Never raises;
+    returns what happened, in words, for the daemon log and the notice."""
+    try:
+        import slack_notify
+    except Exception as e:
+        return f"Slack not sent (slack_notify unavailable: {e})"
+    if not (ORCH_DIR / slack_notify.WEBHOOK_FILE.name).is_file():
+        return f"Slack not configured (no {slack_notify.WEBHOOK_FILE.name} in {ORCH_DIR}) — not sent"
+    try:
+        return "sent to Slack" if slack_notify.send_slack(text) else "Slack send failed"
+    except Exception as e:
+        return f"Slack send failed ({e})"
+
+
+def _write_json_atomic(path, data) -> None:
+    """Write JSON so no reader ever sees it half-written: a temp file beside it (per process and thread),
+    then os.replace. queue-state.json was written in place, and a reader that caught it mid-write read
+    nothing (test_queue_pause TestResume, intermittently, at 8d962c5)."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, default=str))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)      # gone after a replace; a failed write leaves no litter
+
+
 def _read_json(path) -> dict:
     """The JSON object at `path`, or {} when it is absent, unreadable, mid-write or not an object."""
     try:
@@ -86,6 +140,19 @@ def _read_json(path) -> dict:
 def read_persisted_state() -> dict:
     """queue-state.json as the daemon last wrote it — what `status`, `pause` and `resume` read."""
     return _read_json(QUEUE_STATE)
+
+
+def pause_notice_for(st: dict) -> Optional[dict]:
+    """[ORCH-LANE-1] O2: the notice in state/queue-paused.json when it is the daemon's pause now — `st`
+    (queue-state.json) says paused, for the same reason; None otherwise: a stale notice is not shown."""
+    n = _read_json(pause_notice_file())
+    return n if n and st.get("daemon_status") == "paused" and n.get("reason") == st.get("paused_reason") else None
+
+
+def pause_notice_line(n: dict) -> str:
+    """[ORCH-LANE-1] O2: what `status` adds to line 1 for a paused daemon."""
+    return (f"⏸ next brief {n.get('next_brief') or '- (queue empty)'} · resume: {n.get('resume')} · "
+            f"{n.get('slack') or 'Slack pending'}")
 
 
 # [EXECUTOR-DEFAULT-1] S7-CORE-16 · D-S7CORE15-01. A brief with no `#!queue model=… effort=…` header
@@ -197,6 +264,13 @@ def _pid_alive(pid) -> Optional[bool]:
         return False
     except PermissionError:
         return None
+
+
+def _marker_slug(repo_name) -> str:
+    """A repo name as its lock file names it — orchestrator._marker_repo_slug's rule, restated for the
+    same reason _pid_alive is: importing orchestrator writes a log."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(repo_name or "").strip()).strip("-.")
+    return slug or "unknown"
 
 
 def status_line(st: dict) -> str:
@@ -382,6 +456,7 @@ class QueueDaemon:
         self.persisted_repo = None     # [ORCH-YORSIE-SAFETY-1] the old default's persisted value, never applied
         self.refused = []              # [ORCH-YORSIE-SAFETY-1] briefs refused unfired — not routes
         self.start_running = False     # [ORCH-CONTROL-SCOPE-1] C2: `--start-running` — fire a queued start at once
+        self._pending_notice = None    # [ORCH-LANE-1] O2: a pause notice written, not yet sent
         self.lock = threading.Lock()
         self._ensure_dirs()
         self._load_state()
@@ -432,7 +507,7 @@ class QueueDaemon:
                 data.update({k: prior.get(k) for k in DAEMON_OWNED_KEYS})
                 # [EXECUTOR-DEFAULT-1] the model/effort on disk are the ones the DAEMON resolved
                 data["config"] = {**self.config, **_executor_of(prior)}
-            QUEUE_STATE.write_text(json.dumps(data, indent=2, default=str))
+            _write_json_atomic(QUEUE_STATE, data)
         except Exception:
             pass
 
@@ -489,9 +564,49 @@ class QueueDaemon:
         self.status = "paused"
         self.paused_reason = reason
         self.paused_at = datetime.now().isoformat()
-        hint = " --reset-consecutive" if reason.startswith("max-consecutive:") else ""
         if say:
-            print(f"[QUEUE] PAUSED — {reason}. Resume without a restart: python3 queue_daemon.py resume{hint}")
+            print(f"[QUEUE] PAUSED — {reason}. Resume without a restart: {resume_command(reason)}")
+        self._write_pause_notice()
+
+    def _write_pause_notice(self):
+        """[ORCH-LANE-1] O2: the notice of the pause just taken, on disk at once; Slack follows from
+        run_loop's next poll (_send_pause_notice), never under the lock. Only the daemon announces: a CLI
+        object's pause is not the daemon's (DAEMON_OWNED_KEYS)."""
+        if not self.is_daemon:
+            return
+        queue = self._scan_queue()
+        notice = {"reason": self.paused_reason, "at": self.paused_at,
+                  "next_brief": queue[0].name if queue else None, "queued": len(queue),
+                  "resume": resume_command(self.paused_reason), "pid": os.getpid(), "slack": None}
+        try:
+            pause_notice_file().parent.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(pause_notice_file(), notice)
+        except OSError as e:
+            print(f"[QUEUE] could not write {pause_notice_file()}: {e}")
+        self._pending_notice = notice
+
+    def _send_pause_notice(self):
+        """[ORCH-LANE-1] O2: send the notice _write_pause_notice left, outside the lock — a Slack call can
+        take its whole timeout — and record what happened in the notice while that pause still stands."""
+        notice, self._pending_notice = self._pending_notice, None
+        if not notice:
+            return
+        notice["slack"] = notify_slack(pause_notice_text(notice))
+        if self.status == "paused" and self.paused_reason == notice["reason"]:
+            try:
+                _write_json_atomic(pause_notice_file(), notice)
+            except OSError:
+                pass
+        print(f"[QUEUE] 📣 pause notice {pause_notice_file()} — {notice['slack']}")
+
+    def _clear_pause_notice(self):
+        """[ORCH-LANE-1] O2: leaving the pause removes its notice, and an unsent one is not sent."""
+        self._pending_notice = None
+        if self.is_daemon:
+            try:
+                pause_notice_file().unlink(missing_ok=True)
+            except OSError as e:
+                print(f"[QUEUE] could not remove {pause_notice_file()}: {e}")
 
     def pause(self, reason: str = "operator"):
         with self.lock:
@@ -505,6 +620,7 @@ class QueueDaemon:
             if self.status == "paused":
                 self.status = "running"
                 self.paused_reason = self.paused_at = None
+                self._clear_pause_notice()
                 self._save_state()
         return {"ok": True, "status": self.status}
 
@@ -557,6 +673,7 @@ class QueueDaemon:
             if self.status == "paused":
                 self.status = "running"
                 self.paused_reason = self.paused_at = None
+                self._clear_pause_notice()
             self._save_state()
         return {"ok": True, "consecutive_count": 0, "status": self.status}
 
@@ -792,10 +909,37 @@ class QueueDaemon:
               f"{target} checked out in {path}")
         return None
 
-    def _fire_lock_held(self) -> bool:
-        """The fire lock the daemon waits on (root running*.json), after P-STALE has cleared the dead."""
+    def _fire_locks(self, repo: str) -> list:
+        """[ORCH-LANE-1] O1 · S7-CORE-19: the markers that hold a brief naming `repo`, after P-STALE has
+        cleared the dead. The daemon waited on ANY root running*.json, so a direct `orchestrator.py run
+        --repo ai-foundation` (109) held 110 (clinical-mp) for ~2 h. orchestrator.py's lock is per repo
+        ([ORCH-4]); so is this wait. Held by:
+          · state/running-<repo>.json, the repo's own lock;
+          · a legacy global marker — the root running*.json, the state/running.json mirror — that names
+            this repo: its own `repo`, else the repo of the per-repo lock naming its batch. One that names
+            no repo at all (unreadable, mid-write, pre-[ORCH-4]) cannot be attributed and holds: the safe
+            direction, and orchestrator's own _lock_candidates rule.
+        A marker that names another repo never holds."""
         self._clear_stale_markers()
-        return any(ORCH_DIR.glob("running*.json"))
+        state_dir = ORCH_DIR / "state"
+        own = state_dir / f"running-{_marker_slug(repo)}.json"
+        locks = {q: _read_json(q) for q in sorted(state_dir.glob("running-*.json"))} if state_dir.is_dir() else {}
+        held = [own] if own.exists() else []
+        for q in sorted(ORCH_DIR.glob("running*.json")) + [state_dir / "running.json"]:
+            if not q.exists():
+                continue
+            data = _read_json(q)
+            named = data.get("repo")
+            batch = Path(str(data.get("batch_file") or "")).stem
+            if not named and batch:
+                named = next((d.get("repo") for d in locks.values() if d.get("batch_id") == batch), None)
+            if not named or _marker_slug(named) == _marker_slug(repo):
+                held.append(q)
+        return held
+
+    def _fire_lock_held(self, repo: str) -> bool:
+        """[ORCH-LANE-1] O1: whether a brief naming `repo` must wait — see _fire_locks."""
+        return bool(self._fire_locks(repo))
 
     def run_loop(self):
         """Main daemon loop. Call from a background thread."""
@@ -824,6 +968,7 @@ class QueueDaemon:
         else:
             self.status = "running"
             self.paused_reason = self.paused_at = None
+            self._clear_pause_notice()
             start = (f"--start-running — running; {queued} brief(s) queued fire now" if queued
                      else "queue empty — running")
         self._save_state()
@@ -838,6 +983,7 @@ class QueueDaemon:
 
         while self.status != "stopped":
             self._poll_control()
+            self._send_pause_notice()
             if self.status == "paused":
                 time.sleep(PAUSED_POLL_S)
                 continue
@@ -857,7 +1003,8 @@ class QueueDaemon:
             batch_name = next_batch.name
             # [ORCH-YORSIE-SAFETY-1] Y1: a brief names its repo or is refused — before the fire lock and
             # before current_batch, so nothing fires and the next brief is taken at once.
-            if not _parse_batch_header(next_batch).get("repo"):
+            lane = _parse_batch_header(next_batch).get("repo")
+            if not lane:
                 self._refuse(next_batch, NO_REPO_REFUSAL)
                 continue
             start_time = datetime.now()
@@ -875,17 +1022,18 @@ class QueueDaemon:
             # brief that was never actually wrong. Wait for the lock instead.
             # [QUEUE-PAUSE-OPAQUE] P-STALE: a marker whose pid is dead is cleared, not waited on; the
             # wait itself polls the control file, and a pause or stop ends it without firing.
+            # [ORCH-LANE-1] O1: the lock of the repo this brief names, and only that one.
             _waited = 0
-            while self.status == "running" and self._fire_lock_held():
+            while self.status == "running" and (held := self._fire_locks(lane)):
                 if _waited == 0:
-                    print(f"[QUEUE] fire lock held — waiting before {batch_name}")
+                    print(f"[QUEUE] fire lock held for {lane} ({held[0]}) — waiting before {batch_name}")
                 time.sleep(30)
                 _waited += 30
                 self._poll_control()
                 if _waited > 14400:   # 4h: something is wedged, say so and stop trying
                     print(f"[QUEUE] fire lock still held after 4h — leaving {batch_name} queued")
                     break
-            if self.status != "running" or self._fire_lock_held():
+            if self.status != "running" or self._fire_lock_held(lane):
                 with self.lock:
                     self.current_batch = None
                     self._save_state()
@@ -894,8 +1042,6 @@ class QueueDaemon:
                 continue
             if _waited:
                 print(f"[QUEUE] lock clear after {_waited}s")
-
-            print(f"[QUEUE] Firing: {batch_name}")
 
             # A batch may name its own model/effort on the first line as
             #   #!queue model=claude-sonnet-4-5 effort=high repo=clinical-mp
@@ -910,6 +1056,15 @@ class QueueDaemon:
                     self.current_batch = None
                 self._refuse(next_batch, NO_REPO_REFUSAL)
                 continue
+            if b_repo != lane:
+                # [ORCH-LANE-1] edited while it waited to name another repo, whose lock was never asked
+                print(f"[QUEUE] {batch_name} now names repo={b_repo}, not {lane} — its lock is asked before it fires")
+                with self.lock:
+                    self.current_batch = None
+                    self._save_state()
+                continue
+
+            print(f"[QUEUE] Firing: {batch_name}")
 
             cmd = (
                 f"cd {ORCH_DIR} && unset ANTHROPIC_API_KEY && "
@@ -968,6 +1123,7 @@ class QueueDaemon:
                 print(f"[QUEUE] Cooldown {self.config['cooldown_seconds']}s...")
                 time.sleep(self.config["cooldown_seconds"])
 
+        self._send_pause_notice()
         print("[QUEUE] Daemon stopped.")
 
     def _run_route(self, cmd: str, batch_name: str, log_path: Path) -> int:
@@ -1063,12 +1219,15 @@ def main(argv: list) -> int:
         # [QUEUE-PAUSE-OPAQUE] P-PAUSE: this process is not the daemon. Line 1 and every daemon field
         # below come from what the daemon persisted, never from this object's own "idle".
         # [ORCH-CONTROL-SCOPE-1] C6: `--json` prints the JSON alone, for a machine reader.
+        # [ORCH-LANE-1] O2: a paused daemon's notice — next brief, the resume command — on line 1 too.
         st = read_persisted_state()
+        notice = pause_notice_for(st)
         if not argv[1:]:
-            print(status_line(st))
+            print(status_line(st) + (f" | {pause_notice_line(notice)}" if notice else ""))
         r = d.get_status()
         r.update({k: st.get(k) for k in DAEMON_OWNED_KEYS})
         r["config"] = {**r["config"], **_executor_of(st)}   # the daemon's executor, not this process's
+        r["pause_notice"] = notice
         print(json.dumps(r, indent=2, default=str))
     elif cmd in ("pause", "resume"):
         opts = _control_args(cmd, argv[1:])

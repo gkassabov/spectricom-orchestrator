@@ -16,6 +16,7 @@ Usage:
   python3 orchestrator.py parallel <f1> <f2> ...         ← requires --approve
   python3 orchestrator.py status
   python3 orchestrator.py deps <batch-file>              ← show dependency status
+  python3 orchestrator.py verify <brief-stem> [--commit <sha>]   ← one route's evidence (read-only)
 
 Batch-level dependencies:
   Add to batch file header:  # depends_on_batches: [toni-batch-31.md, toni-batch-30.md]
@@ -444,6 +445,29 @@ ENV_VAR_MISSING_PATTERNS = (
 # classifier strips ANSI colour first, because vitest wraps the error name in it.
 _ENV_BLOCK_SIGNALS_RE = [(sid, re.compile(rx, re.IGNORECASE | re.MULTILINE), desc) for sid, rx, desc in ENV_BLOCK_SIGNALS]
 _ENV_VAR_MISSING_RE = [re.compile(rx) for rx in ENV_VAR_MISSING_PATTERNS]
+
+# [ORCH-LANE-1] O5 · S7-CORE-19 route 108: ai-foundation's test_cmd `source venv/bin/activate && …` died in
+# 0.1s under /bin/sh (`source: not found`, exit 127) and the unit gate said only `runner=unrecognised`. A
+# gate command that fails this fast says how in its BLOCKED(environment) message: its exit code and the
+# first lines of its stderr. The message only — which verdict a red gate gets is unchanged.
+GATE_FAST_DEATH_S = 5
+GATE_FAST_DEATH_STDERR_LINES = 5
+GATE_STDERR_HEAD_CHARS = 4000     # what a gate leg keeps of its stderr's head, for the lines above
+_GATE_STDERR_LINE_CHARS = 200
+
+
+def _gate_fast_death(exit_code: int, duration_s: float, stderr_head: Optional[str],
+                     elide: Optional[str] = None) -> Optional[str]:
+    """`failed in 0.1s (exit 127); stderr: /bin/sh: 1: source: not found` for a gate command that exited
+    non-zero in under GATE_FAST_DEATH_S; None otherwise. `stderr_head` None ⇒ no exit was observed (a
+    timeout, a raise, a cached leg): None. Its first GATE_FAST_DEATH_STDERR_LINES non-blank lines, joined
+    by ⏎; a line naming `elide` (the env_file a gate shell sources) is never quoted (canon §23.9d)."""
+    if stderr_head is None or exit_code == 0 or duration_s >= GATE_FAST_DEATH_S:
+        return None
+    lines = [l.strip() for l in stderr_head.splitlines() if l.strip()][:GATE_FAST_DEATH_STDERR_LINES]
+    said = " ⏎ ".join(f"<a line naming {elide}, elided — its values are never logged>" if elide and elide in l
+                      else l[:_GATE_STDERR_LINE_CHARS] for l in lines)
+    return f"failed in {duration_s:.1f}s (exit {exit_code}); " + (f"stderr: {said}" if said else "stderr empty")
 
 
 class GateOutcome(str, Enum):
@@ -1748,6 +1772,7 @@ class BuildGateOutcome:
     duration_s: float = 0.0
     output: str = ""  # [ORCH-1] combined stdout+stderr tail for F-20 classification (never logged whole)
     clock: Optional[ClockViolation] = None  # [GATE-CLOCK-1] the leg's clocks disagree; None = plausible
+    stderr_head: Optional[str] = None  # [ORCH-LANE-1] O5: the command's stderr head; None = no exit observed
 
 
 # ── GATE-CLOCK-1 · every gate leg reads three clocks (S7-CORE-16) ───────────────────────────
@@ -1908,7 +1933,8 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
         log.error(f"   {tail.strip()[-1000:]}")
         return BuildGateOutcome(passed=False, exit_code=r.returncode,
                                 error=tail.strip()[-1000:], duration_s=duration,
-                                output=((r.stdout or "") + "\n" + (r.stderr or ""))[-20000:], clock=clock)
+                                output=((r.stdout or "") + "\n" + (r.stderr or ""))[-20000:], clock=clock,
+                                stderr_head=(r.stderr or "")[:GATE_STDERR_HEAD_CHARS])
     except subprocess.TimeoutExpired as e:
         duration = time.time() - started
         log.error(f"❌ BUILD GATE TIMEOUT after {duration:.1f}s — BLOCKING")
@@ -2537,6 +2563,7 @@ class UnitSuiteRun:
     # [GATE-CLOCK-1] (start, end) LegClocks of THIS execution; None ⇒ not measured now (cache, stub).
     clocks: Optional[tuple] = None
     clock: Optional[ClockViolation] = None   # set by _judge_leg when the clocks disagree
+    stderr_head: Optional[str] = None        # [ORCH-LANE-1] O5: the command's stderr head; None = no exit observed
 
     @property
     def collection(self) -> Optional[str]:
@@ -2863,7 +2890,8 @@ def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         parsed = _parse_unit_summary(raw)
         return UnitSuiteRun(ref=ref, exit_code=r.returncode, duration_s=time.time() - started,
-                            output=raw[-20000:], clocks=(c0, _leg_clocks()), **parsed)
+                            output=raw[-20000:], clocks=(c0, _leg_clocks()),
+                            stderr_head=(r.stderr or "")[:GATE_STDERR_HEAD_CHARS], **parsed)
     except subprocess.TimeoutExpired:
         return UnitSuiteRun(ref=ref, exit_code=-1, duration_s=time.time() - started,
                             error="timeout", output="timeout", clocks=(c0, _leg_clocks()))
@@ -3196,6 +3224,196 @@ def handback_scan(paths: list[str], until: Optional[str] = None) -> int:
     return 1 if len(files) != counts["clean"] else 0
 
 
+# ── verify (S7-CORE-19 [ORCH-LANE-1] O3) ─────────────────────────────────────────────────────
+# ~/_eos/s7core17/verify.sh hard-coded ~/spectricom-clinical-mp. For route 109 (ai-foundation, fired
+# directly) its `ls -t logs/*/orch-$B-*.log` matched nothing — a daemon route writes
+# logs/<log_subdir>/orch-<stem>-<ts>.log, a direct `run` only logs/orch-<ts>.log — and `grep … $OL` with
+# no file waited on stdin. One read-only verifier, here: any route of any repo in config/repos.yaml.
+VERIFY_LOG_RE = re.compile(r"FINAL STATUS|verdict|gate|baseline|\bSIT\b|unit|🛡|Merged", re.IGNORECASE)
+VERIFY_LOG_LINES = 14
+VERIFY_LINE_CHARS = 260
+VERIFY_STAT_LINES = 25
+VERIFY_HANDBACK_LINES = 80
+_VERIFY_STEM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_VERIFY_HEAD_BYTES = 4096
+_VERIFY_ROOT_LOG_RE = re.compile(r"orch-\d{8}-\d{6}\.log")
+_VERIFY_MERGED_RE = re.compile(r"🔀 Merged \S+ → \S+ \(\w+ → (\w+)\)")
+_VERIFY_TONI_LOG_RE = re.compile(r"\bLog: (\S*toni-\S+\.log)")
+
+
+def _verify_route_logs(stem: str, log_dir: Path, kind: str) -> list:
+    """`<kind>-<stem>-<ts>.log` in `log_dir`, oldest first — that stem exactly: verify.sh's
+    `orch-109-x-*.log` also matched orch-109-x-2-<ts>.log."""
+    rx = re.compile(rf"{kind}-{re.escape(stem)}-\d{{8}}-\d{{6}}\.log")
+    return sorted((p for p in log_dir.glob(f"{kind}-{stem}-*.log") if rx.fullmatch(p.name)), key=lambda p: p.name)
+
+
+def _verify_orch_log(stem: str, log_dir: Path) -> Optional[Path]:
+    """The orch log of `stem`'s newest route: a daemon route's own log_dir/orch-<stem>-<ts>.log, or a direct
+    run's LOG_DIR/orch-<ts>.log, whose head names the brief (`Parsed <stem>.md:`). A daemon route's own
+    orchestrator process writes one of those too, inside the route, so a direct run counts only when it
+    started after the daemon route's log was last written. This process's log (setup_logging) is never one."""
+    own = _verify_route_logs(stem, log_dir, "orch")
+    daemon = own[-1] if own else None
+    after = datetime.fromtimestamp(daemon.stat().st_mtime).strftime("%Y%m%d-%H%M%S") if daemon else ""
+    needle = f"Parsed {stem}.md:".encode()
+    mine = Path(log_file).resolve()
+    for p in sorted((p for p in LOG_DIR.glob("orch-*.log") if _VERIFY_ROOT_LOG_RE.fullmatch(p.name)),
+                    key=lambda p: p.name, reverse=True):
+        if _LOG_TS_RE.search(p.name).group(1) <= after:
+            break
+        if p.resolve() == mine:
+            continue
+        try:
+            with p.open("rb") as fh:
+                if needle in fh.read(_VERIFY_HEAD_BYTES):
+                    return p
+        except OSError:
+            continue
+    return daemon
+
+
+def _verify_toni_log(stem: str, log_dir: Path, orch_text: str) -> Optional[Path]:
+    """The Toni log the orch log names (`Log: …/toni-<stem>-<ts>.log`, looked up by NAME in log_dir — never
+    the absolute path it was written under), else the newest toni-<stem>-<ts>.log in log_dir."""
+    rx = re.compile(rf"toni-{re.escape(stem)}-\d{{8}}-\d{{6}}\.log")
+    for name in reversed([Path(m).name for m in _VERIFY_TONI_LOG_RE.findall(orch_text)]):
+        if rx.fullmatch(name) and (log_dir / name).is_file():
+            return log_dir / name
+    found = _verify_route_logs(stem, log_dir, "toni")
+    return found[-1] if found else None
+
+
+def _verify_repo(stem: str, repos: dict) -> tuple:
+    """(repo, how it was known): the `#!queue repo=…` / `## Repo:` of the stem's brief — in queue/,
+    queue/done/, queue/failed/ or a repo's briefs dir — else the one repo whose log dir holds its logs.
+    (None, why) when neither decides: nothing is guessed."""
+    entries = {n: r for n, r in repos.items() if isinstance(r, dict)}
+    places = [QUEUE_DIR, QUEUE_DONE, QUEUE_DIR / "failed"] + [
+        Path(r["project_dir"]).expanduser() / r.get("briefs_subdir", "briefs")
+        for r in entries.values() if r.get("project_dir")]
+    named = {}
+    for d in places:
+        b = d / f"{stem}.md"
+        if b.is_file() and (n := parse_repo_from_brief(b)):
+            named.setdefault(n, b)
+    if len(named) > 1:
+        return None, "its briefs name different repos (" + ", ".join(f"{n} in {b}" for n, b in sorted(named.items())) + ")"
+    if named:
+        (n, b), = named.items()
+        if n not in entries:
+            return None, f"its brief {b} names repo {n}, which is not in {REPOS_CONFIG_PATH}"
+        return n, f"brief header: {b}"
+    logged = [n for n, r in sorted(entries.items())
+              if _verify_route_logs(stem, LOG_DIR / r.get("log_subdir", n), "toni")
+              or _verify_route_logs(stem, LOG_DIR / r.get("log_subdir", n), "orch")]
+    if len(logged) == 1:
+        return logged[0], f"logs/{entries[logged[0]].get('log_subdir', logged[0])}/ holds its logs; no brief found"
+    if logged:
+        return None, f"its logs are in {len(logged)} repos' log dirs ({', '.join(logged)}) and no brief decides"
+    return None, f"no brief and no route log for it in any repo of {REPOS_CONFIG_PATH}"
+
+
+def _verify_git(repo_dir: Path, *args: str) -> tuple:
+    """A read-only git command in `repo_dir`: (exit code, its output). Never reads stdin; never raises."""
+    try:
+        r = subprocess.run(["git", "-C", str(repo_dir), *args], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return r.returncode, (r.stdout if r.returncode == 0 else (r.stderr or r.stdout).strip())
+
+
+def _verify_commit(stem: str, given: Optional[str], orch_text: str, repo_dir: Path, cfg: dict) -> tuple:
+    """(commit, whence): --commit; else the orch log's `🔀 Merged … (<old> → <new>)`; else the route branch,
+    unmerged; else the newest merge-target commit touching the handback. (None, why) when none is found."""
+    if given:
+        return given, "--commit"
+    merged = _VERIFY_MERGED_RE.findall(orch_text)
+    if merged:
+        return merged[-1], "the orch log's merge line"
+    branch = f"{cfg.get('branch_prefix', 'orch')}-{stem}"
+    if _verify_git(repo_dir, "rev-parse", "--verify", "-q", f"refs/heads/{branch}")[0] == 0:
+        return branch, "the route branch — no merge in the orch log"
+    target = cfg.get("merge_target", "main")
+    handback = f"{cfg.get('briefs_subdir', 'briefs')}/{stem}.handback.md"
+    code, out = _verify_git(repo_dir, "log", "-1", "--format=%h", target, "--", handback)
+    if code == 0 and out.strip():
+        return out.strip(), f"the newest {target} commit touching {handback}"
+    return None, (f"no merge line in the orch log, no branch {branch}, no {target} commit touching {handback} "
+                  f"— pass --commit <sha>")
+
+
+def verify_route(stem: str, commit: Optional[str] = None) -> int:
+    """[ORCH-LANE-1] O3: the `verify` subcommand — one route's evidence, from the repo its brief names:
+    the FINAL STATUS / gate / unit lines of its newest orch log, handback-scan over its Toni log,
+    `git show --stat` of its commit and the head of its handback at that commit. Read-only: it reads logs
+    and runs git show / log / rev-parse; it never reads stdin. 0 — every section found and clean;
+    1 — found, with something to look at (no FINAL STATUS, a handback-scan FAIL, the commit or its handback
+    not shown); 2 — it cannot verify: an unknown stem or repo, a missing log, each said in one line."""
+    stem = Path(stem).name
+    for suffix in (".md", ".handback"):
+        stem = stem[:-len(suffix)] if stem.endswith(suffix) else stem
+    if not _VERIFY_STEM_RE.fullmatch(stem):
+        print(f"verify: {stem!r} — not a brief stem (letters, digits, '.', '_', '-')", file=sys.stderr)
+        return 2
+    if commit is not None and (not commit.strip() or commit.startswith("-")):
+        print(f"verify: {stem} — --commit {commit!r} is not a commit", file=sys.stderr)
+        return 2
+    try:
+        repos = load_repo_config()["repos"]
+    except RuntimeError as e:
+        print(f"verify: {stem} — {e}", file=sys.stderr)
+        return 2
+    name, how = _verify_repo(stem, repos)
+    if name is None:
+        print(f"verify: {stem} — {how}", file=sys.stderr)
+        return 2
+    cfg = repos[name]
+    repo_dir = Path(cfg["project_dir"]).expanduser()
+    log_dir = LOG_DIR / cfg.get("log_subdir", name)
+    orch = _verify_orch_log(stem, log_dir)
+    if orch is None:
+        print(f"verify: {stem} — no orch log: no orch-{stem}-<ts>.log in {log_dir}, no orch-<ts>.log in "
+              f"{LOG_DIR} whose head says `Parsed {stem}.md:`", file=sys.stderr)
+        return 2
+    rc = 0
+    text = orch.read_text(encoding="utf-8", errors="replace")
+    print(f"verify {stem} — repo {name} ({how}) · {repo_dir}")
+    print(f"== orch log {orch}")
+    lines = [l for l in text.splitlines() if VERIFY_LOG_RE.search(l)]
+    final = [l for l in lines if "FINAL STATUS" in l]
+    shown = lines[-VERIFY_LOG_LINES:] + ([final[-1]] if final and final[-1] not in lines[-VERIFY_LOG_LINES:] else [])
+    for l in shown:
+        print(l[:VERIFY_LINE_CHARS])
+    if not final:
+        print(f"no FINAL STATUS line in {orch.name} — the route has not finished, or was killed")
+        rc = 1
+    toni = _verify_toni_log(stem, log_dir, text)
+    if toni is None:
+        print(f"== handback-scan: no toni log in {log_dir} (toni-{stem}-*.log) — not run")
+        rc = 2
+    else:
+        print(f"== handback-scan {toni}")
+        if handback_scan([str(toni)]) != 0:
+            rc = max(rc, 1)
+    sha, whence = _verify_commit(stem, commit, text, repo_dir, cfg)
+    if sha is None:
+        print(f"== show --stat: {whence}")
+        return max(rc, 1)
+    code, out = _verify_git(repo_dir, "show", "--stat", "--format=%h %s", sha, "--")
+    print(f"== show --stat {sha} ({whence})")
+    print("\n".join(out.splitlines()[-VERIFY_STAT_LINES:]))
+    handback = f"{cfg.get('briefs_subdir', 'briefs')}/{stem}.handback.md"
+    hcode, hout = _verify_git(repo_dir, "show", f"{sha}:{handback}")
+    if hcode == 0:
+        print(f"== handback {handback} @ {sha}")
+        print("\n".join(hout.splitlines()[:VERIFY_HANDBACK_LINES]))
+    else:
+        print(f"== handback: no {handback} at {sha}")
+    return max(rc, 1 if code or hcode else 0)
+
+
 def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
     """Rehydrate a stored measurement. `error` stays None and `output` empty: this is a real
     measurement that completed, and it has no output to classify."""
@@ -3472,10 +3690,13 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     if branch_run.failures is None or baseline_run.failures is None:
         # Both sides red with output we cannot parse: we cannot tell a regression from
         # pre-existing debt. Say so — a measurement failure is environment, never a silent pass.
-        detail = (f"suite output did not parse on "
-                  f"{'branch' if branch_run.failures is None else 'baseline'} "
+        # [ORCH-LANE-1] O5: and when the leg that did not parse died fast, how it died.
+        leg, unparsed = ("branch", branch_run) if branch_run.failures is None else ("baseline", baseline_run)
+        died = None if unparsed.error else _gate_fast_death(unparsed.exit_code, unparsed.duration_s,
+                                                            unparsed.stderr_head)
+        detail = (f"suite output did not parse on {leg} "
                   f"(runner={branch_run.runner or baseline_run.runner or 'unrecognised'}); "
-                  f"baseline comparison impossible")
+                  f"baseline comparison impossible" + (f"; on the {leg} the test command {died}" if died else ""))
         log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment)")
         return _finish(UnitGateOutcome(passed=False, signal="comparison-unavailable", detail=detail, env=True,
                                        ran=True, branch=branch_run, baseline=baseline_run,
@@ -3800,6 +4021,9 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
             if not bg.passed:
                 v = _classify_gate_failure("build", bg.output or bg.error or "", repo_path, bg.exit_code,
                                            clock=bg.clock)
+                died = _gate_fast_death(bg.exit_code, bg.duration_s, bg.stderr_head, elide=env_name)
+                if v.outcome is GateOutcome.BLOCKED_ENV and died:      # [ORCH-LANE-1] O5: the message only
+                    v.detail = f"{v.detail}; the build command {died}"
                 log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                 return v
         elif gate == "sit":
@@ -4987,6 +5211,14 @@ def main():
     hsp.add_argument("paths", nargs="*", help="toni-*.log files or directories (default: every repo's log dir)")
     hsp.add_argument("--until", default=None, help="Only logs whose filename timestamp is <= YYYYMMDD-HHMMSS")
 
+    # [ORCH-LANE-1] O3: no --repo — the brief names its repo, and nothing here acts on a tree.
+    vp = sp.add_parser("verify", help="One route's evidence: FINAL STATUS/gate/unit lines, handback-scan, "
+                                      "git show --stat, the handback head (read-only; never reads stdin)")
+    vp.add_argument("stem", help="the brief's stem, e.g. 109-minime-rules-1")
+    vp.add_argument("--commit", default=None, help="the commit to show (default: the orch log's merge line, else "
+                                                   "the route branch, else the newest merge-target commit "
+                                                   "touching the handback)")
+
     a = ap.parse_args()
 
     # OI-026 A3: resolve repo — --repo CLI > the brief's own header. [ORCH-YORSIE-SAFETY-1] no default:
@@ -5083,6 +5315,9 @@ def main():
 
     elif a.cmd == "handback-scan":
         sys.exit(handback_scan(a.paths, a.until))
+
+    elif a.cmd == "verify":
+        sys.exit(verify_route(a.stem, a.commit))
 
     else:
         ap.print_help()

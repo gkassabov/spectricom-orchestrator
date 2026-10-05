@@ -7,6 +7,11 @@
 # ORCH-CONTROL-SCOPE-1 (S7-CORE-19) C3 · A1: prefire.py reads the newest SCP_Kanban_v*.md /
 # Yorsie_Kanban_v*.md here and fires a brief only from the READY row its `## Kanban:` line names.
 kanban_dir: /mnt/c/Users/gkass/OneDrive/Documents/Spectricom
+# ORCH-LANE-1 (S7-CORE-19) O4: the families a brief's `## Kanban: <family> row <N>` line may name. A family
+# added here (its <family>_v*.md in kanban_dir) is read by A1 with no code change.
+kanban_families:
+  - SCP_Kanban
+  - Yorsie_Kanban
 
 # ORCH-CONTROL-SCOPE-1 C7a: the PATH systemd/spectricom-queue-daemon.service runs the daemon with — a
 # user unit sources no .bashrc. nvm's node first (the gates run npm), then ~/.local/bin (`claude`): the

@@ -1,0 +1,19 @@
+=== TONI EXECUTION ===
+Batch: 109-minime-rules-1.md
+Started: 2026-10-04T18:47:23.298928
+Command: cd /home/gkassa/spectricom-ai-foundation && stdbuf -oL claude --dangerously-skip-permissions --model claude-opus-5-5 --effort xhigh "Read briefs/109-minime-rules-1.md and execute all briefs in order. Run every command in the foreground and wait for it to finish; never use run_in_background — background tasks are killed when your turn ends and no follow-up turn will come."
+BgWaitCeilingMs: 9420000 (route timeout 9720s, margin 300s)
+Foreground: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1, BASH_DEFAULT_TIMEOUT_MS=9420000, BASH_MAX_TIMEOUT_MS=9420000
+============================================================
+
+MINIME-RULES-1 is done and committed as `7822990c` on `orch-aif-109-minime-rules-1`. All predicates P1–P9 pass. The full suite is **659 passed, 28 skipped, 0 failed**, against a baseline of 581/28/0 recorded before I wrote any code.
+
+**How it was checked**
+- I wrote the tests before the code and confirmed they failed.
+
+The design is written up in `docs/minime/rules.md`.
+
+
+============================================================
+Finished: 2026-10-04T19:42:06.473860
+Exit: 0

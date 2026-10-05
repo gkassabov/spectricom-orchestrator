@@ -10,7 +10,8 @@ as an assertion checked at a decidable moment is not a rule.
 The decidable moment for a brief is the fire.  These run inside approval_gate().
 
 ENFORCED:
-  A1  Kanban READY  — '## Kanban: <SCP_Kanban|Yorsie_Kanban> row <N>' must be declared, and row N
+  A1  Kanban READY  — '## Kanban: <family> row <N>' must be declared, <family> one of
+                      `kanban_families` in config/repos.yaml (default SCP_Kanban, Yorsie_Kanban), and row N
                       of the newest <family>_v*.md in the canon dir (`kanban_dir` in
                       config/repos.yaml) must be READY and not MERGED / COMPLETE / CUT.
                       [ORCH-CONTROL-SCOPE-1] S7-CORE-18 L-49: five routes (99-103) were enqueued
@@ -43,7 +44,10 @@ SIZING_FLOOR_MIN = 30
 # [ORCH-CONTROL-SCOPE-1] C3 · A1. The canon dir is `kanban_dir` in config/repos.yaml, else this.
 REPOS_CONFIG = Path(__file__).resolve().parent / "config" / "repos.yaml"
 KANBAN_DIR_DEFAULT = Path("/mnt/c/Users/gkass/OneDrive/Documents/Spectricom")
+# [ORCH-LANE-1] O4 · route 104 handback item 2: the families A1 accepts are `kanban_families` in
+# config/repos.yaml; this is the default when the key is absent or not a list of family names.
 KANBAN_FAMILIES = ("SCP_Kanban", "Yorsie_Kanban")
+_FAMILY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 KANBAN_READY = "READY"
 KANBAN_DONE = ("MERGED", "COMPLETE", "CUT")      # any of these in the State cell ⇒ not READY
 
@@ -133,13 +137,29 @@ _KANBAN_HEADER_ANY = re.compile(r'^##\s*Kanban:\s*(?P<text>.*?)\s*$', re.MULTILI
 _MD = re.compile(r'[*`]')
 
 
-def kanban_dir() -> Path:
-    """`kanban_dir` in config/repos.yaml, else KANBAN_DIR_DEFAULT. Read per call: tests patch REPOS_CONFIG."""
+def _config_value(key: str):
+    """One top-level key of config/repos.yaml, or None. Read per call: tests patch REPOS_CONFIG."""
     try:
-        named = (yaml.safe_load(REPOS_CONFIG.read_text(encoding="utf-8")) or {}).get("kanban_dir")
+        return (yaml.safe_load(REPOS_CONFIG.read_text(encoding="utf-8")) or {}).get(key)
     except Exception:
-        named = None
+        return None
+
+
+def kanban_dir() -> Path:
+    """`kanban_dir` in config/repos.yaml, else KANBAN_DIR_DEFAULT."""
+    named = _config_value("kanban_dir")
     return Path(named) if named else KANBAN_DIR_DEFAULT
+
+
+def kanban_families() -> tuple:
+    """[ORCH-LANE-1] O4: `kanban_families` in config/repos.yaml, else KANBAN_FAMILIES. A value that is not
+    a non-empty list of family names (`X_Kanban`) is not guessed at: the default stands, and a family it
+    does not name is refused as before."""
+    named = _config_value("kanban_families")
+    if (isinstance(named, list) and named
+            and all(isinstance(f, str) and _FAMILY_NAME.fullmatch(f) for f in named)):
+        return tuple(named)
+    return KANBAN_FAMILIES
 
 
 def parse_kanban_header(filepath: Path) -> Optional[tuple[str, str]]:
@@ -186,17 +206,18 @@ def check_kanban(filepath: Path) -> tuple[Optional[str], str]:
     """A1. (failure line, "") or (None, the row it passed on). Never a silent pass: no header, no
     file, no row ⇒ a failure that says which."""
     header = parse_kanban_header(filepath)
+    families = kanban_families()
     if header is None:
         named = _KANBAN_HEADER_ANY.search(_read(filepath)[:_HEADER_CHARS])
         if named:
             return (f"A1 KANBAN — '## Kanban: {named.group('text')}' names no Kanban row "
-                    f"('<SCP_Kanban|Yorsie_Kanban> row <N>'), not READY"), ""
-        return ("A1 KANBAN — no '## Kanban: <SCP_Kanban|Yorsie_Kanban> row <N>' header; a brief "
-                "fires only from a READY Kanban row"), ""
+                    f"('<{'|'.join(families)}> row <N>'), not READY"), ""
+        return (f"A1 KANBAN — no '## Kanban: <{'|'.join(families)}> row <N>' header; a brief "
+                f"fires only from a READY Kanban row"), ""
     family, row = header
-    if family not in KANBAN_FAMILIES:
+    if family not in families:
         return (f"A1 KANBAN — '## Kanban: {family} row {row}' names no Kanban family "
-                f"({' or '.join(KANBAN_FAMILIES)}), not READY"), ""
+                f"({' or '.join(families)}), not READY"), ""
     canon = kanban_dir()
     newest = disk_family(canon, re.escape(family), family).newest
     text = None
