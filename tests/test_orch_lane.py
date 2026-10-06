@@ -170,7 +170,11 @@ class TestP1FireLockPerRepo:
 
     def test_R_a_direct_route_in_another_repo_does_not_hold_the_queue(self, daemon, monkeypatch, capsys):
         """S7-CORE-19: 109 ran directly in ai-foundation; 110 (clinical-mp) waited behind it ~2 h, until
-        Gemma paused the daemon and fired by hand. All three markers that direct run leaves are here."""
+        Gemma paused the daemon and fired by hand. All three markers that direct run leaves are here.
+        [ORCH-CAPACITY-1] O1 is the per-repo fire lock, and that is what this tests: C1's global limit is set to 2
+        here. Under the shipped 1, admission holds 110 behind 109 — tests/test_capacity.py P1."""
+        cfg = yaml.safe_load(queue_daemon.REPOS_CONFIG.read_text())
+        queue_daemon.REPOS_CONFIG.write_text(yaml.safe_dump({**cfg, "admission": {"max_concurrent_routes": 2}}))
         _root(daemon, "109-minime-rules-1")
         _lock(daemon, "ai-foundation", "109-minime-rules-1")
         _mirror(daemon, {"pid": LIVE, "batch_id": "109-minime-rules-1", "repo": "ai-foundation"})

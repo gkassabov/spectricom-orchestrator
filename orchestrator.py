@@ -31,6 +31,7 @@ from typing import Mapping, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A1/A2/A8)
+import admission  # [ORCH-CAPACITY-1] C1: whether a route may start now — the daemon's fire loop asks it too
 # ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
 # shared with the tests; canon_assert imports nothing from here.
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
@@ -5269,6 +5270,19 @@ def main():
         # this one. set_active_repo() ran above, so ACTIVE_REPO_NAME is resolved by here.
         _check_stale_marker(ACTIVE_REPO_NAME)
         bf = resolve(a.batch_file)
+        # [ORCH-CAPACITY-1] C1 · L-70: one Toni route at a time across every repo, and only with memory to spare.
+        # A direct run is refused (exit 2) with the reason; a daemon-fired one adopts the daemon's claim; --force
+        # bypasses, and says so in A2/A8's words.
+        admitted, why = admission.admit_run(ACTIVE_REPO_NAME, bf.stem, force=a.force, orch_dir=ORCH_DIR,
+                                            config_path=REPOS_CONFIG_PATH)
+        if not admitted:
+            log.error(f"⛔ ADMISSION — {why} — refused, nothing fired (wait, or --force)")
+            print(f"⛔ ADMISSION — {why} — refused, nothing fired (wait, or --force)", file=sys.stderr)
+            sys.exit(2)
+        if a.force:
+            log.warning(why)
+        else:
+            log.info(f"🚦 admission: {why}")
         briefs = parse_batch(bf)
         if not approval_gate(bf, briefs, approve=a.approve, force=a.force,
                             skip_deps=getattr(a, 'skip_deps', False)):

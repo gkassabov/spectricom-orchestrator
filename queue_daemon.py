@@ -34,6 +34,7 @@ from typing import Optional
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import admission   # [ORCH-CAPACITY-1] C1: whether a route may start now; C4: the wall it runs under
 # QUEUE-RETIRE-1: one implementation of the trunk invariant, shared by the boot path and the
 # tests. It lives with the other boot asserts; nothing here reimplements it.
 from canon_assert import (DEFAULT_EXECUTOR_EFFORT, DEFAULT_EXECUTOR_MODEL, EXECUTOR_ENV,
@@ -59,7 +60,7 @@ CONTROL_ACK_WAIT_S = 15    # how long `pause` / `resume` wait for the acknowledg
 # What only the running daemon knows. A CLI process that saves state (enqueue, clear, a script's
 # reset) writes these back as it found them, never its own — it is not the daemon.
 DAEMON_OWNED_KEYS = ("daemon_status", "started_at", "current_batch", "paused_reason", "paused_at",
-                     "pid", "control_ack", "control_result")
+                     "pid", "control_ack", "control_result", "waiting")
 # [ORCH-LANE-1] O2 · S7-CORE-19: 104 sat unfired behind `[QUEUE] PAUSED — max-consecutive:10`, a line in the
 # daemon log and nowhere else, until Gemma read that log. Every pause the daemon takes writes its NOTICE
 # here (reason, at, next brief, the exact resume command) and sends it to Slack when a webhook is
@@ -233,8 +234,10 @@ UNSETTABLE_CONFIG = {
 UNSETTABLE_CONFIG.update({
     "repo": ("a brief names its repo in its `#!queue repo=…` header; one that names none is refused to "
              "queue/failed/ and nothing fires — there is no default repo (ORCH-YORSIE-SAFETY-1)"),
-    "timeout_seconds": ("the daemon's route kill is queue_daemon.py's default, kept above orchestrator.py's own "
-                        "180-minute cap; it is read at daemon start (queue-state.json, else that default)"),
+    "timeout_seconds": ("queue_daemon.py derives each route's wall from its brief (ORCH-CAPACITY-1 C4): the route "
+                        "timeout orchestrator.py resolves (180-minute cap) + the repo's gate budget "
+                        "(admission.gate_budget_s in config/repos.yaml, else the sum of its gate timeouts) + "
+                        "admission.ROUTE_WALL_SLACK_S; a persisted value is not applied"),
 })
 
 
@@ -278,8 +281,10 @@ def status_line(st: dict) -> str:
     pid = st.get("pid")
     who = ("pid not recorded — a daemon started before QUEUE-PAUSE-OPAQUE" if pid is None
            else f"pid {pid} {'DEAD' if _pid_alive(pid) is False else 'alive'}")
+    # [ORCH-CAPACITY-1] C1: a running daemon that admission is holding says why, on this line.
+    waiting = f" | waiting: {st['waiting']}" if st.get("waiting") and st.get("daemon_status") == "running" else ""
     return (f"daemon_status={st.get('daemon_status') or '-'} paused_reason={st.get('paused_reason') or '-'} "
-            f"paused_at={st.get('paused_at') or '-'} | {who} | updated_at={st.get('updated_at') or '-'}")
+            f"paused_at={st.get('paused_at') or '-'} | {who} | updated_at={st.get('updated_at') or '-'}{waiting}")
 
 
 def request_control(action: str, reset_consecutive: bool = False, wait_s: float = CONTROL_ACK_WAIT_S,
@@ -397,6 +402,33 @@ def _log_subdir(repo_name: str) -> str:
     return _repo_config(repo_name).get("log_subdir", repo_name)
 
 
+# [ORCH-CAPACITY-1] C4: the daemon's clock — bound here, not read off `time` at call time (tests replace the
+# module's `time`); the fake clock of tests/test_capacity.py replaces this. A route is polled this often.
+ROUTE_CLOCK = time.monotonic
+ROUTE_POLL_S = 30
+# C4: where a route is, read off its own log — orchestrator.py's lines, the newest that matches wins.
+ROUTE_PHASES = (
+    ("Toni", re.compile(r"Firing Toni: ")),
+    ("after Toni (commit, gate setup)", re.compile(r"Toni finished: |Toni TIMEOUT|Toni error")),
+    ("build", re.compile(r"Running build gate")),
+    ("SIT", re.compile(r"Running SIT post-merge|SIT batch|SIT gate")),
+    ("unit", re.compile(r"Unit baseline gate \[|Unit baseline:|Unit gate")),
+    ("merge", re.compile(r"Pre-merge gate.*: PASS|🔀 Merged")),
+)
+
+
+def route_phase(log_path) -> str:
+    """[ORCH-CAPACITY-1] C4: the phase (Toni / build / SIT / unit / …) a route's log last entered."""
+    phase = "before Toni (pre-fire, branch, worktree)"
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                phase = next((name for name, rx in ROUTE_PHASES if rx.search(line)), phase)
+    except OSError:
+        return "unknown (the route log is unreadable)"
+    return phase
+
+
 def route_log_path(repo_name: str, batch_name: str, when: datetime) -> Path:
     """ORCH-STDOUT-1: where a daemon-fired route's full stdout+stderr goes —
     logs/<log_subdir>/orch-<stem>-<ts>.log, beside fire_toni's toni-<stem>-<ts>.log (same
@@ -438,10 +470,8 @@ class QueueDaemon:
             # [ORCH-YORSIE-SAFETY-1] no "repo" here: a brief names its own or is refused.
             # [EXECUTOR-DEFAULT-1] canon_assert's one default, or TONI_MODEL / TONI_EFFORT at start.
             **dict(zip(EXECUTOR_KEYS, executor_default(os.environ))),
-            # MUST stay ABOVE orchestrator.py's own 180m hard cap, so the orchestrator
-            # times out gracefully (branch preserved, fire lock released) instead of
-            # this daemon SIGKILLing it mid-route and leaving a stale lock.
-            "timeout_seconds": 11400,
+            # [ORCH-CAPACITY-1] C4: no "timeout_seconds". The fixed 11400 s killed route 122 in its unit gate,
+            # inside orchestrator.py's own 162 min + gates; each route's wall is derived (admission.route_wall).
         }
         # [QUEUE-PAUSE-OPAQUE] P-PAUSE: why and since when, None while not paused; the last control
         # request applied; whether THIS object is the running daemon (run_loop sets it) — a CLI
@@ -457,6 +487,9 @@ class QueueDaemon:
         self.refused = []              # [ORCH-YORSIE-SAFETY-1] briefs refused unfired — not routes
         self.start_running = False     # [ORCH-CONTROL-SCOPE-1] C2: `--start-running` — fire a queued start at once
         self._pending_notice = None    # [ORCH-LANE-1] O2: a pause notice written, not yet sent
+        self.waiting = None            # [ORCH-CAPACITY-1] C1: why admission holds the next brief, None when not
+        self._waiting_said = None      # C1: the reason last logged — one line per change of reason
+        self.persisted_timeout = None  # C4: a persisted timeout_seconds, reported at start, never applied
         self.lock = threading.Lock()
         self._ensure_dirs()
         self._load_state()
@@ -475,8 +508,9 @@ class QueueDaemon:
                 self.refused = data.get("refused", [])
                 self.persisted_executor = _executor_of(data)
                 self.persisted_repo = (data.get("config") or {}).get("repo")
+                self.persisted_timeout = (data.get("config") or {}).get("timeout_seconds")
                 self.config.update({k: v for k, v in (data.get("config") or {}).items()
-                                    if k not in EXECUTOR_KEYS and k != "repo"})
+                                    if k not in EXECUTOR_KEYS and k not in ("repo", "timeout_seconds")})
                 self.consecutive_count = data.get("consecutive_count", 0)
                 ack = data.get("control_ack")
                 self.control_ack = ack if isinstance(ack, int) and not isinstance(ack, bool) else 0
@@ -494,6 +528,7 @@ class QueueDaemon:
                 "pid": os.getpid(),
                 "control_ack": self.control_ack,       # P-RESUME: the last request applied
                 "control_result": self.control_result,
+                "waiting": self.waiting,               # [ORCH-CAPACITY-1] C1
                 "queue": [f.name for f in self._scan_queue()],
                 "completed": self.completed[-30:],
                 "failed": self.failed[-15:],
@@ -530,6 +565,7 @@ class QueueDaemon:
                 "daemon_status": self.status,
                 "paused_reason": self.paused_reason,
                 "paused_at": self.paused_at,
+                "waiting": self.waiting,
                 "started_at": self.started_at,
                 "current_batch": self.current_batch,
                 "current_elapsed_s": elapsed,
@@ -979,6 +1015,12 @@ class QueueDaemon:
               f"stop_on_fail={self.config['stop_on_failure']}")
         print(executor_default_line(self.persisted_executor, self.config, os.environ))
         print(repo_rule_line(self.persisted_repo, os.environ))
+        most, floor = admission.limits(REPOS_CONFIG)
+        print(f"[QUEUE] 🛡 admission: at most {most} live route(s) across every repo, and MemAvailable >= {floor:g} "
+              f"GiB — config/repos.yaml `admission:`, read at each fire; a refusal waits (ORCH-CAPACITY-1 C1)")
+        print(f"[QUEUE] 🛡 route-wall: per route — its brief's route timeout + its repo's gate budget + "
+              f"{admission.ROUTE_WALL_SLACK_S}s slack (ORCH-CAPACITY-1 C4)"
+              + (f"; persisted timeout_seconds={self.persisted_timeout} not applied" if self.persisted_timeout else ""))
         print(f"[QUEUE] 🛡 start: {start}")
 
         while self.status != "stopped":
@@ -996,6 +1038,10 @@ class QueueDaemon:
 
             queue = self._scan_queue()
             if not queue:
+                if self.waiting:
+                    with self.lock:
+                        self.waiting = self._waiting_said = None
+                        self._save_state()
                 time.sleep(10)
                 continue
 
@@ -1064,23 +1110,43 @@ class QueueDaemon:
                     self._save_state()
                 continue
 
+            # [ORCH-CAPACITY-1] C1 · L-70: one Toni route at a time across every repo, and only with memory to
+            # spare. A refusal is a wait, never a failure: nothing fires and the brief stays first in queue/. The
+            # yes claims the slot (state/admitted-<pid>.json); the route adopts the claim (ORCH_ADMISSION_CLAIM)
+            # rather than asking again, and the daemon releases it when the route returns.
+            ok, why = admission.admit(b_repo, next_batch.stem, claim=True, orch_dir=ORCH_DIR, config_path=REPOS_CONFIG)
+            if not ok:
+                self._wait_for_admission(batch_name, why)
+                continue
+            claim = admission.claim_path(ORCH_DIR)
+            self.waiting = self._waiting_said = None
+            print(f"[QUEUE] 🛡 admission: {why}")
+            # C4: this route's wall — its brief's route timeout, as orchestrator.py derives it, + its gates' budget.
+            wall = admission.route_wall(next_batch, b_repo, config_path=REPOS_CONFIG)
+
             print(f"[QUEUE] Firing: {batch_name}")
 
             cmd = (
                 f"cd {ORCH_DIR} && unset ANTHROPIC_API_KEY && "
+                f"{admission.CLAIM_ENV}={shlex.quote(str(claim))} "
                 f"python3 -u orchestrator.py run {next_batch} --approve "
                 f"--repo {b_repo} --model {b_model} --effort {b_effort}"
             )
             print(f"[QUEUE] repo={b_repo} model={b_model} effort={b_effort}")
+            print(f"[QUEUE] ⏱ route wall {wall.describe()}")
 
             log_path = route_log_path(b_repo, batch_name, start_time)
             with self.lock:
                 if self.current_batch is not None:
                     self.current_batch["log_file"] = str(log_path)
+                    self.current_batch["wall"] = wall.as_dict()
                 self._save_state()
             print(f"[QUEUE] log={log_path}")
 
-            exit_code = self._run_route(cmd, batch_name, log_path)
+            try:
+                exit_code = self._run_route(cmd, batch_name, log_path)
+            finally:
+                admission.release(claim)
 
             end_time = datetime.now()
             duration_s = (end_time - start_time).total_seconds()
@@ -1126,6 +1192,21 @@ class QueueDaemon:
         self._send_pause_notice()
         print("[QUEUE] Daemon stopped.")
 
+    def _wait_for_admission(self, batch_name: str, why: str):
+        """[ORCH-CAPACITY-1] C1: admission said no — nothing fired, the brief stays first in queue/, and the loop
+        asks again after the cooldown. One log line per change of reason (MemAvailable moving is not a change);
+        `status` line 1 shows the latest as `waiting: …`."""
+        said = re.sub(r"MemAvailable [\d.]+ GiB", "MemAvailable … GiB", why)
+        if said != self._waiting_said:
+            print(f"[QUEUE] 🛡 admission: waiting before {batch_name} — {why}")
+            self._waiting_said = said
+        with self.lock:
+            self.current_batch = None
+            self.waiting = f"{batch_name} — {why}"
+            self._save_state()
+        if self.status == "running":
+            time.sleep(self.config["cooldown_seconds"] or PAUSED_POLL_S)
+
     def _run_route(self, cmd: str, batch_name: str, log_path: Path) -> int:
         """Run one route with its stdout+stderr going to `log_path`; return its exit code.
 
@@ -1137,8 +1218,14 @@ class QueueDaemon:
 
         Exit codes are unchanged: the child's own, -1 on timeout, -2 on any other error
         (including a log that cannot be opened). A trailer is written on every path it can be.
+
+        [ORCH-CAPACITY-1] C4: the timeout is this route's wall (run_loop records it in current_batch), polled
+        on ROUTE_CLOCK every ROUTE_POLL_S. A kill names the clock that fired and the phase the route was in.
+        Outside run_loop there is no brief to derive from: the wall is the 180-minute cap's, plus the slack.
         """
-        timeout = self.config["timeout_seconds"]
+        wall = (self.current_batch or {}).get("wall") or admission.route_wall(
+            None, "", env={"TONI_TIMEOUT_MIN": str(admission.TIMEOUT_HARD_CAP_MIN)}).as_dict()
+        timeout = int(wall["seconds"])
         try:
             lf = open(log_path, "a", encoding="utf-8")
         except Exception as e:
@@ -1154,9 +1241,24 @@ class QueueDaemon:
                 proc = self.current_process = subprocess.Popen(
                     cmd, shell=True, executable="/bin/bash",
                     stdout=lf, stderr=subprocess.STDOUT)
-                exit_code = proc.wait(timeout=timeout)
+                deadline = ROUTE_CLOCK() + timeout
+                while True:
+                    try:
+                        exit_code = proc.wait(timeout=max(0.0, min(ROUTE_POLL_S, deadline - ROUTE_CLOCK())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if ROUTE_CLOCK() >= deadline:
+                            raise
             except subprocess.TimeoutExpired:
-                print(f"[QUEUE] Timeout ({timeout}s) on {batch_name}. Killing.")
+                why = (f"⏱ ROUTE WALL — the daemon's route wall fired on {batch_name} after {timeout}s, in phase "
+                       f"{route_phase(log_path)}; the wall: {wall.get('describe')}. orchestrator.py's own clocks "
+                       f"(Toni, each gate leg) had not ended the route. Killing.")
+                print(f"[QUEUE] {why}")
+                try:
+                    lf.write(f"\n[QUEUE] {why}\n")
+                    lf.flush()
+                except Exception:
+                    pass
                 proc.kill()
                 proc.wait()
                 exit_code, note = -1, f" (timeout after {timeout}s)"

@@ -32,6 +32,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import canon_assert
+import admission
 import queue_daemon
 
 # The fake route. Reads its behaviour from fake-spec.json beside it; ignores argv. It NEVER
@@ -261,9 +262,13 @@ class TestEveryRecordingPath:
         assert re.search(r"^Exit: 3$", text, re.M)
         assert canon_assert.check_gate_log_invariants([e]) == []
 
-    def test_timeout_keeps_what_was_printed_before_the_kill(self, fire):
-        """The marker is never flushed by hand: it survives the kill only through `python3 -u`."""
-        fire.d.config["timeout_seconds"] = 2
+    def test_timeout_keeps_what_was_printed_before_the_kill(self, fire, monkeypatch):
+        """The marker is never flushed by hand: it survives the kill only through `python3 -u`.
+        [ORCH-CAPACITY-1] C4: the kill is the route's derived wall now, not config["timeout_seconds"]; a 2 s
+        wall is put in its place."""
+        two = admission.RouteWall(seconds=2, route_timeout_s=0, route_timeout_source="test", gate_budget_s=0,
+                                  gate_budget_source="test", slack_s=2)
+        monkeypatch.setattr(admission, "route_wall", lambda *a, **k: two)
         e = fire.run("64-hangs", stdout=["BEFORE-KILL-MARKER"], sleep=30, exit=0)
         assert e["exit_code"] == -1 and e in fire.d.failed
         text = _log_of(e)

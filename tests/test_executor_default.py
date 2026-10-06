@@ -272,7 +272,9 @@ class TestPersisted:
 
     def test_every_other_persisted_key_still_applies(self, tmp_path, monkeypatch):
         dm = Daemon(tmp_path, monkeypatch, persisted=LIVE_STATE)
-        assert (dm.d.config["max_consecutive"], dm.d.config["timeout_seconds"]) == (10, 11400)
+        # [ORCH-CAPACITY-1] C4: timeout_seconds is no longer one of them — the route wall is derived per route,
+        # and a persisted value is reported at start and not applied (tests/test_capacity.py P7).
+        assert dm.d.config["max_consecutive"] == 10 and "timeout_seconds" not in dm.d.config
         assert (dm.d.config["model"], dm.d.config["effort"]) == (OPUS_55, "high")
 
     def test_the_stale_value_leaves_the_file_at_the_first_save(self, tmp_path, monkeypatch):
