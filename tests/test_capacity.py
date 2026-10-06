@@ -468,25 +468,23 @@ class TestP4AifWorktree:
         aif = SHIPPED["repos"]["ai-foundation"]
         assert aif["worktree_mode"] == "single-stream" and aif["worktree_base"] == "/home/gkassa/aif-toni"
 
-    def test_R_the_gate_command_names_the_services_venv_by_absolute_path(self):
+    def test_the_gate_command_is_mains(self):
+        """123c R1: a route never changes a repo's suite command (TestTheSuiteCommandIsNotNarrowed). The command
+        stays main's, relative to the checkout the route runs in — single-stream, the checkout itself."""
         aif = SHIPPED["repos"]["ai-foundation"]
-        activate = f"{aif['project_dir']}/venv/bin/activate"
-        assert aif["test_cmd"] == f". {activate} && PYTHONPATH=. pytest"
-        assert aif["build_gate_cmd"] == f". {activate} && PYTHONPATH=. pytest -q"
+        assert aif["test_cmd"] == ". venv/bin/activate && PYTHONPATH=. pytest"
+        assert aif["build_gate_cmd"] == ". venv/bin/activate && PYTHONPATH=. pytest -q"
 
-    def test_R_the_gate_command_runs_green_in_a_worktree_with_no_venv(self, tmp_path, monkeypatch):
-        """The shipped command, its checkout swapped for a fixture one, through the unit gate's own leg runner."""
+    def test_the_gate_command_runs_green_in_the_checkout_it_runs_in(self, tmp_path, monkeypatch):
+        """The shipped command verbatim, in a fixture checkout with its gitignored venv/, through the unit gate's
+        own leg runner."""
         main = _fixture_repo(tmp_path / "main", AIF_GITIGNORE)
         _fake_venv(main)
-        wt = tmp_path / "aif-toni" / "120-minime-x-1"
-        _git(f"git worktree add -q --detach {wt} main", main)
-        assert not (wt / "venv").exists()
-        aif = SHIPPED["repos"]["ai-foundation"]
-        cmd = aif["test_cmd"].replace(aif["project_dir"], str(main))
-        run = orchestrator._run_unit_suite(cmd, wt, "orch-aif-120-minime-x-1")
+        run = orchestrator._run_unit_suite(SHIPPED["repos"]["ai-foundation"]["test_cmd"], main,
+                                           "orch-aif-120-minime-x-1")
         assert run.exit_code == 0 and run.error is None, run.output[-1500:]
         assert re.search(r"\b1 passed\b", run.output)
-        assert _git("git status --porcelain", wt) == "", "nothing created in the worktree"
+        assert _git("git status --porcelain", main) == "", "nothing created in the checkout"
 
     def test_negative_control_the_relative_command_fails_there(self, tmp_path):
         main = _fixture_repo(tmp_path / "main", AIF_GITIGNORE)
@@ -499,13 +497,13 @@ class TestP4AifWorktree:
     @pytest.mark.skipif(not Path(SHIPPED["repos"]["ai-foundation"]["project_dir"], "venv/bin/activate").is_file(),
                         reason="the ai-foundation venv is not on this machine")
     def test_the_shipped_command_verbatim_with_the_real_venv(self, tmp_path, monkeypatch):
-        """Reads the services' venv (never writes: no bytecode); the suite is the fixture's, in a temp worktree."""
+        """Reads the services' venv (never writes: no bytecode); the suite is the fixture's, in a temp checkout
+        whose venv is a link to the real one."""
         monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
         main = _fixture_repo(tmp_path / "main", AIF_GITIGNORE)
-        wt = tmp_path / "wt"
-        _git(f"git worktree add -q --detach {wt} main", main)
+        (main / "venv").symlink_to(Path(SHIPPED["repos"]["ai-foundation"]["project_dir"], "venv"))
         run = orchestrator._run_unit_suite(SHIPPED["repos"]["ai-foundation"]["test_cmd"] + " -p no:cacheprovider",
-                                           wt, "x")
+                                           main, "x")
         assert run.exit_code == 0, run.output[-1500:]
         assert re.search(r"\b1 passed\b", run.output)
 

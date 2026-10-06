@@ -60,10 +60,8 @@ repos:
     worktree_mode: single-stream
     worktree_base: /home/gkassa/aif-toni
     briefs_subdir: briefs
-    # C2: the services' venv by absolute path — a route worktree has no venv/ of its own. Proven in a fresh
-    # worktree with no venv/ (tests/test_capacity.py P4). No gitignored path is needed by the suite.
-    test_cmd: ". /home/gkassa/spectricom-ai-foundation/venv/bin/activate && PYTHONPATH=. pytest"
-    build_gate_cmd: ". /home/gkassa/spectricom-ai-foundation/venv/bin/activate && PYTHONPATH=. pytest -q"
+    test_cmd: ". venv/bin/activate && PYTHONPATH=. pytest"
+    build_gate_cmd: ". venv/bin/activate && PYTHONPATH=. pytest -q"
 
   clinical-mp:
     project_dir: /home/gkassa/spectricom-clinical-mp
