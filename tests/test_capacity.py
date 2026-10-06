@@ -462,11 +462,15 @@ class TestP4AifWorktree:
         assert orchestrator.WORKTREE_MODE == "parallel"
         assert orchestrator.WORKTREE_BASE / "125-minime-console-1" == Path("/home/gkassa/aif-toni/125-minime-console-1")
 
-    def test_the_shipped_mode_stays_single_stream_until_venv_is_ignored(self):
-        """A tripwire, not a preference: see config/repos.yaml and the handback's Found and LEFT 1. Flip it only
-        after ai-foundation's .gitignore ignores a `venv` symlink (TestP4VenvLinkHazard shows why)."""
+    def test_the_shipped_mode_is_parallel_and_venv_is_ignored(self):
+        """ORCH-AIF-WORKTREE-FLIP-1: parallel is safe only while ai-foundation's .gitignore has an exact `venv`
+        line — `venv/` would leave the route's venv link for `git add -A` (TestP4VenvLinkHazard). Reads only."""
         aif = SHIPPED["repos"]["ai-foundation"]
-        assert aif["worktree_mode"] == "single-stream" and aif["worktree_base"] == "/home/gkassa/aif-toni"
+        assert aif["worktree_mode"] == "parallel" and aif["worktree_base"] == "/home/gkassa/aif-toni"
+        if not Path(aif["project_dir"]).is_dir():
+            pytest.skip("the ai-foundation checkout is not on this machine (CI): its .gitignore is unchecked")
+        lines = Path(aif["project_dir"], ".gitignore").read_text().splitlines()
+        assert "venv" in lines, "ai-foundation's .gitignore must read `venv` (route 134), or a route commits the link"
 
     def test_the_gate_command_is_mains(self):
         """123c R1: a route never changes a repo's suite command (TestTheSuiteCommandIsNotNarrowed). The command

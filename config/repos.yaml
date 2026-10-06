@@ -52,12 +52,8 @@ repos:
     merge_target: main
     remote: origin
     log_subdir: ai-foundation
-    # ORCH-CAPACITY-1 C2 (S7-CORE-21, L-71) — STAGED, NOT LIVE: stays single-stream. DO NOT flip to `parallel`
-    # until ai-foundation's .gitignore ignores a `venv` SYMLINK: its line 1 reads `venv/`, which matches a
-    # directory only. A route worktree links venv from this checkout (orchestrator._link_unit_deps), so the
-    # route's `git add -A` commits the link, and the merge's fast-forward here DELETES this checkout's venv/ —
-    # the venv the MiniMe services run from (briefs/123b-orch-capacity-1.handback.md, Found and LEFT 1).
-    worktree_mode: single-stream
+    # ORCH-AIF-WORKTREE-FLIP-1 (L-71): parallel since route 134 merged — ai-foundation 3cfb727d, .gitignore `venv`.
+    worktree_mode: parallel
     worktree_base: /home/gkassa/aif-toni
     briefs_subdir: briefs
     test_cmd: ". venv/bin/activate && PYTHONPATH=. pytest"
