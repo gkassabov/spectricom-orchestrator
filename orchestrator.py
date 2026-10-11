@@ -20,6 +20,12 @@ Usage:
 
 Batch-level dependencies:
   Add to batch file header:  # depends_on_batches: [toni-batch-31.md, toni-batch-30.md]
+
+Route timeout and dependency trees (brief header):
+  ## Estimated runtime: 60-90 min   ← sizing floor (lower) and route timeout (upper × 1.25, capped at 180);
+                                       '<n>-<m> min' or '<n>-<m> h'; prefire refuses a line it cannot read
+  ## Isolated deps: true            ← the route and unit-baseline worktrees build their own node_modules
+                                       (npm ci) / venv instead of linking the main checkout's (L-92)
 """
 
 import os, sys, re, time, json, shlex, signal, logging, hashlib, subprocess, argparse, tempfile
@@ -332,6 +338,13 @@ UNIT_BASELINE_WORKTREE_PREFIX = "orch-unit-baseline-"
 # route sharing them is unaffected. The repo's declared env_file (PRE_MERGE_GATES) is
 # linked too; its NAME is used, its values are never read or logged (canon §23.9d).
 UNIT_BASELINE_LINK_PATHS = ("node_modules", "venv", ".venv", "yorsie/node_modules")
+# [ORCH-PREFIRE-RUNTIME-1] D3 · L-92: a brief's '## Isolated deps: true' — its route worktree and its
+# unit-baseline worktree each build their own copy of those trees (_install_unit_deps) instead of the
+# links. A dependency-upgrade route installed THROUGH the link into the tree yorsie-dev.service runs
+# from, and its baseline leg ran on the route's new packages (route 143). run_batch sets the mode.
+ISOLATED_DEPS = False
+ISOLATED_DEPS_HEADER = re.compile(r'^##[ \t]*Isolated deps:[ \t]*(.*?)[ \t]*$', re.MULTILINE)
+ISOLATED_DEPS_INSTALL_TIMEOUT_S = 900    # one `npm ci` / venv build; the daemon's wall slack is 900 s too
 # A fully-green branch cannot be a regression against ANY baseline: 0 > n is false for
 # every n >= 0, and an empty failing-file set cannot contain a newly-failing file. So the
 # baseline run is skipped in that case and the gate costs one suite run, not two.
@@ -617,6 +630,11 @@ def parse_batch(filepath: Path) -> list[Brief]:
 def parse_brief_timeout(filepath: Path) -> Optional[int]:
     """Parse TONI_TIMEOUT_MIN advisory from brief file header.
     Returns timeout in minutes, or None if not declared.
+
+    [ORCH-PREFIRE-RUNTIME-1] D1 · L-102: the '## Estimated runtime:' line is read by prefire's parse, the
+    one the sizing floor reads (prefire.runtime_timeout: upper bound × 1.25). This function's own grammar
+    read only '<n>-<m> m' / '<n> m', so route 225's '2-3 h' passed prefire at 120 min and ran under the
+    45-min default.
     """
     try:
         content = filepath.read_text(encoding="utf-8")[:4000]
@@ -631,47 +649,45 @@ def parse_brief_timeout(filepath: Path) -> Optional[int]:
     if m:
         return int(m.group(1))
 
-    m = re.search(r'^## Estimated runtime:\s*(.+)', content, re.MULTILINE)
-    if m:
-        runtime_line = m.group(1)
-        rm = re.search(r'(\d+)\s*-\s*(\d+)\s*m', runtime_line)
-        if rm:
-            upper = int(rm.group(2))
-            return int(upper * 1.25)
-        rm = re.search(r'(\d+)\s*m', runtime_line)
-        if rm:
-            return int(int(rm.group(1)) * 1.25)
+    return prefire.runtime_timeout(filepath)
 
-    return None
+
+def _requested_timeout(brief_path: Optional[Path] = None) -> tuple[int, str]:
+    """(minutes, source) by precedence env-var > brief-declared > default, before the hard cap."""
+    env_raw = os.environ.get("TONI_TIMEOUT_MIN", "")
+    if env_raw:
+        return int(env_raw), "env-var"
+    if brief_path:
+        brief_val = parse_brief_timeout(brief_path)
+        if brief_val is not None:
+            return brief_val, "brief-declared"
+    return TIMEOUT_DEFAULT_MIN, "default"
 
 
 def resolve_timeout(brief_path: Optional[Path] = None) -> tuple[int, str]:
     """Resolve timeout with precedence: env-var > brief-declared > default.
     Returns (timeout_minutes, source_label). Hard cap at 180m.
     """
-    env_raw = os.environ.get("TONI_TIMEOUT_MIN", "")
-    if env_raw:
-        timeout = int(env_raw)
-        source = "env-var"
-    elif brief_path:
-        brief_val = parse_brief_timeout(brief_path)
-        if brief_val is not None:
-            timeout = brief_val
-            source = "brief-declared"
-        else:
-            timeout = TIMEOUT_DEFAULT_MIN
-            source = "default"
-    else:
-        timeout = TIMEOUT_DEFAULT_MIN
-        source = "default"
+    timeout, source = _requested_timeout(brief_path)
 
     if timeout > TIMEOUT_HARD_CAP_MIN:
         log.warning(
-            f"Timeout {timeout}min exceeds hard cap {TIMEOUT_HARD_CAP_MIN}min; clamping"
+            f"Timeout {timeout}min ({source}) exceeds hard cap {TIMEOUT_HARD_CAP_MIN}min; clamping"
         )
         timeout = TIMEOUT_HARD_CAP_MIN
 
     return timeout, source
+
+
+def prefire_timeout(brief_path: Path) -> Optional[tuple[int, str, int]]:
+    """[ORCH-PREFIRE-RUNTIME-1] D2: what prefire's pass line names — (the minutes resolve_timeout gives this
+    brief, their source, the minutes asked before the hard cap). None when TONI_TIMEOUT_MIN is not a number:
+    the route then fails at its own resolve_timeout, as it always has."""
+    try:
+        asked, source = _requested_timeout(brief_path)
+    except ValueError:
+        return None
+    return min(asked, TIMEOUT_HARD_CAP_MIN), source, asked
 
 
 # ═══════════════════════════════════════════════════════
@@ -1575,9 +1591,24 @@ def _create_route_worktree(batch_file: Path) -> tuple[Optional[Path], str]:
                        shell=True, capture_output=True, text=True)
     if r.returncode != 0:
         return None, f"git worktree add {wt} {MERGE_TARGET} failed: {r.stderr.strip()[-300:]}"
-    links = _link_unit_deps(PROJECT_ROOT, wt)
-    log.info(f"🌳 Route worktree: {wt} (from {MERGE_TARGET}; {len(links)} dependency path(s) linked from "
-             f"{PROJECT_ROOT}) — the main checkout is not the route's")
+    links = _link_unit_deps(PROJECT_ROOT, wt, isolated=ISOLATED_DEPS)
+    if not ISOLATED_DEPS:
+        log.info(f"🌳 Route worktree: {wt} (from {MERGE_TARGET}; {len(links)} dependency path(s) linked from "
+                 f"{PROJECT_ROOT}) — the main checkout is not the route's")
+        return wt, ""
+    # [ORCH-PREFIRE-RUNTIME-1] D3: a tree that cannot be built is a route that does not fire — never the link.
+    built, why = _install_unit_deps(PROJECT_ROOT, wt)
+    if why:
+        for d in links:
+            d.unlink(missing_ok=True)
+        subprocess.run(f"git -C {shlex.quote(str(PROJECT_ROOT))} worktree remove --force {shlex.quote(str(wt))}",
+                       shell=True, capture_output=True)
+        subprocess.run(f"git -C {shlex.quote(str(PROJECT_ROOT))} worktree prune", shell=True, capture_output=True)
+        return None, f"isolated deps: {why}"
+    log.info(f"🌳 Route worktree: {wt} (from {MERGE_TARGET}; isolated deps — built its own "
+             f"{_describe_built(wt, built)}; linked from {PROJECT_ROOT}: "
+             f"{', '.join(str(d.relative_to(wt)) for d in links) or 'nothing'}) — the main checkout is not the "
+             f"route's, nor are its dependency trees")
     return wt, ""
 
 
@@ -1599,7 +1630,11 @@ def _finish_route_worktree(wt: Path, result: Optional["Result"]):
     subprocess.run(f"git -C {shlex.quote(str(PROJECT_ROOT))} worktree remove --force {shlex.quote(str(wt))}",
                    shell=True, capture_output=True)
     subprocess.run(f"git -C {shlex.quote(str(PROJECT_ROOT))} worktree prune", shell=True, capture_output=True)
-    log.info(f"🌳 Route worktree removed: {wt}")
+    if ISOLATED_DEPS and wt.exists():
+        log.warning(f"⚠️ Route worktree: {wt} is still on disk after `git worktree remove`, with the dependency "
+                    f"trees it built. After review: git -C {PROJECT_ROOT} worktree remove --force {wt}")
+        return
+    log.info(f"🌳 Route worktree removed: {wt}" + (" (with the dependency trees it built)" if ISOLATED_DEPS else ""))
 
 
 def _checkout_holding(branch: str, repo: Path) -> Optional[Path]:
@@ -2809,7 +2844,7 @@ def _unit_merge_base(repo_path: Path, branch_name: Optional[str]) -> Optional[st
     return None
 
 
-def _link_unit_deps(src: Path, dst: Path) -> list:
+def _link_unit_deps(src: Path, dst: Path, isolated: bool = False) -> list:
     """Symlink the git-ignored dependency paths (and the declared env_file) from the gated
     checkout into the detached baseline worktree, so the baseline runs the same suite the
     branch does. Returns the links created, for teardown. Never reads any file's contents.
@@ -2817,9 +2852,12 @@ def _link_unit_deps(src: Path, dst: Path) -> list:
     [ORCH-9]: the env_file is linked for PARITY, not for use — the unit suite is no longer run
     through the env-sourcing shell. The branch leg runs in a checkout that has the file on
     disk, so the baseline leg gets one too; whether a repo's own config reads it is the
-    repo's decision to make identically on both sides."""
+    repo's decision to make identically on both sides.
+
+    [ORCH-PREFIRE-RUNTIME-1] D3: `isolated` links the env_file alone — the dependency trees are then the
+    destination's own (_install_unit_deps)."""
     created = []
-    names = list(UNIT_BASELINE_LINK_PATHS)
+    names = [] if isolated else list(UNIT_BASELINE_LINK_PATHS)
     env_name, _ = _gate_env_file(src)
     if env_name:
         names.append(env_name)
@@ -2834,6 +2872,58 @@ def _link_unit_deps(src: Path, dst: Path) -> list:
         except OSError as e:
             log.warning(f"⚠️  Unit baseline: could not link {rel}: {e}")
     return created
+
+
+def parse_isolated_deps(filepath: Path) -> bool:
+    """[ORCH-PREFIRE-RUNTIME-1] D3: True iff the brief header says '## Isolated deps: true' (case and markdown
+    aside). Absent, or 'false' ⇒ the links, unchanged. Any other value is not guessed at: it links, and says so."""
+    try:
+        m = ISOLATED_DEPS_HEADER.search(filepath.read_text(encoding="utf-8", errors="replace")[:6000])
+    except Exception:
+        return False
+    if not m:
+        return False
+    value = re.sub(r"[*`]", "", m.group(1)).strip().lower()
+    if value not in ("true", "false"):
+        log.warning(f"⚠️ '{m.group(0).strip()}' is not 'true' or 'false' — the dependency trees are LINKED")
+    return value == "true"
+
+
+def _install_unit_deps(src: Path, dst: Path) -> tuple[list, Optional[str]]:
+    """[ORCH-PREFIRE-RUNTIME-1] D3: build in `dst` its own copy of each dependency tree `src` has — the paths
+    _link_unit_deps would otherwise link — from `dst`'s own manifests: `npm ci` beside a node_modules; for
+    venv / .venv (the venv repos.yaml's test_cmd activates), `python3 -m venv` and pip from requirements.txt.
+    Returns (the trees built, None), or (those built so far, why the next one could not be). A built tree must
+    be git-ignored in `dst`: the route lane's `git add -A` would commit it otherwise."""
+    built = []
+    for rel in UNIT_BASELINE_LINK_PATHS:
+        d = dst / rel
+        if not (src / rel).exists() or d.exists():
+            continue
+        if d.name == "node_modules":
+            cwd, cmd = d.parent, "npm ci"
+            if not (cwd / "package.json").is_file():
+                return built, f"{rel}: no package.json in {cwd}"
+        elif (dst / "requirements.txt").is_file():
+            cwd, cmd = dst, f"python3 -m venv {rel} && {rel}/bin/pip install -q -r requirements.txt"
+        else:
+            return built, f"{rel}: no requirements.txt in {dst} to build it from"
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(cwd),
+                               timeout=ISOLATED_DEPS_INSTALL_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return built, f"{rel}: `{cmd}` timed out after {ISOLATED_DEPS_INSTALL_TIMEOUT_S}s"
+        if r.returncode != 0:
+            return built, f"{rel}: `{cmd}` exit {r.returncode}: {((r.stderr or '') + (r.stdout or '')).strip()[-300:]}"
+        built.append(d)
+        if subprocess.run(["git", "-C", str(dst), "check-ignore", "-q", rel], capture_output=True).returncode != 0:
+            return built, f"{rel} is not git-ignored in {dst} — `git add -A` would commit it"
+    return built, None
+
+
+def _describe_built(root: Path, built: list) -> str:
+    return ", ".join(f"{d.relative_to(root)} ({'npm ci' if d.name == 'node_modules' else 'venv, pip -r requirements.txt'})"
+                     for d in built) or "nothing (the checkout has no dependency tree)"
 
 
 def _unit_repo_timeout(key: str, default: int) -> int:
@@ -2922,9 +3012,18 @@ def _run_unit_baseline(repo_path: Path, sha: str, cmd: str) -> UnitSuiteRun:
                                 output=(add.stderr or "")[-2000:])
         links = []
         try:
-            links = _link_unit_deps(repo_path, wt)
+            links = _link_unit_deps(repo_path, wt, isolated=ISOLATED_DEPS)
+            if not ISOLATED_DEPS:
+                log.info(f"🧬 Unit baseline: measuring {ref} in a detached worktree "
+                         f"({len(links)} dependency path(s) linked)")
+                return _run_unit_suite(cmd, wt, ref)
+            # [ORCH-PREFIRE-RUNTIME-1] D3: the merge base's own trees, from its own lockfile — never the route's.
+            built, why = _install_unit_deps(repo_path, wt)
+            if why:
+                log.error(f"⛔ Unit baseline: isolated deps at {sha[:7]} could not be built: {why}")
+                return UnitSuiteRun(ref=ref, exit_code=-1, error="baseline-deps-install-failed", output=why[-2000:])
             log.info(f"🧬 Unit baseline: measuring {ref} in a detached worktree "
-                     f"({len(links)} dependency path(s) linked)")
+                     f"(isolated deps — built its own {_describe_built(wt, built)})")
             return _run_unit_suite(cmd, wt, ref)
         finally:
             for d in links:
@@ -4247,13 +4346,20 @@ def _executor_exit_hold(ec: int, branch: str) -> Optional[HandbackHold]:
 
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     # HOOK-1 / D-S7CORE4-02 — assertions checked at the moment of action.
-    if not PREFIRE_BYPASS and not prefire.report(batch_file):
+    if not PREFIRE_BYPASS and not prefire.report(batch_file, timeout=prefire_timeout(batch_file)):
         log.error('Pre-fire assertions FAILED - not firing %s' % batch_file.name)
         _now = datetime.now().isoformat()
         return Result(batch_file=batch_file.name, status=Status.FAILED,
                       started=_now, finished=_now, duration_s=0.0,
                       exit_code=2, briefs=0,
                       error='pre-fire assertions failed (A1/A2/A8) — HOOK-1')
+    # [ORCH-PREFIRE-RUNTIME-1] D3: read once per route; _create_route_worktree and _run_unit_baseline use it.
+    global ISOLATED_DEPS
+    ISOLATED_DEPS = parse_isolated_deps(batch_file)
+    log.info("📦 deps: ISOLATED (## Isolated deps: true) — a route worktree and a unit-baseline worktree build "
+             "their own dependency trees (L-92)" if ISOLATED_DEPS else
+             "📦 deps: linked — a route worktree and a unit-baseline worktree link the main checkout's "
+             "dependency trees (UNIT_BASELINE_LINK_PATHS)")
     meta_wt = None
     meta_branch = None
     is_self_mod = IS_META_FIRE and (PROJECT_ROOT.resolve() == ORCH_DIR)

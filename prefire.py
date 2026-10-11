@@ -20,6 +20,10 @@ ENFORCED:
   A2  sizing floor  — '## Estimated runtime:' must be declared and its lower bound
                       must be >= 30 min, unless '## Micro-fire trigger:' names a
                       P0-infra or P1-safety trigger (System Prompt 5.9).
+                      [ORCH-PREFIRE-RUNTIME-1] L-102: the line is also the route timeout
+                      (orchestrator.parse_brief_timeout reads this module's parse, upper bound
+                      × 1.25), so a line that gives no upper bound fails, micro-fire or not, and
+                      the pass line names the timeout the route will run under.
   A8  no skip-sit   — 'skip-sit' must not appear in a feature brief (5.5).
 
 NOT enforced here: A3-A7, A9.
@@ -62,18 +66,32 @@ def _read(filepath: Path) -> str:
         return ""
 
 
-def parse_declared_estimate(filepath: Path) -> Optional[int]:
-    """Lower bound of the brief's '## Estimated runtime:' line, in minutes.
+_RUNTIME_LINE = re.compile(r'^##\s*Estimated runtime:\s*(.+)$', re.MULTILINE)
+# A unit may touch its number ('2-3h', '90min'); it may not sit inside a word ('admin', 'with').
+_MINUTES = re.compile(r'(?<![a-z])m(in(ute)?s?)?\b', re.IGNORECASE)
+_HOURS = re.compile(r'(?<![a-z])h(ours?|rs?)?\b', re.IGNORECASE)
+# [ORCH-PREFIRE-RUNTIME-1] D1: the route timeout a runtime line asks for is its upper bound × this.
+RUNTIME_TIMEOUT_FACTOR = 1.25
 
-    Returns None when the line is absent — which is itself an A2 failure, and is
-    exactly what happened on both S7-CORE-4 routes: neither brief declared one.
 
-    '75-95 min'  -> 75      '90 min'   -> 90
-    '45-90 min (HIGH-substrate bundle)' -> 45   (parentheticals stripped first)
-    '1.5h' / '2 hours' -> 90 / 120
+def _runtime_line(filepath: Path) -> Optional[re.Match]:
+    return _RUNTIME_LINE.search(_read(filepath)[:_HEADER_CHARS])
+
+
+def parse_declared_runtime(filepath: Path) -> Optional[tuple[int, int]]:
+    """(lower, upper) of the brief's '## Estimated runtime:' line, in minutes — the ONE parse of it.
+
+    [ORCH-PREFIRE-RUNTIME-1] D1 · L-102: the sizing floor (parse_declared_estimate) reads the lower
+    bound and the route timeout (orchestrator.parse_brief_timeout) the upper. Route 225's '2-3 h'
+    was 120 min to this grammar and nothing to the timeout's own, so it ran under the 45-min default.
+
+    None when the line is absent, or gives no number. A single value is both bounds.
+
+    '75-95 min'  -> (75, 95)      '90 min'   -> (90, 90)
+    '45-90 min (HIGH-substrate bundle)' -> (45, 90)   (parentheticals stripped first)
+    '1.5h' / '2-3 hours' -> (90, 90) / (120, 180)
     """
-    m = re.search(r'^##\s*Estimated runtime:\s*(.+)$', _read(filepath)[:_HEADER_CHARS],
-                  re.MULTILINE)
+    m = _runtime_line(filepath)
     if not m:
         return None
 
@@ -83,12 +101,28 @@ def parse_declared_estimate(filepath: Path) -> Optional[int]:
     if not nums:
         return None
 
-    has_min = re.search(r'\bm(in(ute)?s?)?\b', line, re.IGNORECASE) is not None
-    has_hr = re.search(r'\bh(ours?|rs?)?\b', line, re.IGNORECASE) is not None
-    if has_hr and not has_min:
+    if _HOURS.search(line) and not _MINUTES.search(line):
         nums = [n * 60 for n in nums]
 
-    return int(min(nums))
+    return int(min(nums)), int(max(nums))
+
+
+def parse_declared_estimate(filepath: Path) -> Optional[int]:
+    """Lower bound of the brief's '## Estimated runtime:' line, in minutes.
+
+    Returns None when the line is absent — which is itself an A2 failure, and is
+    exactly what happened on both S7-CORE-4 routes: neither brief declared one.
+    """
+    runtime = parse_declared_runtime(filepath)
+    return runtime[0] if runtime else None
+
+
+def runtime_timeout(filepath: Path) -> Optional[int]:
+    """The route timeout the '## Estimated runtime:' line asks for: its upper bound × 1.25, in minutes.
+    None when it gives none. orchestrator.parse_brief_timeout returns this unless a TONI_TIMEOUT_MIN
+    header or Fire mechanism override comes first."""
+    runtime = parse_declared_runtime(filepath)
+    return int(runtime[1] * RUNTIME_TIMEOUT_FACTOR) if runtime else None
 
 
 def parse_microfire_trigger(filepath: Path) -> Optional[str]:
@@ -246,10 +280,16 @@ def check(filepath: Path) -> list[str]:
     if a1:
         failures.append(a1)
 
+    line = _runtime_line(filepath)
     estimate = parse_declared_estimate(filepath)
     trigger = parse_microfire_trigger(filepath)
 
-    if estimate is None:
+    if line and estimate is None:
+        # [ORCH-PREFIRE-RUNTIME-1] D2: declared, but no route timeout can be read off it. A micro-fire
+        # trigger waives the floor, not the timeout.
+        failures.append("A2 RUNTIME — '%s' gives no route timeout; write '<n>-<m> min'"
+                        % line.group(0).strip())
+    elif estimate is None:
         if trigger:
             pass  # declared micro-fire: sizing floor waived by 5.9
         else:
@@ -278,7 +318,22 @@ def check(filepath: Path) -> list[str]:
     return failures
 
 
-def report(filepath: Path) -> bool:
+def _timeout_detail(filepath: Path, timeout: Optional[tuple[int, str, int]]) -> str:
+    """[ORCH-PREFIRE-RUNTIME-1] D2: the pass line's timeout. `timeout` is what the fire resolved —
+    orchestrator.prefire_timeout: (minutes, source, minutes asked before the hard cap). Without it (this
+    module's CLI) the line can say only what the runtime line asks."""
+    if timeout is not None:
+        minutes, source, asked = timeout
+        clamp = " ⚠ clamped to %d min from %d" % (minutes, asked) if asked > minutes else ""
+        return "timeout %d min (%s)%s" % (minutes, source, clamp)
+    asks = runtime_timeout(filepath)
+    if asks is None:
+        return "timeout: none declared — the fire's default"
+    return ("timeout %d min (Estimated runtime × %s — the fire applies TONI_TIMEOUT_MIN and the hard cap)"
+            % (asks, RUNTIME_TIMEOUT_FACTOR))
+
+
+def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bool:
     """Run the assertions and print the verdict. True == cleared to fire."""
     failures = check(filepath)
     bar = "━" * 60
@@ -290,7 +345,7 @@ def report(filepath: Path) -> bool:
             detail = "declared %dm (floor %dm)" % (est, SIZING_FLOOR_MIN)
         else:
             detail = "micro-fire: %s" % trig
-        print("  Assertions: ✅ A1/A2/A8 pass — %s; %s" % (row, detail))
+        print("  Assertions: ✅ A1/A2/A8 pass — %s; %s; %s" % (row, detail, _timeout_detail(filepath, timeout)))
         return True
 
     print("\n%s" % bar)
