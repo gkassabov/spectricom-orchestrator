@@ -2042,3 +2042,140 @@ class TestOrchTally1ChangedNoGateOrSitSemantics:
     def test_ac_t1_09_the_cache_version_and_fast_path_switch_are_unchanged(self):
         assert orchestrator.UNIT_BASELINE_CACHE_VERSION == 1
         assert orchestrator.UNIT_GATE_SKIP_BASELINE_WHEN_GREEN is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# S7-CORE-24 [ORCH-ADMISSION-PARSER-1] D3 — the tally counts every outcome the runner's own
+# summary reports.
+#
+# pytest's total counts xfailed and xpassed: under -q it is the sum of the summary line, and
+# otherwise it is the `collected N items` line. The tally did not count them. So every pytest
+# suite carrying an xfail or an xpass warned on every correct run. That is ORCH-TALLY-1's
+# shape on the other runner. Route 233's gate
+# (logs/orchestrator/orch-233-orch-prefire-runtime-1-20261011-052144.log:47) said:
+#   TALLY MISMATCH on orch-orch-233-…: 0 failed + 1148 passed = 1148, but the runner states 1149
+# The 1 is the strict xfail 233 added.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# The tail of that suite exactly as pytest 9.0.3 printed it: `pytest -q tests/` at 8a2842c,
+# this route's merge-base gate. 233's own handback records the same line in 66.23s.
+PYTEST_233 = (".....................................................................    [100%]\n"
+              "1148 passed, 1 xfailed in 67.92s (0:01:07)\n")
+# P2's fabricated total: one more test than the runner ran.
+PYTEST_233_OVER_1150 = "collected 1150 items\n\n" + PYTEST_233
+PYTEST_1148_OVER_1150 = "collected 1150 items\n\n1148 passed in 66.23s\n"
+# Every pytest outcome in one run, pytest 9.0.3, from an 8-test scratch file. It has 2 passes,
+# a failure, a fixture error, a skip, an xfail, a strict xfail and a non-strict xpass. Run with
+# -q (no `collected` line, so the total is the summary's sum) and without (`collected 8 items`).
+PYTEST_Q_EVERY_OUTCOME = (REPO_ROOT / "tests" / "fixtures" / "unit_pytest_q_every_outcome.txt").read_text()
+PYTEST_EVERY_OUTCOME = (REPO_ROOT / "tests" / "fixtures" / "unit_pytest_every_outcome.txt").read_text()
+# Real vitest 4.1.4 `Tests` lines from clinical-mp route logs (logs/clinical-mp/):
+#   toni-toni-batch-s7core9-red-5b-flake-class-and-last-reds-01-20260915-054400.log:72 — skipped + todo
+#   toni-06-rm-i-032-a-key-number-per-modality-20260917-081618.log:64 — skipped, no todo
+#   toni-toni-batch-s7core11-date-3-parse-convention-and-comparators-01-20260916-111119.log:84 — all five
+# and Yorsie's SIT output in tests/fixtures/sit_gate_vitest_429_19files_3down.txt (51 passed | 9 skipped).
+VITEST_SKIPPED_TODO = (" Test Files  1 failed | 787 passed | 1 skipped (789)\n"
+                       "      Tests  3 failed | 7273 passed | 8 skipped | 4 todo (7288)\n"
+                       "   Duration  286.54s\n")
+VITEST_REAL_LINES = [
+    "      Tests  3 failed | 7273 passed | 8 skipped | 4 todo (7288)\n",
+    " Tests  13 failed | 11 passed | 14 skipped (38)\n",
+    "      Tests  3 failed | 7412 passed | 1 expected fail | 8 skipped | 4 todo (7428)\n",
+    (REPO_ROOT / "tests" / "fixtures" / "sit_gate_vitest_429_19files_3down.txt").read_text(),
+]
+
+
+def _run(raw: str, ref: str = "route") -> "orchestrator.UnitSuiteRun":
+    return orchestrator.UnitSuiteRun(ref=ref, exit_code=0, **orchestrator._parse_unit_summary(raw))
+
+
+class TestP2Route233sLineReconciles:
+    """P2 — route 233's summary (1148 passed, 1 xfailed, 1149 total) is CLEAN."""
+
+    def test_p2_the_xfail_is_a_parsed_tally_and_the_sum_is_the_total(self):
+        r = _run(PYTEST_233)
+        assert (r.runner, r.tests_total, r.tests_passed, r.failures) == ("pytest", 1149, 1148, 0)
+        assert (r.tests_xfailed, r.tests_xpassed) == (1, None)
+        assert r.tally_sum == 1149 and r.tally_note is None
+
+    def test_p2_the_gate_is_silent_and_the_record_agrees(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="orch"):
+            o, entries = run_gate(repo, tmp_path, branch_out=PYTEST_233, branch_code=0,
+                                  test_cmd="pytest -q tests/")
+        assert o.passed is True and o.baseline_source == "not-needed"
+        assert "TALLY MISMATCH" not in (o.detail or "") and "TALLY MISMATCH" not in caplog.text
+        assert "1149 tests, 0 failed, 1148 passed, 1 xfailed" in o.branch.collection
+        side = entries[-1]["branch"]
+        assert (side["tally_agrees"], side["tally_sum"], side["tests_xfailed"], side["tests_xpassed"]) == \
+            (True, 1149, 1, None)
+
+    @pytest.mark.parametrize("raw", [PYTEST_Q_EVERY_OUTCOME, PYTEST_EVERY_OUTCOME], ids=["-q", "collected"])
+    def test_every_pytest_outcome_is_counted(self, raw):
+        """failed + error (both in `failures`, as always) + passed + skipped + xfailed + xpassed = 8."""
+        r = _run(raw)
+        assert (r.failures, r.tests_passed, r.tests_skipped, r.tests_xfailed, r.tests_xpassed) == (2, 2, 1, 2, 1)
+        assert r.tests_total == 8 and r.tally_sum == 8 and r.tally_note is None
+        assert "8 tests, 2 failed, 2 passed, 1 skipped, 2 xfailed, 1 xpassed" in r.collection
+
+    def test_the_cache_does_not_launder_it_back(self, repo, tmp_path):
+        """A red branch needs the baseline; the second route reads it from the cache with its xfail."""
+        branch = ("FAILED tests/test_x.py::test_b - assert 1 == 2\n"
+                  "1 failed, 1147 passed, 1 xfailed in 66.00s (0:01:06)\n")
+        archive = tmp_path / "archive"
+        for _ in range(2):
+            with active(archive=archive, test_cmd="pytest -q tests/"), patch.object(
+                    orchestrator, "_run_unit_suite", fake_suite(branch, PYTEST_233, 1, 0)):
+                o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
+        assert o.baseline_source == "cache"
+        assert o.baseline.tests_xfailed == 1 and o.baseline.tally_sum == 1149
+        assert "TALLY MISMATCH" not in (o.detail or "")
+
+    @pytest.mark.parametrize("raw", [VITEST_ZERO, PYTEST_RED, PYTEST_GREEN, CMP_FIXTURE, VITEST_SKIPPED_TODO],
+                             ids=["VITEST_ZERO", "PYTEST_RED", "PYTEST_GREEN", "CMP_FIXTURE", "VITEST_SKIPPED_TODO"])
+    def test_absent_is_none_not_zero_and_vitest_never_carries_them(self, raw):
+        c = orchestrator._parse_unit_summary(raw)
+        assert c["tests_xfailed"] is None and c["tests_xpassed"] is None
+        assert "xfailed" not in (_run(raw).collection or "") and "xpassed" not in (_run(raw).collection or "")
+
+
+class TestP2AGenuineMismatchStillWarns:
+    """P2 — a fabricated 1148 passed / 1150 total is a MISMATCH, and the new terms absorb nothing else."""
+
+    def test_p2_1148_passed_over_1150_is_a_mismatch(self, repo, tmp_path, caplog):
+        r = _run(PYTEST_1148_OVER_1150)
+        assert "TALLY MISMATCH on route: 0 failed + 1148 passed = 1148, but the runner states 1150" in r.tally_note
+        with caplog.at_level(logging.WARNING, logger="orch"):
+            o, entries = run_gate(repo, tmp_path, branch_out=PYTEST_1148_OVER_1150, branch_code=0,
+                                  test_cmd="pytest -q tests/")
+        assert "TALLY MISMATCH on route" in o.detail and "TALLY MISMATCH on route" in caplog.text
+        assert entries[-1]["branch"]["tally_agrees"] is False
+
+    def test_p2_233s_line_over_1150_names_the_xfail_and_still_warns(self):
+        r = _run(PYTEST_233_OVER_1150)
+        assert r.tally_sum == 1149
+        assert ("TALLY MISMATCH on route: 0 failed + 1148 passed + 1 xfailed = 1149, but the runner states 1150"
+                in r.tally_note)
+
+    def test_every_outcome_over_one_more_collected_still_warns(self):
+        r = _run(PYTEST_EVERY_OUTCOME.replace("collected 8 items", "collected 9 items"))
+        assert "2 failed + 2 passed + 1 skipped + 2 xfailed + 1 xpassed = 8, but the runner states 9" in r.tally_note
+
+    @pytest.mark.parametrize("raw", [CMP_SHORT, CMP_EXPECTED_FAIL_OFF_BY_ONE, CMP_EXPECTED_FAIL_SHORT,
+                                     "      Tests  5 passed | 9 skipped (7)\n"],
+                             ids=["CMP_SHORT", "expected-fail-off-by-one", "CMP_EXPECTED_FAIL_SHORT", "clamped"])
+    def test_stop_c_every_existing_mismatch_fixture_still_mismatches(self, raw):
+        assert _run(raw).tally_note is not None
+
+
+class TestP2VitestSkippedAndTodoReconcile:
+    """P2 — a vitest summary with skipped + todo is CLEAN (it was on 8a2842c too: a control)."""
+
+    @pytest.mark.parametrize("raw", VITEST_REAL_LINES, ids=["skipped+todo", "skipped", "all-five", "yorsie-sit"])
+    def test_p2_real_vitest_summaries_reconcile(self, raw):
+        r = _run(raw)
+        assert r.runner == "vitest" and r.tally_sum == r.tests_total and r.tally_note is None
+
+    def test_p2_the_gate_is_silent_on_skipped_and_todo(self, repo, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="orch"):
+            o, _ = run_gate(repo, tmp_path, branch_out=VITEST_SKIPPED_TODO, baseline_out=VITEST_SKIPPED_TODO)
+        assert o.branch.tally_sum == 7288 == o.branch.tests_total, "3 + 7273 + 8 + 4"
+        assert "TALLY MISMATCH" not in (o.detail or "") and "TALLY MISMATCH" not in caplog.text

@@ -234,10 +234,7 @@ def test_the_cli_with_no_runtime_line_says_the_default_applies(tmp_path, capsys)
 
 
 
-# ── found-and-left 1: the third parser ──────────────────────────────────────────────────────────────────
-@pytest.mark.xfail(strict=True, reason="handback found-and-left 1: admission.parse_brief_timeout (outside this "
-                                       "brief's files) restates the old grammar, so the daemon's route wall reads "
-                                       "'2-3 h' as the 45-min default. Fixing it turns this XPASS: drop the marker.")
+# ── found-and-left 1: the third parser — closed by ORCH-ADMISSION-PARSER-1 (tests/test_admission_parser.py) ──
 def test_found_and_left_the_daemons_wall_reads_the_same_route_timeout(tmp_path):
     import admission
     b = brief(tmp_path, "## Estimated runtime: 2-3 h\n")

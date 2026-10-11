@@ -42,6 +42,8 @@ from typing import Mapping, Optional
 
 import yaml
 
+import prefire   # [ORCH-ADMISSION-PARSER-1] D1: the runtime line's one parser (stdlib, yaml, canon_assert; no log)
+
 ORCH_DIR = Path.home() / "spectricom-orchestrator"   # where the markers live; callers pass their own
 MEMINFO = Path("/proc/meminfo")
 DEFAULT_MAX_CONCURRENT_ROUTES = 1     # L-70: one Toni route at a time
@@ -293,7 +295,13 @@ def admit_run(repo: str, batch: str, *, force: bool = False, orch_dir=None, conf
 # C4 · the daemon's wall for one route
 # ═══════════════════════════════════════════════════════
 def parse_brief_timeout(brief) -> Optional[int]:
-    """orchestrator.parse_brief_timeout, restated: minutes the brief declares, or None."""
+    """Minutes the brief declares, or None. This is the one reading: orchestrator.parse_brief_timeout returns it.
+
+    A `## TONI_TIMEOUT_MIN:` header wins, then a `## Fire mechanism:` line's TONI_TIMEOUT_MIN=, then the runtime
+    line through prefire's parse (prefire.runtime_timeout: upper bound × 1.25).
+
+    [ORCH-ADMISSION-PARSER-1] D1: this was a restated copy of the old '<n>-<m> m' grammar. After route 233,
+    a '2-3 h' brief got 180 min from the route but a daemon wall built from the 45-min default."""
     try:
         content = Path(brief).read_text(encoding="utf-8")[:4000]
     except Exception:
@@ -304,31 +312,31 @@ def parse_brief_timeout(brief) -> Optional[int]:
     m = re.search(r'^## Fire mechanism:.*TONI_TIMEOUT_MIN=(\d+)', content, re.MULTILINE)
     if m:
         return int(m.group(1))
-    m = re.search(r'^## Estimated runtime:\s*(.+)', content, re.MULTILINE)
-    if m:
-        rm = re.search(r'(\d+)\s*-\s*(\d+)\s*m', m.group(1))
-        if rm:
-            return int(int(rm.group(2)) * 1.25)
-        rm = re.search(r'(\d+)\s*m', m.group(1))
-        if rm:
-            return int(int(rm.group(1)) * 1.25)
-    return None
+    return prefire.runtime_timeout(Path(brief))
 
 
-def route_timeout(brief, env: Optional[Mapping[str, str]] = None) -> tuple[int, str]:
-    """(minutes, source) by orchestrator.resolve_timeout's rule: TONI_TIMEOUT_MIN > brief-declared > the
-    default, capped. The daemon's environment is its route's (the child inherits it). A TONI_TIMEOUT_MIN that
-    is not a number fails the route in orchestrator.py; here it is the cap, the long side."""
+def requested_timeout(brief, env: Optional[Mapping[str, str]] = None) -> tuple[int, str]:
+    """(minutes, source) before the hard cap: TONI_TIMEOUT_MIN in `env` > the brief's own > the default.
+    orchestrator._requested_timeout returns this over its own environment (ORCH-ADMISSION-PARSER-1 D1).
+    ValueError when TONI_TIMEOUT_MIN is set and is not a number."""
     env = os.environ if env is None else env
     raw = env.get("TONI_TIMEOUT_MIN", "")
     if raw:
-        try:
-            minutes, source = int(raw), "env-var"
-        except ValueError:
-            return TIMEOUT_HARD_CAP_MIN, f"env-var {raw!r} unreadable — the {TIMEOUT_HARD_CAP_MIN}m cap"
-    else:
-        declared = parse_brief_timeout(brief) if brief else None
-        minutes, source = (declared, "brief-declared") if declared is not None else (TIMEOUT_DEFAULT_MIN, "default")
+        return int(raw), "env-var"
+    declared = parse_brief_timeout(brief) if brief else None
+    return (declared, "brief-declared") if declared is not None else (TIMEOUT_DEFAULT_MIN, "default")
+
+
+def route_timeout(brief, env: Optional[Mapping[str, str]] = None) -> tuple[int, str]:
+    """(minutes, source) by orchestrator.resolve_timeout's rule: requested_timeout, capped. The daemon's
+    environment is its route's (the child inherits it). A TONI_TIMEOUT_MIN that is not a number fails the
+    route in orchestrator.py; here it is the cap, the long side."""
+    env = os.environ if env is None else env
+    try:
+        minutes, source = requested_timeout(brief, env)
+    except ValueError:
+        raw = env.get("TONI_TIMEOUT_MIN", "")
+        return TIMEOUT_HARD_CAP_MIN, f"env-var {raw!r} unreadable — the {TIMEOUT_HARD_CAP_MIN}m cap"
     return min(minutes, TIMEOUT_HARD_CAP_MIN), source
 
 

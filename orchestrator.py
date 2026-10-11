@@ -635,33 +635,17 @@ def parse_brief_timeout(filepath: Path) -> Optional[int]:
     one the sizing floor reads (prefire.runtime_timeout: upper bound × 1.25). This function's own grammar
     read only '<n>-<m> m' / '<n> m', so route 225's '2-3 h' passed prefire at 120 min and ran under the
     45-min default.
+
+    [ORCH-ADMISSION-PARSER-1] D1: the reading is admission.parse_brief_timeout, so the queue daemon's route
+    wall (admission.route_wall) reads the brief the same way.
     """
-    try:
-        content = filepath.read_text(encoding="utf-8")[:4000]
-    except Exception:
-        return None
-
-    m = re.search(r'^## TONI_TIMEOUT_MIN:\s*(\d+)', content, re.MULTILINE)
-    if m:
-        return int(m.group(1))
-
-    m = re.search(r'^## Fire mechanism:.*TONI_TIMEOUT_MIN=(\d+)', content, re.MULTILINE)
-    if m:
-        return int(m.group(1))
-
-    return prefire.runtime_timeout(filepath)
+    return admission.parse_brief_timeout(filepath)
 
 
 def _requested_timeout(brief_path: Optional[Path] = None) -> tuple[int, str]:
-    """(minutes, source) by precedence env-var > brief-declared > default, before the hard cap."""
-    env_raw = os.environ.get("TONI_TIMEOUT_MIN", "")
-    if env_raw:
-        return int(env_raw), "env-var"
-    if brief_path:
-        brief_val = parse_brief_timeout(brief_path)
-        if brief_val is not None:
-            return brief_val, "brief-declared"
-    return TIMEOUT_DEFAULT_MIN, "default"
+    """(minutes, source) by precedence env-var > brief-declared > default, before the hard cap.
+    [ORCH-ADMISSION-PARSER-1] D1: admission.requested_timeout, the precedence the daemon's wall applies."""
+    return admission.requested_timeout(brief_path, os.environ)
 
 
 def resolve_timeout(brief_path: Optional[Path] = None) -> tuple[int, str]:
@@ -2589,6 +2573,10 @@ class UnitSuiteRun:
     # [ORCH-TALLY-1] vitest's `N expected fail` (a `test.fails` that failed as expected). Same
     # discipline: None ⇒ no such segment (and always None on pytest), never rendered as 0.
     tests_expected_fail: Optional[int] = None
+    # [ORCH-ADMISSION-PARSER-1] D3: pytest's `N xfailed` / `N xpassed`, which its total counts. Same
+    # discipline: None ⇒ no such segment (and always None on vitest), never rendered as 0.
+    tests_xfailed: Optional[int] = None
+    tests_xpassed: Optional[int] = None
     # [ORCH-8] AC-O8-03: "reported" ⇒ the runner stated the failure count and we read it;
     # "derived" ⇒ there was no `failed` segment and it came from the fallback subtraction.
     # A reader of the log must never have to guess which of the two produced the number.
@@ -2621,22 +2609,26 @@ class UnitSuiteRun:
             if self.failures_source == "derived":
                 s += " (derived)"
         for n, label in ((self.tests_passed, "passed"), (self.tests_expected_fail, "expected fail"),
-                         (self.tests_skipped, "skipped"), (self.tests_todo, "todo")):
+                         (self.tests_skipped, "skipped"), (self.tests_todo, "todo"),
+                         (self.tests_xfailed, "xfailed"), (self.tests_xpassed, "xpassed")):
             if n is not None:
                 s += f", {n} {label}"
         return s
 
     @property
     def tally_sum(self) -> Optional[int]:
-        """[ORCH-9] failed + passed + expected fail + skipped + todo, over the tallies THIS
-        run carries ([ORCH-TALLY-1] added expected fail — vitest counts it in its total). A
+        """[ORCH-9] failed + passed + expected fail + skipped + todo + xfailed + xpassed, over the
+        tallies THIS run carries ([ORCH-TALLY-1] added expected fail — vitest counts it in its
+        total; [ORCH-ADMISSION-PARSER-1] D3 added xfailed and xpassed — pytest counts them in
+        its total. pytest's errors are inside `failures`, as they always were). A
         tally the runner did not state contributes 0 — it was not counted anywhere else
         either. None when there is nothing to add up, or no stated total to check it
         against: an UNKNOWN is not a disagreement (§2.4)."""
         if self.tests_total is None or self.failures is None or self.tests_passed is None:
             return None
         return (self.failures + self.tests_passed + (self.tests_expected_fail or 0)
-                + (self.tests_skipped or 0) + (self.tests_todo or 0))
+                + (self.tests_skipped or 0) + (self.tests_todo or 0)
+                + (self.tests_xfailed or 0) + (self.tests_xpassed or 0))
 
     @property
     def tally_note(self) -> Optional[str]:
@@ -2653,7 +2645,8 @@ class UnitSuiteRun:
             return None
         parts = [f"{self.failures} failed", f"{self.tests_passed} passed"]
         for n, label in ((self.tests_expected_fail, "expected fail"), (self.tests_skipped, "skipped"),
-                         (self.tests_todo, "todo")):
+                         (self.tests_todo, "todo"), (self.tests_xfailed, "xfailed"),
+                         (self.tests_xpassed, "xpassed")):
             if n is not None:
                 parts.append(f"{n} {label}")
         return (f"TALLY MISMATCH on {self.ref}: {' + '.join(parts)} = {s}, but the runner "
@@ -2754,8 +2747,8 @@ def _parse_unit_summary(raw: str) -> dict:
     text = _ANSI_RE.sub("", raw or "")
     out = {"runner": None, "test_files_total": None, "tests_total": None,
            "tests_passed": None, "failures": None, "tests_skipped": None,
-           "tests_todo": None, "tests_expected_fail": None, "failures_source": None,
-           "failing_files": ()}
+           "tests_todo": None, "tests_expected_fail": None, "tests_xfailed": None,
+           "tests_xpassed": None, "failures_source": None, "failing_files": ()}
 
     v = _parse_vitest_summary(text)
     if v["tests_total"] is not None or v["test_files_total"] is not None:
@@ -2803,6 +2796,9 @@ def _parse_unit_summary(raw: str) -> dict:
         out["failures"] = failed
         out["failures_source"] = "reported" if m else "derived"
         out["tests_skipped"] = tally.get("skipped") if m else None
+        # [ORCH-ADMISSION-PARSER-1] D3: the total below counts them, so the tally must too.
+        out["tests_xfailed"] = tally.get("xfailed") if m else None
+        out["tests_xpassed"] = tally.get("xpassed") if m else None
         out["tests_passed"] = passed
         out["tests_total"] = int(collected.group(1)) if collected else passed + failed + other
         progress = {_norm_test_path(f) for f in _UNIT_PYTEST_PROGRESS_RE.findall(text)}
@@ -3183,6 +3179,7 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         "tests_skipped": run.tests_skipped, "tests_todo": run.tests_todo,
         "failures_source": run.failures_source,
         "tests_expected_fail": run.tests_expected_fail,   # [ORCH-TALLY-1], additive the same way
+        "tests_xfailed": run.tests_xfailed, "tests_xpassed": run.tests_xpassed,   # [ORCH-ADMISSION-PARSER-1]
         # [CONFIG-TRUTH-1] additive: an entry without it predates GATE-CLOCK-1 and was never judged
         "clock": "plausible",
         **flaky,
@@ -3523,6 +3520,7 @@ def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
                         tests_passed=e.get("tests_passed"), failures=e.get("failures"),
                         tests_skipped=e.get("tests_skipped"), tests_todo=e.get("tests_todo"),
                         tests_expected_fail=e.get("tests_expected_fail"),
+                        tests_xfailed=e.get("tests_xfailed"), tests_xpassed=e.get("tests_xpassed"),
                         failures_source=e.get("failures_source"),
                         failing_files=tuple(e.get("failing_files") or ()))
 
@@ -3921,6 +3919,7 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
                 "failures": r.failures, "tests_skipped": r.tests_skipped,   # [ORCH-8]
                 "tests_todo": r.tests_todo, "failures_source": r.failures_source,
                 "tests_expected_fail": r.tests_expected_fail,           # [ORCH-TALLY-1]
+                "tests_xfailed": r.tests_xfailed, "tests_xpassed": r.tests_xpassed,   # [ORCH-ADMISSION-PARSER-1]
                 # [ORCH-9] AC-O9-03: the agreement check, persisted — a later reader can tell
                 # whether this entry's number reconciled without re-deriving it.
                 "tally_sum": r.tally_sum, "tally_agrees": r.tally_note is None,

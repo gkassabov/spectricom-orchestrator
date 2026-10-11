@@ -1,0 +1,29 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0
+rootdir: /tmp/p241/py
+plugins: anyio-4.12.1
+collected 8 items
+
+test_all.py ..FEsxXx                                                     [100%]
+
+==================================== ERRORS ====================================
+_________________________ ERROR at setup of test_error _________________________
+
+    @pytest.fixture
+>   def broken(): raise RuntimeError("setup")
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   RuntimeError: setup
+
+test_all.py:7: RuntimeError
+=================================== FAILURES ===================================
+__________________________________ test_fail ___________________________________
+
+>   def test_fail(): assert False
+                     ^^^^^^^^^^^^
+E   assert False
+
+test_all.py:5: AssertionError
+=========================== short test summary info ============================
+FAILED test_all.py::test_fail - assert False
+ERROR test_all.py::test_error - RuntimeError: setup
+==== 1 failed, 2 passed, 1 skipped, 2 xfailed, 1 xpassed, 1 error in 0.03s =====

@@ -753,7 +753,8 @@ class TestP7RouteWall:
     @pytest.mark.parametrize("header,env", [
         ("## TONI_TIMEOUT_MIN: 162", {}), ("## Fire mechanism: queue TONI_TIMEOUT_MIN=75", {}),
         ("## Estimated runtime: 60-100 min", {}), ("## Estimated runtime: 40 min", {}), ("", {}),
-        ("## TONI_TIMEOUT_MIN: 400", {}), ("## TONI_TIMEOUT_MIN: 162", {"TONI_TIMEOUT_MIN": "30"})])
+        ("## TONI_TIMEOUT_MIN: 400", {}), ("## TONI_TIMEOUT_MIN: 162", {"TONI_TIMEOUT_MIN": "30"}),
+        ("## Estimated runtime: 2-3 h", {})])   # [ORCH-ADMISSION-PARSER-1] P1: hours, as the route reads them
     def test_the_route_timeout_is_orchestrators_own(self, tmp_path, monkeypatch, header, env):
         monkeypatch.delenv("TONI_TIMEOUT_MIN", raising=False)
         for k, v in env.items():
@@ -821,6 +822,20 @@ class TestP7RouteWall:
         assert daemon.fired == ["122-organ-fat-1.md"]
         w = daemon.walls[0]
         assert w["seconds"] == 162 * 60 + 5100 + admission.ROUTE_WALL_SLACK_S and w["route_timeout_source"] == "brief-declared"
+        assert f"[QUEUE] ⏱ route wall {w['describe']}" in capsys.readouterr().out
+
+    def test_R_the_daemon_reads_a_runtime_line_in_hours_as_the_route_does(self, daemon, orch, monkeypatch, capsys):
+        """[ORCH-ADMISSION-PARSER-1] P1 · route 225's '2-3 h': the route runs 180 min, so the wall is built from
+        180, not from the 45-min default (8a2842c: 45 + 85 gates + 15 slack = 145 min, below the route's own)."""
+        monkeypatch.delenv("TONI_TIMEOUT_MIN", raising=False)
+        b = daemon.brief("225-provider-task-privacy-1", "clinical-mp", "## Estimated runtime: 2-3 h\n")
+        route = orchestrator.resolve_timeout(b)
+        daemon.stop_on_sleep(monkeypatch)
+        daemon.d.run_loop()
+        assert daemon.fired == ["225-provider-task-privacy-1.md"]
+        w = daemon.walls[0]
+        assert (w["route_timeout_s"] // 60, w["route_timeout_source"]) == route == (180, "brief-declared")
+        assert w["seconds"] == 180 * 60 + 5100 + admission.ROUTE_WALL_SLACK_S
         assert f"[QUEUE] ⏱ route wall {w['describe']}" in capsys.readouterr().out
 
     def test_a_persisted_timeout_seconds_is_reported_and_not_applied(self, tmp_path, monkeypatch, orch, capsys):
