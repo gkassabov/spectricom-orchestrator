@@ -210,7 +210,8 @@ def _seed(gate, sha, stdout, judged=True, **extra) -> str:
     orchestrator._unit_cache_store(gate.archive, REPO, sha, TEST_CMD, run)
     f = gate.archive / orchestrator.UNIT_BASELINE_CACHE_FILE
     data = json.loads(f.read_text())
-    key = orchestrator._unit_cache_key(REPO, sha, TEST_CMD)
+    # ORCH-GATE-COST-1 D2: the cache key is the commit's content key (its non-briefs tree), not its SHA
+    key = orchestrator._unit_cache_key(REPO, orchestrator._unit_content_key(gate.repo, sha), TEST_CMD)
     if not judged:
         data["entries"][key].pop("clock", None)
         data["entries"][key]["measured_at"] = LEGACY_AT

@@ -2040,7 +2040,8 @@ class TestOrchTally1ChangedNoGateOrSitSemantics:
         assert _def_body(now, name) == _def_body(r.stdout, name), f"{name} moved — out of scope"
 
     def test_ac_t1_09_the_cache_version_and_fast_path_switch_are_unchanged(self):
-        assert orchestrator.UNIT_BASELINE_CACHE_VERSION == 1
+        # ORCH-GATE-COST-1 D2 bumped the cache to v2 (keyed by content); ORCH-TALLY-1 left it where it found it
+        assert orchestrator.UNIT_BASELINE_CACHE_VERSION == 2
         assert orchestrator.UNIT_GATE_SKIP_BASELINE_WHEN_GREEN is True
 
 

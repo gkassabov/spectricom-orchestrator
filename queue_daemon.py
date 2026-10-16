@@ -24,11 +24,15 @@ Can also run standalone for testing:
                                                  # no daemon running; anything else is refused, exit 1
   python3 queue_daemon.py check        # boot assert B6: queued briefs whose route already merged
   python3 queue_daemon.py check-logs   # ORCH-STDOUT-1: recorded routes without a readable log
+
+  ORCH-GATE-COST-1 D4: a repo with `full_gate_nightly: "HH:MM"` in config/repos.yaml gets
+  `orchestrator.py full-gate --repo <it>` once a local day, between routes, while running and idle;
+  `status` line 1 names each repo's last full-gate result.
 """
 
 import os, re, sys, json, time, shlex, shutil, threading, subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Optional
 
 import yaml
@@ -60,7 +64,7 @@ CONTROL_ACK_WAIT_S = 15    # how long `pause` / `resume` wait for the acknowledg
 # What only the running daemon knows. A CLI process that saves state (enqueue, clear, a script's
 # reset) writes these back as it found them, never its own — it is not the daemon.
 DAEMON_OWNED_KEYS = ("daemon_status", "started_at", "current_batch", "paused_reason", "paused_at",
-                     "pid", "control_ack", "control_result", "waiting")
+                     "pid", "control_ack", "control_result", "waiting", "full_gate_nightly", "full_gate_running")
 # [ORCH-LANE-1] O2 · S7-CORE-19: 104 sat unfired behind `[QUEUE] PAUSED — max-consecutive:10`, a line in the
 # daemon log and nowhere else, until Gemma read that log. Every pause the daemon takes writes its NOTICE
 # here (reason, at, next brief, the exact resume command) and sends it to Slack when a webhook is
@@ -417,6 +421,75 @@ ROUTE_PHASES = (
 )
 
 
+# [ORCH-GATE-COST-1] D4 · S7-CORE-30 (D-S7CORE29-02): the full SIT + unit suites, nightly. A repo whose repos.yaml
+# entry says `full_gate_nightly: "HH:MM"` gets `orchestrator.py full-gate --repo <it> --trigger nightly` once per
+# local day, at or after that time, as a scheduler step BETWEEN routes — only while the daemon is running (not
+# paused) and idle (admission would admit a route now: no live route in any repo, memory above its floor). The
+# run holds that repo's fire lock (orchestrator.py takes it), so no route starts over it. A window missed while
+# paused or busy runs at the next idle moment the same day, or is logged SKIPPED when the day has ended.
+FULL_GATE_NIGHTLY_KEY = "full_gate_nightly"
+FULL_GATE_PREFIX = "full-gate-"          # orchestrator.py's FULL_GATE_PREFIX: its logs and state/full-gate-<repo>.json
+FULL_GATE_CLOCK = datetime.now           # the scheduler's local clock — bound here so tests can replace it
+FULL_GATE_WALL_S = 6 * 3600              # the daemon's backstop on one run; orchestrator.py's per-leg budgets end it first
+_HHMM_RE = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
+_said_bad_schedule = set()
+
+
+def full_gate_schedule() -> dict:
+    """{repo: (hour, minute, "HH:MM")} for each repos.yaml entry with a valid full_gate_nightly. A value that is
+    not a quoted "HH:MM" is said once and not scheduled (unquoted, YAML reads 02:30 as the integer 150)."""
+    try:
+        repos = (yaml.safe_load(REPOS_CONFIG.read_text(encoding="utf-8")) or {}).get("repos") or {}
+    except Exception:
+        return {}
+    out = {}
+    for name, r in repos.items():
+        if not isinstance(r, dict) or r.get(FULL_GATE_NIGHTLY_KEY) is None:
+            continue
+        raw = r[FULL_GATE_NIGHTLY_KEY]
+        m = _HHMM_RE.fullmatch(raw.strip()) if isinstance(raw, str) else None
+        if m:
+            out[name] = (int(m.group(1)), int(m.group(2)), m.group(0))
+        elif (name, repr(raw)) not in _said_bad_schedule:
+            _said_bad_schedule.add((name, repr(raw)))
+            print(f"[QUEUE] 🌙 full-gate {name}: {FULL_GATE_NIGHTLY_KEY}={raw!r} is not a quoted \"HH:MM\" — not scheduled")
+    return out
+
+
+def full_gate_summary() -> dict:
+    """{repo: {"outcome", "at", "sha", "trigger", "log", "nightly"}} — each state/full-gate-<repo>.json the last
+    full-gate wrote (nightly or on demand), and each scheduled repo (outcome None: never run)."""
+    out = {}
+    state_dir = ORCH_DIR / "state"
+    for f in sorted(state_dir.glob(f"{FULL_GATE_PREFIX}*.json")) if state_dir.is_dir() else []:
+        d = _read_json(f)
+        if d:
+            out[d.get("repo") or f.stem[len(FULL_GATE_PREFIX):]] = {
+                k: d.get(src) for k, src in (("outcome", "outcome"), ("at", "finished_at"), ("sha", "sha"),
+                                             ("trigger", "trigger"), ("log", "log"))}
+    for name, (_, _, hhmm) in full_gate_schedule().items():
+        out.setdefault(name, {"outcome": None})["nightly"] = hhmm
+    return out
+
+
+def full_gate_line(st: dict, summary: Optional[dict] = None) -> str:
+    """What `status` adds to line 1: `full-gate clinical-mp: PASS 2026-10-17T02:41 a1b2c3d (nightly 02:30)` per
+    repo, or `never run`, and a run the daemon has in hand. "" when no repo has a schedule or a result."""
+    summary = full_gate_summary() if summary is None else summary
+    running = st.get("full_gate_running") if isinstance(st.get("full_gate_running"), dict) else {}
+    parts = []
+    for name, s in sorted(summary.items()):
+        when = f" (nightly {s['nightly']})" if s.get("nightly") else ""
+        now = (f" — running now since {str(running.get('started_at') or '?')[:16]}"
+               if running.get("repo") == name else "")
+        if s.get("outcome"):
+            parts.append(f"full-gate {name}: {s['outcome']} {str(s.get('at') or '?')[:16]} "
+                         f"{str(s.get('sha') or '?')[:7]}{when}{now}")
+        else:
+            parts.append(f"full-gate {name}: never run{when}{now}")
+    return " | ".join(parts)
+
+
 def route_phase(log_path) -> str:
     """[ORCH-CAPACITY-1] C4: the phase (Toni / build / SIT / unit / …) a route's log last entered."""
     phase = "before Toni (pre-fire, branch, worktree)"
@@ -490,6 +563,10 @@ class QueueDaemon:
         self.waiting = None            # [ORCH-CAPACITY-1] C1: why admission holds the next brief, None when not
         self._waiting_said = None      # C1: the reason last logged — one line per change of reason
         self.persisted_timeout = None  # C4: a persisted timeout_seconds, reported at start, never applied
+        # [ORCH-GATE-COST-1] D4: per repo {"ran_day", "deferred_day", "deferred", "skipped_day", "last"} — persisted, so
+        # a restart never runs a second full gate the same day; and the run in hand, None between runs
+        self.full_gate = {}
+        self.full_gate_running = None
         self.lock = threading.Lock()
         self._ensure_dirs()
         self._load_state()
@@ -512,6 +589,8 @@ class QueueDaemon:
                 self.config.update({k: v for k, v in (data.get("config") or {}).items()
                                     if k not in EXECUTOR_KEYS and k not in ("repo", "timeout_seconds")})
                 self.consecutive_count = data.get("consecutive_count", 0)
+                fg = data.get("full_gate_nightly")
+                self.full_gate = fg if isinstance(fg, dict) else {}
                 ack = data.get("control_ack")
                 self.control_ack = ack if isinstance(ack, int) and not isinstance(ack, bool) else 0
             except Exception:
@@ -529,6 +608,8 @@ class QueueDaemon:
                 "control_ack": self.control_ack,       # P-RESUME: the last request applied
                 "control_result": self.control_result,
                 "waiting": self.waiting,               # [ORCH-CAPACITY-1] C1
+                "full_gate_nightly": self.full_gate,   # [ORCH-GATE-COST-1] D4
+                "full_gate_running": self.full_gate_running,
                 "queue": [f.name for f in self._scan_queue()],
                 "completed": self.completed[-30:],
                 "failed": self.failed[-15:],
@@ -1027,6 +1108,7 @@ class QueueDaemon:
             self._poll_control()
             self._send_pause_notice()
             if self.status == "paused":
+                self._full_gate_step()   # [ORCH-GATE-COST-1] D4: says a window missed while paused; never runs one
                 time.sleep(PAUSED_POLL_S)
                 continue
 
@@ -1034,6 +1116,9 @@ class QueueDaemon:
                 print(f"[QUEUE] Max consecutive ({self.config['max_consecutive']}) reached. Pausing.")
                 self._mark_paused(f"max-consecutive:{self.config['max_consecutive']}")
                 self._save_state()
+                continue
+
+            if self._full_gate_step():   # D4: a scheduler step between routes — never over one
                 continue
 
             queue = self._scan_queue()
@@ -1192,6 +1277,94 @@ class QueueDaemon:
         self._send_pause_notice()
         print("[QUEUE] Daemon stopped.")
 
+    def _full_gate_step(self) -> bool:
+        """[ORCH-GATE-COST-1] D4: run one nightly full gate that is due, if the daemon is running and idle. True
+        when it ran one (the loop polls the control file again before its next brief). Due: the repo's
+        `full_gate_nightly` time has passed today and no full gate ran for it today. Not running (paused) or not
+        idle (admission would refuse a route now) ⇒ deferred, said once a day per reason; it runs at the next idle
+        moment today. A day that ended with its window deferred is said SKIPPED, once."""
+        schedule = full_gate_schedule()
+        if not schedule:
+            return False
+        now = FULL_GATE_CLOCK()
+        today, changed = now.date().isoformat(), False
+        for repo, (hh, mm, hhmm) in sorted(schedule.items()):
+            rec = self.full_gate.setdefault(repo, {})
+            missed = rec.get("deferred_day")
+            if missed and missed != today and rec.get("ran_day") != missed:
+                print(f"[QUEUE] 🌙 full-gate {repo}: SKIPPED {missed} — the {hhmm} window was missed "
+                      f"({rec.get('deferred')}) and no idle moment followed that day")
+                rec.update(skipped_day=missed, skipped=rec.get("deferred"), deferred_day=None, deferred=None)
+                changed = True
+            if rec.get("ran_day") == today or now.time() < dtime(hh, mm):
+                continue
+            if self.status != "running":
+                why = f"daemon {self.status}" + (f" ({self.paused_reason})" if self.paused_reason else "")
+            else:
+                ok, adm = admission.admit(repo, f"{FULL_GATE_PREFIX}nightly", orch_dir=ORCH_DIR,
+                                          config_path=REPOS_CONFIG)
+                why = None if ok else f"busy — {adm}"
+            if why:
+                kind = why.split(" — ")[0].split(" (")[0]
+                if rec.get("deferred_day") != today or rec.get("deferred_kind") != kind:
+                    print(f"[QUEUE] 🌙 full-gate {repo}: due at {hhmm}, not run now — {why}; it runs at the next "
+                          f"idle moment today, else it is logged SKIPPED")
+                    rec.update(deferred_day=today, deferred=why, deferred_kind=kind)
+                    changed = True
+                continue
+            rec.update(ran_day=today, deferred_day=None, deferred=None, deferred_kind=None)
+            self._run_full_gate(repo, hhmm)
+            return True
+        if changed:
+            with self.lock:
+                self._save_state()
+        return False
+
+    def _run_full_gate(self, repo: str, hhmm: str) -> int:
+        """[ORCH-GATE-COST-1] D4: `orchestrator.py full-gate --repo <repo> --trigger nightly`, its stdout+stderr to
+        logs/<log_subdir>/full-gate-<ts>.log (ORCH-STDOUT-1's shape: a file, never a pipe), under FULL_GATE_WALL_S.
+        The run takes the repo's fire lock itself; the daemon records it as full_gate_running, never as a route
+        (current_batch stays empty). Returns its exit code: 0 PASS, 1 NEW FAILURES or BLOCKED, 2 refused."""
+        started = datetime.now()
+        log_path = LOG_DIR / _log_subdir(repo) / f"{FULL_GATE_PREFIX}{started:%Y%m%d-%H%M%S}.log"
+        cmd = (f"cd {shlex.quote(str(ORCH_DIR))} && unset ANTHROPIC_API_KEY && python3 -u orchestrator.py full-gate "
+               f"--repo {shlex.quote(repo)} --trigger nightly --log-file {shlex.quote(str(log_path))}")
+        with self.lock:
+            self.full_gate_running = {"repo": repo, "started_at": started.isoformat(), "log": str(log_path)}
+            self._save_state()
+        print(f"[QUEUE] 🌙 full-gate {repo}: nightly {hhmm} — running the full SIT + unit suites; log={log_path}")
+        rc, note = -2, ""
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"=== QUEUE FULL GATE ===\nRepo: {repo}\nStarted: {started.isoformat()}\nCommand: {cmd}\n"
+                         f"{'=' * 60}\n\n")
+                lf.flush()
+                proc = self.current_process = subprocess.Popen(cmd, shell=True, executable="/bin/bash",
+                                                               stdout=lf, stderr=subprocess.STDOUT)
+                try:
+                    rc = proc.wait(timeout=FULL_GATE_WALL_S)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    rc, note = -1, f" (the daemon's {FULL_GATE_WALL_S}s backstop fired)"
+                lf.write(f"\n{'=' * 60}\nFinished: {datetime.now().isoformat()}\nExit: {rc}{note}\n")
+        except Exception as e:
+            note = f" (error: {e})"
+        result = _read_json(ORCH_DIR / "state" / f"{FULL_GATE_PREFIX}{_marker_slug(repo)}.json")
+        fresh = str(result.get("started_at") or "") >= started.isoformat()[:19]
+        outcome = (result.get("outcome") if fresh and result.get("outcome") else
+                   "REFUSED" if rc == 2 else f"exit {rc}")
+        sha = str(result.get("sha") or "?")[:7] if fresh else "-"
+        with self.lock:
+            self.full_gate.setdefault(repo, {})["last"] = {"at": datetime.now().isoformat(), "exit": rc,
+                                                            "outcome": outcome, "sha": sha, "log": str(log_path)}
+            self.full_gate_running = None
+            self.current_process = None
+            self._save_state()
+        print(f"[QUEUE] 🌙 full-gate {repo}: {outcome} (exit {rc}{note}) — sha {sha}; log={log_path}")
+        return rc
+
     def _wait_for_admission(self, batch_name: str, why: str):
         """[ORCH-CAPACITY-1] C1: admission said no — nothing fired, the brief stays first in queue/, and the loop
         asks again after the cooldown. One log line per change of reason (MemAvailable moving is not a change);
@@ -1324,12 +1497,16 @@ def main(argv: list) -> int:
         # [ORCH-LANE-1] O2: a paused daemon's notice — next brief, the resume command — on line 1 too.
         st = read_persisted_state()
         notice = pause_notice_for(st)
+        # [ORCH-GATE-COST-1] D4: and each repo's last full-gate result, from state/full-gate-<repo>.json.
+        summary = full_gate_summary()
+        fg = full_gate_line(st, summary)
         if not argv[1:]:
-            print(status_line(st) + (f" | {pause_notice_line(notice)}" if notice else ""))
+            print(status_line(st) + (f" | {pause_notice_line(notice)}" if notice else "") + (f" | {fg}" if fg else ""))
         r = d.get_status()
         r.update({k: st.get(k) for k in DAEMON_OWNED_KEYS})
         r["config"] = {**r["config"], **_executor_of(st)}   # the daemon's executor, not this process's
         r["pause_notice"] = notice
+        r["full_gate"] = summary
         print(json.dumps(r, indent=2, default=str))
     elif cmd in ("pause", "resume"):
         opts = _control_args(cmd, argv[1:])

@@ -55,6 +55,31 @@ waiting = [f for f in sorted(queue.glob("*.md")) if f.is_file() and f.name != cu
 print(f"📥 QUEUED {len(waiting)} brief(s) waiting")
 if current.get("file"):
     print(f"▶️  RUNNING {current['file']} | since {current.get('started_at') or '-'}")
+
+# ORCH-GATE-COST-1 D4: the last full-gate result per repo (state/full-gate-<repo>.json, nightly or on demand),
+# each repo config/repos.yaml schedules with no result yet, and a nightly run the daemon has in hand.
+shown, running = set(), ((st or {}).get("full_gate_running") or {})
+icons = {"PASS": "✅", "NEW FAILURES": "❌", "BLOCKED": "🚧"}
+for f in sorted((orch / "state").glob("full-gate-*.json")) if (orch / "state").is_dir() else []:
+    try:
+        d = json.loads(f.read_text())
+    except (OSError, ValueError):
+        continue
+    repo = d.get("repo") or f.stem[len("full-gate-"):]
+    shown.add(repo)
+    out = d.get("outcome") or "?"
+    print(f"🌙 FULL-GATE {repo} | {icons.get(out, '⚪')} {out} | {str(d.get('finished_at') or '-')[:16]} | "
+          f"sha {str(d.get('sha') or '-')[:7]} | {d.get('trigger') or '-'}")
+try:
+    import yaml
+    repos = (yaml.safe_load((orch / "config" / "repos.yaml").read_text()) or {}).get("repos") or {}
+except Exception:
+    repos = {}
+for name, r in sorted(repos.items()):
+    if isinstance(r, dict) and r.get("full_gate_nightly") and name not in shown:
+        print(f"🌙 FULL-GATE {name} | ⚪ never run | nightly {r['full_gate_nightly']}")
+if running.get("repo"):
+    print(f"🌙 FULL-GATE {running['repo']} | running now | since {str(running.get('started_at') or '-')[:16]}")
 PY
 
 # Route — the fire lock: state/running.json mirrors the newest per-repo lock of an orchestrator fire

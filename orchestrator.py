@@ -17,6 +17,8 @@ Usage:
   python3 orchestrator.py status
   python3 orchestrator.py deps <batch-file>              ← show dependency status
   python3 orchestrator.py verify <brief-stem> [--commit <sha>]   ← one route's evidence (read-only)
+  python3 orchestrator.py full-gate --repo <name> [--ref main] [--dry-run]
+                                                         ← the FULL SIT + unit suites on <ref>; never merges
 
 Batch-level dependencies:
   Add to batch file header:  # depends_on_batches: [toni-batch-31.md, toni-batch-30.md]
@@ -28,10 +30,10 @@ Route timeout and dependency trees (brief header):
                                        (npm ci) / venv instead of linking the main checkout's (L-92)
 """
 
-import os, sys, re, time, json, shlex, signal, logging, hashlib, subprocess, argparse, tempfile
+import os, sys, re, time, json, shlex, shutil, signal, logging, hashlib, subprocess, argparse, tempfile
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Mapping, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -251,6 +253,21 @@ SIT_BATCH_PAUSE_S = 90
 SIT_LIST_CMD_KEY = "sit_list_cmd"
 SIT_BATCH_FILES_KEY = "sit_batch_files"
 SIT_BATCH_PAUSE_KEY = "sit_batch_pause_s"
+# [ORCH-GATE-COST-1] D3 (D-S7CORE29-02): per merge, a repo with `sit_list_cmd` runs the SIT files RELATED to
+# the branch's diff, not the whole suite (~25 min per merge on clinical-mp, L-150). The related set is the
+# union of (a) the files the installed vitest reports affected by the diff against the merge base — its
+# `list --changed <base>` (4.1.4: "Print only tests that are affected by the changed files"; files only, so
+# nothing is collected or run) appended to the repo's own sit_list_cmd; (b) the SIT files the branch added or
+# changed; (c) `sit_core_files` in repos.yaml (absent ⇒ none). Empty ⇒ the leg is not applicable, said so.
+# A related set that cannot be computed ⇒ the FULL suite, with the reason — never none.
+SIT_CORE_FILES_KEY = "sit_core_files"
+SIT_RELATED_ARGS = "--changed {base} --filesOnly"
+# The list command's own error banners: vitest exits 0 after "There were unhandled errors during test
+# collection", so the exit code alone cannot say the enumeration failed.
+_SIT_LIST_ERROR_RE = re.compile(r"\b(?:Collect|Startup|Unhandled) Error\b|unhandled errors during test collection"
+                                r"|Could not find Git root")
+SIT_BATCH_LEG = "sit-batch"                  # [GATE-CLOCK-1] a batch of the full suite — the history before D3
+SIT_RELATED_BATCH_LEG = "sit-batch-related"  # a related batch: 1-10 files, never judged against full batches
 # SitOutcome.error values that are an ENVIRONMENT verdict on the gate's own machinery, never
 # a verdict about the product (run_pre_merge_gates maps them to BLOCKED(environment)).
 SIT_GATE_ENV_ERRORS = ("zero-collection", "sit-list-failed", "batch-incomplete")
@@ -324,8 +341,13 @@ UNIT_CONFIRM_REF_PREFIX = "confirm"  # the ref prefix that identifies the confir
 # base, by us, from a real suite run — it is simply not re-measured for a commit that has not
 # changed. What §2.2 forbids is a baseline that was never measured for the commit in hand:
 # main's current tip, or a hand-entered figure. Neither is reachable from here.
+# [ORCH-GATE-COST-1] D2 (D-S7CORE29-02): v2 keys an entry by the CONTENT of the commit it measured — its tree
+# with briefs_subdir removed — not by the SHA. Every merge commits its brief and handback, so the next route's
+# merge base was a new SHA over an identical tree, and the baseline was re-measured (8-9 min) every route
+# (L-150). The number is still ours, measured on a commit with that exact tree. v1 entries are migrated on
+# first load (_unit_cache_load); one whose commit is unreachable is dropped, and said.
 UNIT_BASELINE_CACHE_FILE = "unit-baseline-cache.json"   # in the sit-archive dir, gitignored
-UNIT_BASELINE_CACHE_VERSION = 1
+UNIT_BASELINE_CACHE_VERSION = 2
 # §2.2: the baseline is MEASURED on the MERGE BASE — never stored, never read off main's
 # current tip. A stored number goes stale and becomes a lie; the `test_cmd` key in
 # repos.yaml that sat unconsumed through this whole incident is the cautionary precedent.
@@ -361,6 +383,16 @@ UNIT_FLAKY_QUARANTINE_THRESHOLD = 2
 GATE_DURATIONS_FILE = "gate-durations.json"
 GATE_DURATIONS_VERSION = 1
 GATE_DURATIONS_KEEP = 20   # newest plausible samples kept per (repo, leg kind); the median reads them all
+# [ORCH-GATE-COST-1] D1 (D-S7CORE29-02): a merge whose diff touches only briefs_subdir runs no build, SIT or
+# unit leg — routes 267 and 268 paid 46 and 45 min of gates for a brief and a handback (L-150). The verdict
+# names the files, at most this many, then how many more.
+BRIEFS_ONLY_NAMED_FILES = 5
+# [ORCH-GATE-COST-1] D4: `full-gate` — the FULL SIT and unit suites on a ref, nightly (the daemon, per
+# `full_gate_nightly: "HH:MM"` in repos.yaml) and on demand before a tester session. Its log is
+# logs/<log_subdir>/full-gate-<ts>.log, its result state/full-gate-<repo>.json; it never merges or pushes.
+FULL_GATE_PREFIX = "full-gate-"
+FULL_GATE_WORKTREE_PREFIX = "orch-full-gate-"
+FULL_GATE_HISTORY_KEEP = 10   # results kept in the state file; the newest with a SIT measurement is "previous"
 
 # ═══════════════════════════════════════════════════════
 # PRE-MERGE GATE POLICY (S7-CORE-4 [ORCH-1] — gate-then-merge)
@@ -1800,10 +1832,12 @@ class BuildGateOutcome:
 #   build          run_build_gate
 #   sit-run        run_sit_post_merge, when the SIT gate runs in one invocation
 #   sit-batch      _run_sit_batched, once per batch
+#   sit-batch-related  the same, for a batch of a RELATED set ([ORCH-GATE-COST-1] D3) — its own history
 #   sit-isolation  _sit_isolate, the alone re-runs after the refill pause (the pause is not measured)
 #   unit-branch    run_unit_gate, the branch leg
 #   unit-baseline  _unit_baseline_measure_or_reuse, only when MEASURED — a cache hit is not a leg;
-#                  an implausible one is re-measured once, a second leg (BASELINE-TRUST-1)
+#                  an implausible one is re-measured once, a second leg (BASELINE-TRUST-1); and
+#                  full_gate's unit leg, the same suite in the same kind of detached worktree
 #   unit-confirm   run_unit_gate, the isolation confirmation of newly-failing files
 # The verdict clause is one rule in _classify_gate_failure; the predicate is canon_assert's.
 def _leg_clocks() -> LegClocks:
@@ -2026,6 +2060,11 @@ class SitOutcome:
     isolation: Optional[SitIsolation] = None
     # [GATE-CLOCK-1] the first implausible leg of this gate (run, batch or isolation); None = all plausible.
     clock: Optional[ClockViolation] = None
+    # [ORCH-GATE-COST-1] D3: which files the per-merge leg ran — "related 2/113" or "full 113" — named in the
+    # verdict line as `sit[related 2/113 files]`; None when no selection was asked (a direct call, full-gate).
+    scope: Optional[str] = None
+    # D3: the sentence of a leg declared not applicable (no SIT file relates to the diff); nothing ran.
+    not_applicable: Optional[str] = None
 
     @property
     def files_failed(self) -> Optional[int]:
@@ -2037,9 +2076,16 @@ class SitOutcome:
     @property
     def collection(self) -> Optional[str]:
         """`7 files/18 tests, 6.6s` for FINAL STATUS / batch summary; None when nothing parsed.
-        [SIT-RATE-1] `19 files/60 tests in 2 batches, 110.2s` when the gate ran batched."""
+        [SIT-RATE-1] `19 files/60 tests in 2 batches, 110.2s` when the gate ran batched.
+        [ORCH-GATE-COST-1] D3: `sit[related 2/113 files] 2 files/5 tests in 1 batches, 21.0s` when the per-merge
+        leg selected its files, and the not-applicable sentence when it ran none."""
+        if self.not_applicable:
+            return self.not_applicable
+        mode = f"sit[{self.scope} files]" if self.scope else None
         if self.test_files_total is None and self.tests_total is None:
-            return None
+            return mode
+        if mode:
+            return f"{mode} {replace(self, scope=None).collection}"
         f = "?" if self.test_files_total is None else self.test_files_total
         t = "?" if self.tests_total is None else self.tests_total
         b = f" in {self.batches} batches" if self.batches else ""
@@ -2159,11 +2205,29 @@ class SitPlan:
     pause_s: int = SIT_BATCH_PAUSE_S
     error: Optional[str] = None
     detail: Optional[str] = None
+    tests_per_file: dict = field(default_factory=dict)   # [ORCH-GATE-COST-1] D3: a related set's expected tests
 
     @property
     def batches(self) -> list:
         n = max(1, self.batch_files)
         return [self.files[i:i + n] for i in range(0, len(self.files), n)]
+
+
+def _parse_sit_listing(text: str) -> tuple:
+    """([file, ...] in listing order, {file: tests listed}) from a list command's stdout — `file > test` per
+    line, or `file` alone (files only). Banners and blank lines are never a path."""
+    files, per_file = [], {}
+    for line in _ANSI_RE.sub("", text or "").splitlines():
+        line = line.strip()
+        if not line or " " in line.split(" > ", 1)[0]:
+            continue  # banners / blank lines are never a path
+        f = line.split(" > ", 1)[0]
+        if f not in files:
+            files.append(f)
+            per_file[f] = 0
+        if " > " in line:
+            per_file[f] += 1
+    return files, per_file
 
 
 def _sit_plan(repo_path: Path) -> Optional[SitPlan]:
@@ -2188,24 +2252,80 @@ def _sit_plan(repo_path: Path) -> Optional[SitPlan]:
     except (subprocess.TimeoutExpired, OSError) as e:
         plan.error, plan.detail = "sit-list-failed", f"{list_cmd!r}: {type(e).__name__}"
         return plan
-    text = _ANSI_RE.sub("", r.stdout or "")
-    files, tests = [], 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or " " in line.split(" > ", 1)[0]:
-            continue  # banners / blank lines are never a path
-        if " > " in line:
-            tests += 1
-        f = line.split(" > ", 1)[0]
-        if f not in files:
-            files.append(f)
+    files, per_file = _parse_sit_listing(r.stdout)
+    tests = sum(per_file.values())
     if r.returncode != 0 or not files:
         plan.error = "sit-list-failed"
         plan.detail = (f"{list_cmd!r} exit {r.returncode}, {len(files)} files enumerated: "
                        f"{((r.stderr or r.stdout or '').strip()[-300:]) or 'no output'}")
         return plan
-    plan.files, plan.tests_expected = files, (tests or None)
+    plan.files, plan.tests_expected, plan.tests_per_file = files, (tests or None), per_file
     return plan
+
+
+def _sit_config_file(list_cmd: str) -> Optional[str]:
+    """The `--config`/`-c` file a list command names, or None. vitest's own force-rerun triggers name only
+    vitest.config.* / vite.config.* / package.json, so a diff to a differently named SIT config relates no file
+    — and changes every one."""
+    try:
+        toks = shlex.split(list_cmd)
+    except ValueError:
+        return None
+    for i, t in enumerate(toks):
+        if t in ("--config", "-c") and i + 1 < len(toks):
+            return toks[i + 1]
+        if t.startswith("--config="):
+            return t.split("=", 1)[1]
+    return None
+
+
+def _sit_related_files(repo_path: Path, plan: SitPlan, diff: "BranchDiff") -> tuple:
+    """[ORCH-GATE-COST-1] D3: (files, how) — the related set, in the suite's listing order — or (None, why) when
+    it cannot be computed, which means the FULL suite, never none. An empty list is "no SIT file relates".
+
+    (a) the installed vitest's own answer, enumerated, never run: the repo's sit_list_cmd + SIT_RELATED_ARGS
+        (`--changed <merge base>`: `git diff <base>...HEAD`, staged and untracked files, followed through the
+        import graph of every SIT file). A failed or erroring enumeration is a reason, not an empty set.
+    (b) the SIT files the branch's diff itself adds or changes.
+    (c) sit_core_files from repos.yaml — a name the suite does not enumerate is said and skipped.
+    A diff that changes the SIT config named by `--config` is the full suite: no import graph reaches it."""
+    if diff is None or diff.paths is None or not diff.base:
+        return None, f"the branch's diff is unknown ({diff.error if diff else 'not computed'})"
+    list_cmd = (ACTIVE_REPO_CONFIG.get(SIT_LIST_CMD_KEY) or "").strip()
+    changed = {_norm_test_path(p) for p in diff.paths}
+    config = _sit_config_file(list_cmd)
+    if config and _norm_test_path(config) in changed:
+        return None, f"the diff changes the SIT config {config}, which no related set can see"
+    cmd = f"{list_cmd} {SIT_RELATED_ARGS.format(base=shlex.quote(diff.base))}"
+    try:
+        r = subprocess.run(_gate_shell_cmd(cmd, repo_path), shell=True, capture_output=True,
+                           text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"{cmd!r}: {type(e).__name__}"
+    said = _ANSI_RE.sub("", (r.stdout or "") + "\n" + (r.stderr or ""))
+    if r.returncode != 0 or _SIT_LIST_ERROR_RE.search(said):
+        return None, (f"{cmd!r} exit {r.returncode}: "
+                      f"{((r.stderr or r.stdout or '').strip()[-300:]) or 'no output'}")
+    listed, _ = _parse_sit_listing(r.stdout)
+    suite = set(plan.files)
+    affected = [f for f in listed if f in suite]
+    stray = [f for f in listed if f not in suite]
+    if stray:
+        log.warning(f"⚠️  SIT gate: the related enumeration names {len(stray)} file(s) the suite does not "
+                    f"enumerate — not run: {', '.join(stray[:BRIEFS_ONLY_NAMED_FILES])}")
+    touched = [f for f in plan.files if f in changed]
+    core_cfg = ACTIVE_REPO_CONFIG.get(SIT_CORE_FILES_KEY) or []
+    core_cfg = [core_cfg] if isinstance(core_cfg, str) else list(core_cfg)
+    core = [_norm_test_path(str(f)) for f in core_cfg]
+    unknown = [f for f in core if f not in suite]
+    if unknown:
+        log.warning(f"⚠️  SIT gate: {SIT_CORE_FILES_KEY} names file(s) the suite does not enumerate — "
+                    f"skipped: {', '.join(unknown)}")
+    chosen = set(affected) | set(touched) | {f for f in core if f in suite}
+    files = [f for f in plan.files if f in chosen]
+    return files, (f"{len(affected)} affected by the diff against merge-base {diff.base[:7]} "
+                   f"(--changed), {len(touched)} changed by the branch, "
+                   f"{len([f for f in core if f in suite])} core ({SIT_CORE_FILES_KEY})")
 
 
 @dataclass
@@ -2230,7 +2350,7 @@ def _add_count(agg: dict, key: str, val: Optional[int], unknown: set):
 
 
 def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
-                     archive: Optional[Path] = None) -> _SitBatchedRun:
+                     archive: Optional[Path] = None, kind: str = SIT_BATCH_LEG) -> _SitBatchedRun:
     """[SIT-RATE-1] Run `sit_cmd -- <files>` once per batch, pausing `plan.pause_s` between,
     and add the per-batch vitest summaries up. Every batch runs (no early exit, and a BATCH is
     NEVER re-run — a re-run against an unrefilled budget is dirtier than the first, measured
@@ -2238,7 +2358,9 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
     be re-measured ALONE, after the refill pause, by run_sit_post_merge (_sit_isolate) — a
     measurement, not a retry, and never of a batch. A batch that collects a different number of files
     than it was handed, or an aggregate that does not equal the enumeration, is `mismatch`:
-    the [ORCH-8] failure in a new costume, and not a verdict."""
+    the [ORCH-8] failure in a new costume, and not a verdict.
+    [ORCH-GATE-COST-1] D3: `kind` is the leg the batches are judged as — a related batch (SIT_RELATED_BATCH_LEG)
+    holds 1-10 files and is never measured against the history of full ones."""
     out = _SitBatchedRun()
     agg, unknown = {}, set()
     batches = plan.batches
@@ -2250,7 +2372,7 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
             time.sleep(plan.pause_s)
         cmd = f"{sit_cmd} -- {' '.join(shlex.quote(f) for f in files)}"
         started = time.time()
-        r, clock = _run_leg("sit-batch", archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path),
+        r, clock = _run_leg(kind, archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path),
                             shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
         out.clock = out.clock or clock
         d = time.time() - started
@@ -2388,7 +2510,8 @@ def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list,
     return iso
 
 
-def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> SitOutcome:
+def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
+                       diff: Optional["BranchDiff"] = None) -> SitOutcome:
     """Run SIT smoke tests, then apply the MANY-or-SEVERE halt rule.
 
     [ORCH-1] Name retained for its call sites (tests import it by name); since S7-CORE-4 this
@@ -2398,6 +2521,11 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
     (SIT_CRITICAL_SPECS) blocks on any 1; non-critical failures block only at SIT_MANY_THRESHOLD
     or more. Timeout / unparseable failure -> advisory (surfaced, not blocking). SitOutcome.passed
     encodes block-worthiness; the caller blocks iff not passed and SIT_BLOCKING.
+
+    [ORCH-GATE-COST-1] D3: `diff` is the per-merge gate's (run_pre_merge_gates): a batched repo then runs the
+    files RELATED to it (_sit_related_files) — batching, pauses, isolation and GATE-SIT-2 unchanged on that set —
+    or the full suite when the set cannot be computed, or declares the leg not applicable when it is empty.
+    None (a direct call, full-gate) ⇒ the whole suite, exactly as before.
     """
     if SKIP_SIT:
         log.info("⏭️  SIT skipped (--skip-sit)")
@@ -2417,12 +2545,34 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
                   f"— BLOCKED(environment), not run unbatched into the rate limit")
         _log_sit_outcome(archive, repo_path, False, -1, 0.0, None, error=plan.error, error_excerpt=plan.detail)
         return SitOutcome(passed=False, exit_code=-1, error=plan.error, detail=plan.detail, output=plan.detail or "")
+    # [ORCH-GATE-COST-1] D3: the per-merge leg runs the related set, or the full suite and says why.
+    scope, suite_n, leg = None, (len(plan.files) if plan is not None else 0), SIT_BATCH_LEG
+    if plan is not None and diff is not None:
+        related, how = _sit_related_files(repo_path, plan, diff)
+        if related is None:
+            scope = f"full {suite_n}"
+            log.warning(f"🧪 SIT gate: related set not computed — {how} — running the FULL suite "
+                        f"(sit[{scope} files])")
+        elif not related:
+            said = f"sit: no SIT file relates to this diff ({len(diff.paths)} changed files)"
+            log.info(f"🧪 SIT gate: not applicable — {said} — {how}; nothing run, PASS for this leg "
+                     f"(not zero-collection: no file was asked to run)")
+            _log_sit_outcome(archive, repo_path, True, 0, 0.0, None, scope="none", not_applicable=said)
+            return SitOutcome(passed=True, exit_code=0, not_applicable=said)
+        else:
+            plan = replace(plan, files=related,
+                           tests_expected=(sum(plan.tests_per_file.get(f, 0) for f in related) or None
+                                           if plan.tests_expected is not None else None),
+                           tests_per_file={f: plan.tests_per_file.get(f, 0) for f in related})
+            scope, leg = f"related {len(related)}/{suite_n}", SIT_RELATED_BATCH_LEG
+            log.info(f"🧪 SIT gate: sit[{scope} files] — {how}")
     if plan is None:
         log.info(f"🧪 Running SIT post-merge: {sit_cmd}")
     else:
         log.info(f"🧪 Running SIT post-merge: {sit_cmd} — {len(plan.files)} files"
                  f"{'' if plan.tests_expected is None else f' / {plan.tests_expected} tests'} enumerated, "
-                 f"in {len(plan.batches)} batches of ≤{plan.batch_files} files, {plan.pause_s}s pause between")
+                 f"in {len(plan.batches)} batches of ≤{plan.batch_files} files, {plan.pause_s}s pause between"
+                 + (f" — sit[{scope} files]" if scope else ""))
     started = time.time()
     batch_mismatch: Optional[str] = None
     batches: Optional[int] = None
@@ -2437,7 +2587,7 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
             raw = (r.stdout or "") + "\n" + (r.stderr or "")
             counts, tallies = _parse_vitest_summary(raw), _parse_vitest_tallies(raw)
         else:
-            b = _run_sit_batched(sit_cmd, repo_path, plan, archive)
+            b = _run_sit_batched(sit_cmd, repo_path, plan, archive, kind=leg)
             r = subprocess.CompletedProcess(sit_cmd, b.returncode, stdout=b.stdout, stderr=b.stderr)
             raw = b.red_output or (b.stdout + "\n" + b.stderr)
             counts, tallies, batches, batch_mismatch = b.counts, b.tallies, b.batches, b.mismatch
@@ -2487,7 +2637,9 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
             log.error(f"⛔ SIT gate collected NOTHING — treating as BLOCKED(environment), not PASS "
                       f"(exit 0, {collection}, {duration:.1f}s)")
         elif passed:
-            recon = "" if plan is None else f" (equals the enumerated suite: {len(plan.files)} files" + \
+            whole = (f"the enumerated related set: {len(plan.files)} of {suite_n} files" if leg == SIT_RELATED_BATCH_LEG
+                     else f"the enumerated suite: {len(plan.files)} files") if plan is not None else ""
+            recon = "" if plan is None else f" (equals {whole}" + \
                     ("" if plan.tests_expected is None else f" / {plan.tests_expected} tests") + ")"
             log.info(f"🧪 SIT gate: PASS — {collection}{recon} in {duration:.1f}s")
         else:
@@ -2526,24 +2678,24 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None) -> 
         _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path,
                          error=error, error_excerpt=error_excerpt, tests_failed=tests_failed,
                          batches=batches, isolation=None if isolation is None else isolation.as_log(),
-                         **counts)
+                         scope=scope, **counts)
 
         return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration,
                           error=error, detail=detail, output="" if passed else raw[-20000:],
                           tests_failed=tests_failed, tests_skipped=tallies.get("skipped"),
-                          batches=batches, isolation=isolation, clock=clock, **counts)
+                          batches=batches, isolation=isolation, clock=clock, scope=scope, **counts)
 
     except subprocess.TimeoutExpired:
         duration = time.time() - started
         log.error(f"🟠 SIT TIMEOUT after {duration:.1f}s — ADVISORY (not blocking); surfacing for review.")
-        _log_sit_outcome(archive, repo_path, True, -1, duration, None, error="timeout-advisory")
-        return SitOutcome(passed=True, exit_code=-1, error="timeout-advisory", duration_s=duration)
+        _log_sit_outcome(archive, repo_path, True, -1, duration, None, error="timeout-advisory", scope=scope)
+        return SitOutcome(passed=True, exit_code=-1, error="timeout-advisory", duration_s=duration, scope=scope)
     except Exception as e:
         duration = time.time() - started
         log.warning(f"⚠️  SIT ERROR: {e} — advisory only")
-        _log_sit_outcome(archive, repo_path, False, -1, duration, None, error=str(e))
+        _log_sit_outcome(archive, repo_path, False, -1, duration, None, error=str(e), scope=scope)
         return SitOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e),
-                          clock=getattr(e, "gate_clock", None))
+                          clock=getattr(e, "gate_clock", None), scope=scope)
 
 
 # ═══════════════════════════════════════════════════════
@@ -3096,6 +3248,9 @@ def _unit_confirm_new_files(repo_path: Path, test_cmd: str, ref_label: str,
 # enough — the same commit measured with a DIFFERENT command is a different measurement, and
 # reusing it would be exactly the stale-number lie §2.2 warns about. Change `test_cmd` in
 # repos.yaml and every entry for it is a miss, which is correct.
+# [ORCH-GATE-COST-1] D2: (repo, merge-base CONTENT KEY, test_cmd) since cache v2 — the content key is the
+# commit's tree without briefs_subdir (_unit_content_key), so a merge base that differs from a measured commit
+# only by briefs and handbacks hits; any other difference misses. Each entry keeps the `sha` it was measured at.
 def _unit_is_measurement(run: Optional[UnitSuiteRun]) -> bool:
     """Did this run yield a measurement at all? The [ORCH-3] predicate, unchanged and now
     named: an error (timeout, worktree failure) or a demonstrably EMPTY collection is not a
@@ -3118,7 +3273,112 @@ def _unit_cache_file(archive: Path) -> Path:
     return archive / UNIT_BASELINE_CACHE_FILE
 
 
-def _unit_cache_load(archive: Path) -> dict:
+def _under_subdir(path: str, subdir: str) -> bool:
+    """[ORCH-GATE-COST-1] D1/D2: `path` (repo-relative) is `subdir` or lies under it. An empty subdir holds
+    nothing."""
+    sub = str(subdir or "").strip().strip("/")
+    p = str(path or "").strip()
+    return bool(sub) and (p == sub or p.startswith(sub + "/"))
+
+
+def _active_briefs_subdir() -> str:
+    """The active repo's briefs_subdir (config/repos.yaml), `briefs` when it names none."""
+    return str(ACTIVE_REPO_CONFIG.get("briefs_subdir") or "briefs").strip().strip("/")
+
+
+def _unit_cache_repo() -> Optional[Path]:
+    """The active repo's checkout (repos.yaml project_dir) — where a cache call that names no repo_path reads
+    a commit's tree. None when the active repo names none."""
+    pd = ACTIVE_REPO_CONFIG.get("project_dir")
+    return Path(pd).expanduser() if pd else None
+
+
+def _unit_content_key(repo_path: Optional[Path], sha: Optional[str],
+                      briefs_subdir: Optional[str] = None) -> Optional[str]:
+    """[ORCH-GATE-COST-1] D2: the CONTENT key of commit `sha` — sha256 over `git ls-tree -r <sha>` with every
+    entry under briefs_subdir removed (each kept entry is mode, type, object and path). Two commits whose trees
+    differ only under briefs/ share it; a difference anywhere else — a blob, a mode, a path added, removed or
+    renamed — does not. None when `sha` is not a commit readable in `repo_path`: no key is guessed."""
+    if not repo_path or not sha:
+        return None
+    sub = _active_briefs_subdir() if briefs_subdir is None else briefs_subdir
+    try:
+        r = subprocess.run(["git", "-C", str(repo_path), "ls-tree", "-r", "-z", "--full-tree", f"{sha}^{{commit}}"],
+                           capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    kept = [e for e in r.stdout.split(b"\0")
+            if e and not _under_subdir(e.split(b"\t", 1)[-1].decode("utf-8", "surrogateescape"), sub)]
+    return hashlib.sha256(b"\0".join(kept)).hexdigest()[:32]
+
+
+def _unit_cache_twins(a: Optional[dict], b: dict) -> dict:
+    """[ORCH-GATE-COST-1] D2: two v1 entries whose commits share a content key become ONE v2 entry — the judged
+    one, else the newer measurement — carrying both entries' [ORCH-6/7] flaky tallies (they are about files)."""
+    if not isinstance(a, dict):
+        return b
+    keep, other = sorted((a, b), key=lambda e: (_unit_cache_judged(e), str(e.get("measured_at") or "")))[::-1]
+    keep = dict(keep)
+    files = sorted(set(keep.get("flaky_files") or ()) | set(other.get("flaky_files") or ()))
+    seen = {f: dict(v) for f, v in (keep.get("flaky_seen") or {}).items() if isinstance(v, dict)}
+    for f, v in (other.get("flaky_seen") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        mine = seen.setdefault(f, {"count": 0, "last_seen": None})
+        mine["count"] = (mine.get("count") or 0) + (v.get("count") or 0)
+        mine["last_seen"] = max(filter(None, (mine.get("last_seen"), v.get("last_seen"))), default=None)
+    if files:
+        keep["flaky_files"] = files
+    if seen:
+        keep["flaky_seen"] = seen
+    return keep
+
+
+def _unit_cache_migrate_v1(entries: dict) -> dict:
+    """[ORCH-GATE-COST-1] D2: v1 entries (keyed by SHA) → v2 (keyed by content key), each content key computed
+    from the entry's own `sha` in its own repo's checkout (repos.yaml project_dir and briefs_subdir). An entry
+    whose commit is unreachable there — or whose repo repos.yaml does not name — is dropped, one line each."""
+    try:
+        repos = load_repo_config()["repos"]
+    except Exception as e:
+        log.warning(f"⚠️  Unit baseline cache v1 → v2: repo config unreadable ({e}) — no entry can be keyed")
+        repos = {}
+    out, dropped, twins = {}, 0, 0
+    for old, e in entries.items():
+        if not isinstance(e, dict):
+            continue
+        name, sha, cmd = e.get("repo"), e.get("sha"), e.get("test_cmd")
+        cfg = repos.get(name) if isinstance(repos.get(name), dict) else {}
+        root = Path(cfg["project_dir"]).expanduser() if cfg.get("project_dir") else None
+        ck = _unit_content_key(root, sha, str(cfg.get("briefs_subdir") or "briefs")) if cmd else None
+        if not ck:
+            where = f"in {root}" if root else f"(repo {name!r} is not in {REPOS_CONFIG_PATH.name})"
+            log.warning(f"♻️  Unit baseline cache v1 → v2: entry {old} dropped — commit {str(sha)[:7]} is "
+                        f"unreachable {where}")
+            dropped += 1
+            continue
+        key = _unit_cache_key(name, ck, cmd)
+        twins += key in out
+        out[key] = _unit_cache_twins(out.get(key), dict(e, content_key=ck))
+    log.info(f"♻️  Unit baseline cache migrated v1 → v2: {len(out)} entr{'y' if len(out) == 1 else 'ies'} keyed by "
+             f"content (non-briefs tree), {twins} merged into a content twin, {dropped} dropped")
+    return out
+
+
+def _unit_cache_write(archive: Path, entries: dict, what: str):
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+        _unit_cache_file(archive).write_text(
+            json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
+    except OSError as e:
+        log.warning(f"⚠️  Unit baseline cache: {what} not written ({e})")
+
+
+def _unit_cache_load(archive: Path, persist: bool = True) -> dict:
+    """The cache's entries. A v1 file is migrated to v2 (D2) — written back when `persist`, so it happens once;
+    a read-only reader (the `flaky` report) passes persist=False and writes nothing."""
     f = _unit_cache_file(archive)
     if not f.exists():
         return {}
@@ -3127,30 +3387,45 @@ def _unit_cache_load(archive: Path) -> dict:
     except (json.JSONDecodeError, IOError, OSError):
         log.warning(f"⚠️  Unit baseline cache unreadable at {f} — treated as empty (it will be rewritten)")
         return {}
+    if isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("entries"), dict):
+        entries = _unit_cache_migrate_v1(data["entries"])
+        if persist:
+            _unit_cache_write(archive, entries, "the v2 migration")
+        return entries
     if not isinstance(data, dict) or data.get("version") != UNIT_BASELINE_CACHE_VERSION:
         return {}
     entries = data.get("entries")
     return entries if isinstance(entries, dict) else {}
 
 
-def _unit_cache_key(repo_name: str, sha: str, cmd: str) -> str:
-    return f"{repo_name}@{sha}@{hashlib.md5(cmd.encode()).hexdigest()[:8]}"
+def _unit_cache_key(repo_name: str, content_key: str, cmd: str) -> str:
+    """[ORCH-GATE-COST-1] D2: repo, CONTENT key (no longer the SHA), test_cmd."""
+    return f"{repo_name}@{content_key}@{hashlib.md5(cmd.encode()).hexdigest()[:8]}"
 
 
-def _unit_cache_entry_matches(e: dict, repo_name: str, sha: str, cmd: str) -> bool:
-    """AC-O5-02: an entry is usable only for the SHA, repo and command it was measured under.
+def _unit_cache_entry_matches(e: dict, repo_name: str, content_key: str, cmd: str) -> bool:
+    """AC-O5-02: an entry is usable only for the tree, repo and command it was measured under —
+    [ORCH-GATE-COST-1] D2: the tree is its content key (briefs aside), no longer its SHA alone.
     Checked on the entry itself, not just on the key, so a hand-edited or renamed key cannot
-    smuggle a measurement onto the wrong commit."""
-    return (isinstance(e, dict) and e.get("sha") == sha
+    smuggle a measurement onto the wrong tree."""
+    return (isinstance(e, dict) and bool(content_key) and e.get("content_key") == content_key
             and e.get("repo") == repo_name and e.get("test_cmd") == cmd)
 
 
-def _unit_cache_lookup(archive: Path, repo_name: str, sha: str, cmd: str) -> Optional[dict]:
-    e = _unit_cache_load(archive).get(_unit_cache_key(repo_name, sha, cmd))
-    return e if _unit_cache_entry_matches(e, repo_name, sha, cmd) else None
+def _unit_cache_lookup(archive: Path, repo_name: str, sha: str, cmd: str, repo_path: Optional[Path] = None,
+                       content_key: Optional[str] = None, persist: bool = True) -> Optional[dict]:
+    """The entry for `sha`'s non-briefs tree (D2), measured at `sha` or at any commit with that tree; None when
+    there is none — or when `sha`'s content key cannot be read (repo_path, else the active repo's checkout).
+    persist=False: a reader that writes nothing (full-gate --dry-run) — a v1 file is migrated in memory only."""
+    ck = content_key or _unit_content_key(repo_path or _unit_cache_repo(), sha)
+    if not ck:
+        return None
+    e = _unit_cache_load(archive, persist=persist).get(_unit_cache_key(repo_name, ck, cmd))
+    return e if _unit_cache_entry_matches(e, repo_name, ck, cmd) else None
 
 
-def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: UnitSuiteRun):
+def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: UnitSuiteRun,
+                      repo_path: Optional[Path] = None, content_key: Optional[str] = None):
     """Persist a MEASURED baseline. AC-O5-02: files, tests, failures, duration and the SHA.
     The suite output is deliberately NOT stored — it is only ever used to F-20-classify the
     BRANCH leg, and keeping 20KB per commit forever buys nothing.
@@ -3158,17 +3433,25 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
     [CONFIG-TRUTH-1] only a leg judged plausible reaches this (BASELINE-TRUST-1 returns first on an
     implausible one), and the entry says so: `clock: "plausible"`. Storing supersedes an unjudged
     entry at the same key; that entry's [ORCH-6/7] flaky tally is about files, not about this
-    measurement, so it is carried forward."""
+    measurement, so it is carried forward.
+
+    [ORCH-GATE-COST-1] D2: keyed by `sha`'s content key, which the entry records beside `sha` (the commit
+    actually measured). A content key that cannot be read leaves the measurement uncached, said."""
     if run.clock is not None:
         return   # BASELINE-TRUST-1: never cached — the field below would be false
+    ck = content_key or _unit_content_key(repo_path or _unit_cache_repo(), sha)
+    if not ck:
+        log.warning(f"⚠️  Unit baseline at {sha[:7]} NOT cached — its content key could not be read "
+                    f"(git ls-tree {sha[:7]}); the next route off this tree re-measures")
+        return
     archive.mkdir(parents=True, exist_ok=True)
     entries = _unit_cache_load(archive)
-    key = _unit_cache_key(repo_name, sha, cmd)
+    key = _unit_cache_key(repo_name, ck, cmd)
     prior = entries.get(key)
     flaky = ({k: prior[k] for k in ("flaky_files", "flaky_seen") if k in prior}
-             if _unit_cache_entry_matches(prior, repo_name, sha, cmd) else {})
+             if _unit_cache_entry_matches(prior, repo_name, ck, cmd) else {})
     entries[key] = {
-        "sha": sha, "repo": repo_name, "test_cmd": cmd,
+        "sha": sha, "content_key": ck, "repo": repo_name, "test_cmd": cmd,
         "measured_at": datetime.now().isoformat(),
         "ref": run.ref, "exit_code": run.exit_code, "duration_s": round(run.duration_s, 2),
         "runner": run.runner, "test_files_total": run.test_files_total,
@@ -3184,11 +3467,7 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         "clock": "plausible",
         **flaky,
     }
-    try:
-        _unit_cache_file(archive).write_text(
-            json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
-    except OSError as e:
-        log.warning(f"⚠️  Unit baseline cache not written ({e}) — the next route will re-measure")
+    _unit_cache_write(archive, entries, "the baseline (the next route will re-measure)")
 
 
 def _unit_cache_judged(e: dict) -> bool:
@@ -3197,7 +3476,8 @@ def _unit_cache_judged(e: dict) -> bool:
     return e.get("clock") == "plausible"
 
 
-def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str, flakes: tuple):
+def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str, flakes: tuple,
+                              repo_path: Optional[Path] = None):
     """[ORCH-6] AC-O6-06: union `flakes` into the ADDITIVE `flaky_files` field on the cached
     baseline entry for `sha` — every existing field (brief §4 STOP trigger 3) is untouched.
     Two routes off the same base naming the same file is exactly the recurrence signal the
@@ -3206,13 +3486,18 @@ def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str,
 
     [ORCH-7] AC-O7-02: also accumulates a per-file `flaky_seen` count and last-seen
     timestamp, ADDITIVE alongside `flaky_files` — a second, ADDITIVE field, not a
-    replacement for it. Entries written before this existed simply lack `flaky_seen`."""
+    replacement for it. Entries written before this existed simply lack `flaky_seen`.
+
+    [ORCH-GATE-COST-1] D2: the entry is `sha`'s content key's — the one a content hit read."""
     if not flakes:
         return
+    ck = _unit_content_key(repo_path or _unit_cache_repo(), sha)
+    if not ck:
+        return
     entries = _unit_cache_load(archive)
-    key = _unit_cache_key(repo_name, sha, cmd)
+    key = _unit_cache_key(repo_name, ck, cmd)
     entry = entries.get(key)
-    if not _unit_cache_entry_matches(entry, repo_name, sha, cmd):
+    if not _unit_cache_entry_matches(entry, repo_name, ck, cmd):
         return
     entry["flaky_files"] = sorted(set(entry.get("flaky_files") or ()) | set(flakes))
     now = datetime.now().isoformat()
@@ -3221,11 +3506,7 @@ def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str,
         prior = seen.get(f) or {}
         seen[f] = {"count": prior.get("count", 0) + 1, "last_seen": now}
     entry["flaky_seen"] = seen
-    try:
-        _unit_cache_file(archive).write_text(
-            json.dumps({"version": UNIT_BASELINE_CACHE_VERSION, "entries": entries}, indent=2))
-    except OSError as e:
-        log.warning(f"⚠️  Unit gate: flaky-file set not persisted ({e})")
+    _unit_cache_write(archive, entries, "the flaky-file set")
 
 
 def _flaky_collect(archive: Path, repo_filter: str = "") -> dict:
@@ -3234,7 +3515,7 @@ def _flaky_collect(archive: Path, repo_filter: str = "") -> dict:
     shape) still contributes its files, with `count`/`last_seen` left None — read without
     error rather than crashing (AC-O7-02)."""
     report: dict = {}
-    for entry in _unit_cache_load(archive).values():
+    for entry in _unit_cache_load(archive, persist=False).values():
         if not isinstance(entry, dict):
             continue
         repo_name = entry.get("repo")
@@ -3587,19 +3868,31 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
     line per call (P-SAY).
 
     [CONFIG-TRUTH-1] a cached entry is a hit only if its clock was judged (`clock: "plausible"`). One
-    that predates GATE-CLOCK-1 is a miss: measured again, and a plausible leg overwrites it."""
-    hit = _unit_cache_lookup(archive, repo_name, base_sha, cmd)
+    that predates GATE-CLOCK-1 is a miss: measured again, and a plausible leg overwrites it.
+
+    [ORCH-GATE-COST-1] D2: the lookup is by `base_sha`'s CONTENT key — a hit may have been measured at another
+    commit whose tree differs only under briefs_subdir, and the note names both commits."""
+    ck = _unit_content_key(repo_path, base_sha)
+    if ck is None:
+        log.warning(f"♻️  Unit baseline: the content key of {base_sha[:7]} could not be read (git ls-tree) — "
+                    f"no cache lookup; measuring")
+    hit = _unit_cache_lookup(archive, repo_name, base_sha, cmd, content_key=ck) if ck else None
     if hit and not _unit_cache_judged(hit):
         log.info(f"♻️  Unit baseline: cached entry at {base_sha[:7]} predates GATE-CLOCK-1 (clock never "
                  f"judged) — re-measuring")
         hit = None
     if hit:
-        run = _unit_run_from_cache(hit, f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]}")
+        at = str(hit.get("sha") or "?")
+        same = at == base_sha
+        run = _unit_run_from_cache(hit, f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]}"
+                                        + ("" if same else f" (measured at {at[:7]})"))
         measured_at = hit.get("measured_at", "?")[:19]
-        note = (f"read from cache — measured {measured_at} at "
-                f"{base_sha[:7]}, {run.collection or 'collection unknown'} in {run.duration_s:.1f}s; "
-                f"not re-run (the baseline for a commit does not change)")
-        log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} — {run.collection}; no baseline run")
+        note = (f"read from cache — cache hit by content: measured at {at[:7]}, merge base {base_sha[:7]}, "
+                f"non-briefs tree identical (measured {measured_at}, "
+                f"{run.collection or 'collection unknown'} in {run.duration_s:.1f}s); "
+                f"not re-run (the baseline for a tree does not change)")
+        log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} by content (measured at {at[:7]}, non-briefs tree "
+                 f"identical) — {run.collection}; no baseline run")
         log.info(f'🛡 baseline-trust: CLEAN — cache hit at {base_sha[:7]}, measured {measured_at} on a clock '
                  f'judged plausible (cache entry "clock": "{hit["clock"]}")')
         return run, "cache", note
@@ -3634,8 +3927,9 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
         again = f" — re-measured once, the first leg was implausible ({first.clock})"
     log.info(f"🛡 baseline-trust: CLEAN — unit-baseline at {base_sha[:7]} {trust}")
     if _unit_is_cacheable(run):
-        _unit_cache_store(archive, repo_name, base_sha, cmd, run)
-        return run, "measured", f"measured now at {base_sha[:7]} and cached for later routes off this base{again}"
+        _unit_cache_store(archive, repo_name, base_sha, cmd, run, repo_path=repo_path, content_key=ck)
+        return run, "measured", (f"measured now at {base_sha[:7]} and cached for later routes off this "
+                                 f"tree (briefs aside){again}")
     if _unit_is_measurement(run):
         # It ran and collected something, but the summary gave no failure count. That is the
         # [ORCH-3] `comparison-unavailable` path — let it reach its own verdict, uncached.
@@ -3836,7 +4130,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                  f"flake: {', '.join(flakes) or '(none)'}; regression: {', '.join(regressions) or '(none)'}")
         if flakes and baseline_source in ("cache", "measured"):
             _unit_cache_record_flakes(archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME, base_sha,
-                                      test_cmd, flakes)
+                                      test_cmd, flakes, repo_path=repo_path)
 
     if regressions:
         # AC-O6b-01/02: a regression is a named file confirmed still failing in isolation that
@@ -4089,6 +4383,49 @@ def sit_verdict_violations(so: SitOutcome, v: GateVerdict) -> list[str]:
     return out
 
 
+# ── [ORCH-GATE-COST-1] D1 · what a merge would bring in (D-S7CORE29-02) ─────────────────────────────────
+@dataclass
+class BranchDiff:
+    """The paths a route branch changes against its merge base — exactly what its merge brings in."""
+    base: Optional[str] = None      # the merge base (_unit_merge_base)
+    tip: Optional[str] = None       # the branch ref diffed, or HEAD when the branch is not resolvable here
+    paths: Optional[tuple] = None   # None ⇒ not computed (`error` says why); () ⇒ an empty diff
+    error: Optional[str] = None
+
+
+def branch_changed_paths(repo_path: Path, base_sha: str, branch: Optional[str]) -> Optional[tuple]:
+    """[ORCH-GATE-COST-1] D1: `git diff --name-only <base>...<branch>` — every path the branch adds, changes or
+    deletes against `base_sha`, in git's order; () for an empty diff; None when git cannot say.
+    `--no-renames`: a rename is both of its paths, so `docs/x.md → briefs/x.md` names docs/x.md too and is
+    never briefs-only. `-z`: a path is read as git stores it, never as core.quotePath escapes it."""
+    try:
+        r = subprocess.run(["git", "-C", str(repo_path), "diff", "--name-only", "--no-renames", "-z",
+                            f"{base_sha}...{branch or 'HEAD'}"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return tuple(p for p in r.stdout.split("\0") if p)
+
+
+def _branch_diff(repo_path: Path, branch_name: Optional[str]) -> BranchDiff:
+    """The branch's diff against its merge base, for the gate: D1 decides briefs-only on it, D3 relates the SIT
+    files to it. The base and tip are the unit gate's own (_unit_merge_base: the branch, else HEAD)."""
+    if not _is_git_work_tree(repo_path):
+        return BranchDiff(error=f"{repo_path} is not a git work tree")
+    tip = "HEAD"
+    if branch_name and subprocess.run(["git", "-C", str(repo_path), "rev-parse", "--verify", "-q",
+                                       f"{branch_name}^{{commit}}"], capture_output=True).returncode == 0:
+        tip = branch_name
+    base = _unit_merge_base(repo_path, branch_name)
+    if not base:
+        return BranchDiff(tip=tip, error=f"merge-base {MERGE_TARGET}..{tip} not resolvable in {repo_path}")
+    paths = branch_changed_paths(repo_path, base, tip)
+    if paths is None:
+        return BranchDiff(base=base, tip=tip, error=f"git diff {base[:7]}...{tip} failed in {repo_path}")
+    return BranchDiff(base=base, tip=tip, paths=paths)
+
+
 def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> GateVerdict:
     """Run the repo's PRE_MERGE_GATES on the route branch checked out at repo_path, BEFORE any
     merge, then the S7-CORE-8 [ORCH-3] unit baseline gate. Returns a three-way GateVerdict:
@@ -4097,9 +4434,30 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
     [ORCH-3]'s DISABLE_UNIT_GATE) are honoured inside the gate functions, unchanged.
 
     Order is build → SIT → unit: cheapest signal first, the slowest suite last and only if
-    the others were green."""
+    the others were green.
+
+    [ORCH-GATE-COST-1] D1: a branch whose every changed path is under briefs_subdir is PASS with no leg run,
+    and the verdict says so — on every caller (the route lane, a route worktree, the meta-fire lane whose verdict
+    _self_mod_auto_merge consumes, a parallel worker). An empty diff is not briefs-only; a diff that cannot be
+    computed is not briefs-only. D3: the SIT leg is handed the same diff."""
     policy = PRE_MERGE_GATES.get(ACTIVE_REPO_NAME)
     where = f" on {branch_name}" if branch_name else ""
+    diff = _branch_diff(repo_path, branch_name)
+    briefs = _active_briefs_subdir()
+    if diff.paths and all(_under_subdir(p, briefs) for p in diff.paths):
+        n, k = len(diff.paths), BRIEFS_ONLY_NAMED_FILES
+        named = ", ".join(diff.paths[:k]) + (f", … +{n - k} more" if n > k else "")
+        reason = f"briefs-only diff ({n} files: {named}) — build/SIT/unit not run (D-S7CORE29-02)"
+        # the reason rides in `collection` too, so FINAL STATUS and notify() say which legs did not run
+        v = GateVerdict(GateOutcome.PASS, None, None, reason, collection=reason)
+        log.info(f"✅ Pre-merge gate{where}: {v.label}")
+        return v
+    if diff.paths is not None:
+        log.info(f"🧾 Pre-merge gate{where}: {len(diff.paths)} file(s) changed against merge-base {diff.base[:7]}"
+                 f" — not briefs-only ({briefs}/); the gates run")
+    elif diff.base or not diff.error.endswith("is not a git work tree"):
+        log.info(f"🧾 Pre-merge gate{where}: the branch's diff could not be computed ({diff.error}) — not "
+                 f"briefs-only; the gates run")
     gates = tuple(policy["gates"]) if policy and policy.get("gates") else ()
     if not gates:
         log.info(f"🚪 Pre-merge gate{where}: repo '{ACTIVE_REPO_NAME}' is UNGATED by PRE_MERGE_GATES (explicit) — merge proceeds")
@@ -4114,6 +4472,7 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
             return v
 
     sit_collection: Optional[str] = None  # [ORCH-2]
+    sit_na: Optional[str] = None          # [ORCH-GATE-COST-1] D3: the SIT leg was not applicable, and why
     for gate in gates:
         if gate == "build":
             bg = run_build_gate(repo_path)
@@ -4126,8 +4485,9 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                 log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                 return v
         elif gate == "sit":
-            so = run_sit_post_merge(repo_path)
+            so = run_sit_post_merge(repo_path, diff=diff)
             sit_collection = so.collection
+            sit_na = so.not_applicable
             if not so.passed:
                 if SIT_BLOCKING:
                     if so.error == "zero-collection":
@@ -4183,10 +4543,13 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
         log.error(f"⛔ Pre-merge gate{where}: {v.label}")
         return v
 
-    ran = list(gates) + ([] if uo.signal in ("ungated", "disabled", "not-applicable") else ["unit"])
+    ran = [g for g in gates if not (g == "sit" and sit_na)] + (
+        [] if uo.signal in ("ungated", "disabled", "not-applicable") else ["unit"])
     reason = f"{'+'.join(ran)} green{where}" if ran else f"{ACTIVE_REPO_NAME}: ungated by policy"
     if uo.signal == "ungated" and ran:
         reason += f" (unit: {uo.detail})"
+    if sit_na:
+        reason += f"; {sit_na}"
     v = GateVerdict(GateOutcome.PASS, None, None, reason,
                     collection=sit_collection, unit_collection=unit_collection)
     log.info(f"✅ Pre-merge gate{where}: {v.label}")
@@ -4199,12 +4562,15 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
                      test_files_total: Optional[int] = None, test_files_passed: Optional[int] = None,
                      tests_total: Optional[int] = None, tests_passed: Optional[int] = None,
                      tests_failed: Optional[int] = None, batches: Optional[int] = None,
-                     isolation: Optional[dict] = None):
+                     isolation: Optional[dict] = None, scope: Optional[str] = None,
+                     not_applicable: Optional[str] = None):
     """Append SIT outcome to orchestrator-sit-log.json. [ORCH-2] carries the four collection
     counts (null when the summary did not parse) so "was the gate ever thin?" is answerable
     historically. Old-shape entries without them still load.
     [GATE-SIT-2] `isolation` (SitIsolation.as_log()) is written only when the leg was owed;
-    entries without the key are runs where it was not."""
+    entries without the key are runs where it was not.
+    [ORCH-GATE-COST-1] D3: `scope` ("related 2/113" | "full 113" | "none") and, for a leg declared not
+    applicable, its sentence — written only when the per-merge leg selected its files."""
     log_file = archive / "orchestrator-sit-log.json"
     entries = []
     if log_file.exists():
@@ -4232,6 +4598,10 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
         entry["error_excerpt"] = error_excerpt
     if isolation is not None:
         entry["isolation"] = isolation
+    if scope is not None:
+        entry["scope"] = scope
+    if not_applicable is not None:
+        entry["not_applicable"] = not_applicable
     entries.append(entry)
     log_file.write_text(json.dumps(entries, indent=2))
 
@@ -4256,6 +4626,9 @@ def sit_report_aggregate(since: Optional[str] = None):
     total = len(entries)
     passed = sum(1 for e in entries if e["passed"])
     failed = total - passed
+    # [ORCH-GATE-COST-1] D3: a per-merge leg ran a related set, the full suite, or nothing (not applicable)
+    not_applicable = sum(1 for e in entries if e.get("not_applicable"))
+    related = sum(1 for e in entries if str(e.get("scope") or "").startswith("related"))
 
     print(f"\n{'═'*60}")
     print(f"SIT REPORT AGGREGATE (since {since or 'all time'})")
@@ -4263,14 +4636,335 @@ def sit_report_aggregate(since: Optional[str] = None):
     print(f"  Total runs:  {total}")
     print(f"  Passed:      {passed} ({100*passed/total:.0f}%)")
     print(f"  Failed:      {failed} ({100*failed/total:.0f}%)")
+    if related or not_applicable:
+        print(f"  Per-merge related runs: {related}; not applicable (no SIT file related to the diff): {not_applicable}")
     avg_dur = sum(e.get("duration_s", 0) for e in entries) / total
     print(f"  Avg duration: {avg_dur:.1f}s")
     print(f"\n  Recent entries:")
     for e in entries[-10:]:
         status = "✅" if e["passed"] else "❌"
         err = f" ({e['error']})" if e.get("error") else ""
-        print(f"    {status} {e['timestamp'][:19]} — {e.get('duration_s', 0):.1f}s{err}")
+        scope = (f" — {e['not_applicable']}" if e.get("not_applicable")
+                 else f" — sit[{e['scope']} files]" if e.get("scope") else "")
+        print(f"    {status} {e['timestamp'][:19]} — {e.get('duration_s', 0):.1f}s{err}{scope}")
     print(f"{'═'*60}\n")
+
+
+# ═══════════════════════════════════════════════════════
+# FULL GATE (S7-CORE-30 [ORCH-GATE-COST-1] D4 · D-S7CORE29-02)
+# Per merge, SIT runs the related set (D3) and a briefs-only merge runs nothing (D1). The FULL SIT and unit
+# suites run here instead: nightly (the queue daemon, `full_gate_nightly` in repos.yaml) and on demand before
+# a tester session. Read-only on the repo: a detached worktree at <ref>, removed after; it never merges,
+# pushes, or writes a branch. It holds the repo's fire lock while it runs, so no route starts over it.
+# ═══════════════════════════════════════════════════════
+def full_gate_state_file(repo_name: str) -> Path:
+    """state/full-gate-<repo>.json — the last full-gate result for `repo_name` (qstat.sh and `queue_daemon.py
+    status` read it). Resolved per call: ORCH_DIR is patched in tests."""
+    return _running_marker_dir() / f"{FULL_GATE_PREFIX}{_marker_repo_slug(repo_name)}.json"
+
+
+def _full_gate_refusal(repo_name: str) -> Optional[str]:
+    """Why a full-gate for `repo_name` may not start now, or None. Any live fire lock for that repo — its lock,
+    the mirror or a root marker naming it (or naming no repo: unattributable holds, the lock's own rule), or an
+    admission claim — admission.live_routes, pid alive; or the queue daemon's own word that a route is live
+    (queue-state.json current_batch, daemon pid alive)."""
+    mine = os.getpid()
+    held = [r for r in admission.live_routes(ORCH_DIR)
+            if r.pid != mine and (r.repo == "?" or _marker_repo_slug(r.repo) == _marker_repo_slug(repo_name))]
+    if held:
+        return "fire lock held — " + "; ".join(r.describe(ORCH_DIR) for r in held)
+    st = _read_marker(ORCH_DIR / "queue-state.json") or {}
+    cb = st.get("current_batch") if isinstance(st.get("current_batch"), dict) else {}
+    if cb.get("file") and st.get("pid") is not None and _pid_alive(st.get("pid")) is not False:
+        return (f"the queue daemon (pid {st.get('pid')}) reports a route live — {cb['file']} since "
+                f"{cb.get('started_at') or '?'}")
+    return None
+
+
+def _full_gate_sit(wt: Path, archive: Path, previous: Optional[dict]) -> dict:
+    """The full SIT leg on the worktree, judged as the per-merge gate judges a red (F-20, GATE-SIT-2 isolation,
+    GATE-CLOCK-1), then compared against the previous full-gate's SIT failures: a confirmed failing file it did
+    not have is new. No previous SIT measurement ⇒ every failing file is new."""
+    env_name, env_path = _gate_env_file(wt)
+    if env_name and not env_path.is_file():
+        return {"ran": False, "outcome": "BLOCKED", "signal": "env-file-missing", "detail": f"{env_path} not found",
+                "failing_files": None, "new": []}
+    so = run_sit_post_merge(wt, archive)
+    out = {"ran": True, "collection": so.collection, "batches": so.batches, "duration_s": round(so.duration_s, 2),
+           "clock": "plausible" if so.clock is None else str(so.clock), "contaminated": [], "new": []}
+    n = so.test_files_total
+    out["scope"] = f"full {'?' if n is None else n}"
+    if so.passed and so.error is None:
+        out.update(outcome="PASS", failing_files=[])
+    elif so.error:
+        # a machinery error, an empty collection — and a timeout, which the per-merge leg lets through as
+        # advisory: here it is a suite that did not finish, so nothing about it is known
+        why = f"timeout — a batch exceeded its {SIT_TIMEOUT}s budget" if so.error == "timeout-advisory" else so.error
+        out.update(outcome="BLOCKED", signal=so.error, detail=so.detail or why, failing_files=None)
+    else:
+        v = _classify_gate_failure("sit", so.output or "", wt, so.exit_code, tests_failed=so.tests_failed,
+                                   files_failed=so.files_failed, isolation=so.isolation, clock=so.clock)
+        for msg in sit_verdict_violations(so, v):
+            log.error(f"⛔ GATE-SIT-2 invariant: {msg}")
+        iso = so.isolation
+        out["contaminated"] = list(iso.contaminated) if iso is not None else []
+        if v.outcome is GateOutcome.PASS:
+            out.update(outcome="PASS", signal=v.signal, detail=v.detail, failing_files=[])
+        elif v.outcome is GateOutcome.BLOCKED_ENV:
+            out.update(outcome="BLOCKED", signal=v.signal, detail=v.detail, failing_files=None)
+        else:
+            failing = (list(iso.confirmed) if iso is not None and not iso.skipped and iso.confirmed
+                       else _sit_failing_files(so.output))
+            out.update(outcome="FAIL(product)", signal=v.signal, detail=v.detail, failing_files=failing)
+    if out["failing_files"]:
+        before = set((previous or {}).get("failing_files") or ())
+        out["previous"] = None if previous is None else {k: previous.get(k) for k in ("at", "sha")}
+        out["new"] = [f for f in out["failing_files"] if previous is None or f not in before]
+    return out
+
+
+def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: str,
+                    previous: Optional[dict]) -> dict:
+    """The full unit suite on the worktree — the same suite, in the same kind of detached worktree, as a
+    baseline leg (it is judged as one: `unit-baseline`). Compared against the content-keyed baseline for this
+    tree (D2); else the nearest measured ancestor, said approximate; else the previous full-gate's unit
+    failures; else nothing, and every failing file is new. A new failing file is confirmed alone ([ORCH-6]) —
+    one that passes alone is a flake, named, not new. A plausible measurement with no content hit is cached as
+    this tree's baseline: the next route off it reuses it."""
+    test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
+    if not test_cmd or ACTIVE_REPO_NAME not in _unit_gate_eligible_repos():
+        return {"ran": False, "outcome": "not gated", "detail": f"{ACTIVE_REPO_NAME}: no test_cmd in repos.yaml",
+                "failing_files": None, "new": []}
+    label = f"full-gate {ref}@{sha[:7]}"
+    log.info(f"🧪 full-gate unit: {test_cmd} — {label}, the full suite")
+    run = _run_unit_suite(test_cmd, wt, label,
+                          timeout=_unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT))
+    log.info(f"🧪 full-gate unit run — {run.describe}")
+    run.clock = _judge_leg("unit-baseline", run.clocks, archive, red=run.exit_code != 0 or bool(run.failures),
+                           completed=run.error is None)
+    out = {"ran": True, "command": test_cmd, "collection": run.collection, "duration_s": round(run.duration_s, 2),
+           "clock": "plausible" if run.clock is None else str(run.clock), "new": [], "flaky": []}
+    if run.error or not _unit_is_measurement(run) or run.failures is None:
+        why = run.error or run.collection or "no parseable summary"
+        return {**out, "outcome": "BLOCKED", "signal": "unmeasurable", "detail": f"the suite did not measure ({why})",
+                "failing_files": None}
+    out["failing_files"] = list(run.failing_files)
+    hit = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck) if ck else None
+    hit = hit if hit and _unit_cache_judged(hit) else None
+    if hit:
+        ref_files = set(hit.get("failing_files") or ())
+        base = {"source": "cache", "sha": hit.get("sha"),
+                "note": f"cache hit by content: measured at {str(hit.get('sha'))[:7]}, this tree {sha[:7]}"}
+    elif (anc := _unit_cache_ancestor(PROJECT_ROOT, archive, ACTIVE_REPO_NAME, sha, test_cmd)) is not None:
+        ref_files = set(anc.get("failing_files") or ())
+        base = {"source": "ancestor-cache", "sha": anc.get("sha"),
+                "note": f"nearest measured ANCESTOR {str(anc.get('sha'))[:7]}, {anc.get('ancestor_distance', '?')} "
+                        f"commit(s) back — approximate, stated as such"}
+    elif previous is not None:
+        ref_files = set(previous.get("failing_files") or ())
+        base = {"source": "previous-full-gate", "sha": previous.get("sha"),
+                "note": f"no measured baseline for this tree or an ancestor; the previous full-gate "
+                        f"({str(previous.get('sha'))[:7]}, {previous.get('at')})"}
+    else:
+        ref_files = set()
+        base = {"source": "none", "sha": None, "note": "nothing measured to compare against — every failing file is new"}
+    out["baseline"] = base
+    suspects = tuple(sorted(set(run.failing_files) - ref_files))
+    if run.clock is None and hit is None and ck and _unit_is_cacheable(run):
+        _unit_cache_store(archive, ACTIVE_REPO_NAME, sha, test_cmd, run, repo_path=PROJECT_ROOT, content_key=ck)
+        out["cached"] = True
+    if not suspects:
+        return {**out, "outcome": "PASS", "detail": f"{run.failures} failure(s), no failing file outside the baseline "
+                                                    f"({base['source']})"}
+    if run.clock is not None:
+        return {**out, "outcome": "BLOCKED", "signal": "clock-implausible",
+                "detail": f"{run.clock} — failing file(s) {', '.join(suspects)} measured on that clock"}
+    flakes, regressions, confirm = _unit_confirm_new_files(wt, test_cmd, label, suspects)
+    if confirm is not None:
+        confirm.clock = _judge_leg("unit-confirm", confirm.clocks, archive, red=flakes is None or bool(regressions),
+                                   completed=confirm.error is None)
+        out["confirm_clock"] = "plausible" if confirm.clock is None else str(confirm.clock)
+    if flakes is None:
+        return {**out, "outcome": "BLOCKED", "signal": "confirmation-unmeasurable",
+                "detail": f"failing file(s) {', '.join(suspects)} could not be confirmed alone"}
+    out["flaky"] = list(flakes)
+    if regressions and confirm.clock is not None:
+        return {**out, "outcome": "BLOCKED", "signal": "clock-implausible",
+                "detail": f"{confirm.clock} — {', '.join(regressions)} confirmed on that clock"}
+    if regressions:
+        return {**out, "outcome": "FAIL(product)", "new": list(regressions),
+                "detail": f"failing alone, not in the baseline ({base['source']}): {', '.join(regressions)}"}
+    return {**out, "outcome": "PASS", "detail": f"failing file(s) outside the baseline passed alone (flaky, not new): "
+                                                f"{', '.join(flakes)}"}
+
+
+def _full_gate_previous(state: dict, leg: str) -> Optional[dict]:
+    """The newest earlier result that MEASURED `leg` ({"at", "sha", "failing_files"}), from the state file's
+    last result and its history; None when no full-gate has measured it."""
+    if not state:
+        return None
+    rows = [{"at": state.get("finished_at"), "sha": state.get("sha"),
+             "failing_files": (state.get(leg) or {}).get("failing_files")}]
+    rows += [{"at": h.get("at"), "sha": h.get("sha"), "failing_files": h.get(f"{leg}_failing_files")}
+             for h in reversed(state.get("history") or []) if isinstance(h, dict)]
+    return next((r for r in rows if r["failing_files"] is not None), None)
+
+
+def _full_gate_dry_run(ref: str, sha: str, ck: Optional[str], refusal: Optional[str]) -> int:
+    """Enumerate and print the plan; run nothing, take no lock. The suite is enumerated in the project checkout
+    when it is clean at <ref>'s commit (nothing is written), else in a detached worktree removed after."""
+    test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
+    gates = tuple((PRE_MERGE_GATES.get(ACTIVE_REPO_NAME) or {}).get("gates") or ())
+    print(f"full-gate --dry-run {ACTIVE_REPO_NAME} @ {ref} = {sha[:12]} (content key {ck or 'unreadable'})")
+    print(f"  lock: {'HELD — a real run would refuse (exit 2): ' + refusal if refusal else 'free — a real run would start now'}")
+    head = _git_read("git rev-parse HEAD", PROJECT_ROOT)
+    clean = not _git_read("git status --porcelain", PROJECT_ROOT)
+    rc = 0
+    if "sit" in gates:
+        if head == sha and clean:
+            where, plan = f"the project checkout {PROJECT_ROOT} (clean, at {sha[:7]})", _sit_plan(PROJECT_ROOT)
+        else:
+            with tempfile.TemporaryDirectory(prefix=FULL_GATE_WORKTREE_PREFIX) as td:
+                wt = Path(td) / "wt"
+                add = subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "add", "--detach", str(wt), sha],
+                                     capture_output=True, text=True)
+                links = _link_unit_deps(PROJECT_ROOT, wt) if add.returncode == 0 else []
+                plan = _sit_plan(wt) if add.returncode == 0 else SitPlan(error="worktree-failed",
+                                                                         detail=add.stderr.strip()[-300:])
+                for d in links:
+                    d.unlink(missing_ok=True)
+                subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "remove", "--force", str(wt)],
+                               capture_output=True)
+                subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "prune"], capture_output=True)
+            where = f"a detached worktree at {sha[:7]} (the checkout is at {head[:7] or '?'}"\
+                    f"{'' if clean else ', dirty'}), removed after"
+        if plan is None:
+            print(f"  SIT: one unbatched run of the whole suite (no {SIT_LIST_CMD_KEY} in repos.yaml)")
+        elif plan.error:
+            print(f"  SIT: could not enumerate in {where} — {plan.error}: {plan.detail}")
+            rc = 1
+        else:
+            print(f"  SIT: sit[full {len(plan.files)} files] — {len(plan.files)} files"
+                  f"{'' if plan.tests_expected is None else f' / {plan.tests_expected} tests'} enumerated in {where}; "
+                  f"{len(plan.batches)} batches of ≤{plan.batch_files}, {plan.pause_s}s pause between, "
+                  f"{SIT_TIMEOUT}s per batch")
+    else:
+        print(f"  SIT: not gated for {ACTIVE_REPO_NAME} (PRE_MERGE_GATES)")
+    if test_cmd and ACTIVE_REPO_NAME in _unit_gate_eligible_repos():
+        hit = (_unit_cache_lookup(SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck, persist=False)
+               if ck else None)
+        base = (f"cache hit by content (measured at {str(hit.get('sha'))[:7]})" if hit and _unit_cache_judged(hit)
+                else "no content-keyed entry — the nearest measured ancestor, else the previous full-gate")
+        print(f"  unit: `{test_cmd}` — the full suite, budget "
+              f"{_unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT)}s; baseline: {base}")
+    else:
+        print(f"  unit: not gated for {ACTIVE_REPO_NAME} (no test_cmd)")
+    print(f"  writes: {LOG_DIR / LOG_SUBDIR}/{FULL_GATE_PREFIX}<ts>.log, {full_gate_state_file(ACTIVE_REPO_NAME)} "
+          f"— nothing run, nothing written (--dry-run)")
+    return rc
+
+
+def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = None,
+              trigger: str = "on-demand") -> int:
+    """[ORCH-GATE-COST-1] D4: the `full-gate` subcommand for the active repo. Exit 0 only when nothing is new
+    (PASS); 1 for NEW FAILURES or BLOCKED; 2 when refused — a fire lock for the repo held, the daemon reporting a
+    route live, or a ref that is not a commit — with nothing run. Writes `log_path` (else
+    logs/<log_subdir>/full-gate-<ts>.log) and state/full-gate-<repo>.json."""
+    repo, ref = ACTIVE_REPO_NAME, ref or MERGE_TARGET
+    sha = _git_read(f"git rev-parse --verify -q {shlex.quote(ref + '^{commit}')}", PROJECT_ROOT)
+    if not sha:
+        print(f"⛔ full-gate {repo}: refused — {ref!r} is not a commit in {PROJECT_ROOT}; nothing run", file=sys.stderr)
+        return 2
+    ck = _unit_content_key(PROJECT_ROOT, sha)
+    refusal = _full_gate_refusal(repo)
+    if dry_run:
+        return _full_gate_dry_run(ref, sha, ck, refusal)
+    if refusal:
+        print(f"⛔ full-gate {repo}: refused — {refusal}; nothing run", file=sys.stderr)
+        log.error(f"⛔ full-gate {repo}: refused — {refusal}; nothing run")
+        return 2
+    started = datetime.now()
+    ts = started.strftime("%Y%m%d-%H%M%S")
+    handler = None
+    if not log_path:
+        log_path = str(ensure_log_subdir(LOG_SUBDIR) / f"{FULL_GATE_PREFIX}{ts}.log")
+        handler = logging.FileHandler(log_path)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-7s] %(message)s", datefmt="%H:%M:%S"))
+        log.addHandler(handler)
+    lock = _running_marker_path(repo)
+    td = Path(tempfile.mkdtemp(prefix=FULL_GATE_WORKTREE_PREFIX))
+    wt = td / "wt"
+    # the repo's fire lock, as a route takes it: no route starts over this run; a dead one is P-STALE's, and its
+    # route_worktree tells dead-route recovery the main checkout was never this run's
+    _write_running_marker(Path(f"{FULL_GATE_PREFIX}{ts}"), repo, PROJECT_ROOT, f"full-gate {ref}", None, False,
+                          route_worktree=wt)
+    links, state = [], {}
+    try:
+        late = _full_gate_refusal(repo)
+        if late:
+            print(f"⛔ full-gate {repo}: refused — {late}; nothing run", file=sys.stderr)
+            log.error(f"⛔ full-gate {repo}: refused — {late} (taken between the check and the lock); nothing run")
+            return 2
+        log.info(f"🌙 full-gate {repo} @ {ref} = {sha[:7]} ({trigger}) — the full SIT and unit suites in a detached "
+                 f"worktree {wt}; content key {ck or 'unreadable'}; log {log_path}")
+        add = subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "add", "--detach", str(wt), sha],
+                             capture_output=True, text=True)
+        prior = _read_marker(full_gate_state_file(repo)) or {}
+        if add.returncode != 0:
+            sit = unit = {"ran": False, "outcome": "BLOCKED", "signal": "worktree-failed",
+                          "detail": (add.stderr or "").strip()[-300:], "failing_files": None, "new": []}
+        else:
+            links = _link_unit_deps(PROJECT_ROOT, wt)
+            gates = tuple((PRE_MERGE_GATES.get(repo) or {}).get("gates") or ())
+            sit = (_full_gate_sit(wt, SIT_ARCHIVE_DIR, _full_gate_previous(prior, "sit")) if "sit" in gates else
+                   {"ran": False, "outcome": "not gated", "detail": f"{repo}: no SIT leg (PRE_MERGE_GATES)",
+                    "failing_files": None, "new": []})
+            unit = _full_gate_unit(wt, SIT_ARCHIVE_DIR, sha, ck, ref, _full_gate_previous(prior, "unit"))
+        legs = (sit, unit)
+        outcome = ("NEW FAILURES" if any(l.get("new") for l in legs)
+                   else "BLOCKED" if any(l.get("outcome") == "BLOCKED" for l in legs) else "PASS")
+        finished = datetime.now()
+        state = {"repo": repo, "ref": ref, "sha": sha, "content_key": ck, "trigger": trigger,
+                 "started_at": started.isoformat(), "finished_at": finished.isoformat(),
+                 "duration_s": round((finished - started).total_seconds(), 1), "outcome": outcome,
+                 "exit_code": 0 if outcome == "PASS" else 1, "log": log_path, "sit": sit, "unit": unit,
+                 "clock": {"sit": sit.get("clock", "not measured"), "unit": unit.get("clock", "not measured"),
+                           "unit_confirm": unit.get("confirm_clock", "not engaged")}}
+        history = list(prior.get("history") or [])
+        if prior.get("sha"):
+            history.append({"at": prior.get("finished_at"), "sha": prior.get("sha"), "outcome": prior.get("outcome"),
+                            "sit_failing_files": (prior.get("sit") or {}).get("failing_files"),
+                            "unit_failing_files": (prior.get("unit") or {}).get("failing_files")})
+        state["history"] = history[-FULL_GATE_HISTORY_KEEP:]
+        try:
+            full_gate_state_file(repo).parent.mkdir(parents=True, exist_ok=True)
+            tmp = full_gate_state_file(repo).with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state, indent=2, default=str))
+            os.replace(tmp, full_gate_state_file(repo))
+        except OSError as e:
+            log.error(f"⛔ full-gate {repo}: state file not written ({e})")
+
+        def _leg(name: str, l: dict) -> str:
+            new = f"; NEW: {', '.join(l['new'])}" if l.get("new") else ""
+            return f"{name} {l.get('outcome')} ({l.get('collection') or l.get('detail') or '-'}){new}"
+        line = (f"🌙 full-gate {repo} @ {sha[:7]} ({ref}): {outcome} — {_leg('sit', sit)} | {_leg('unit', unit)} "
+                f"| {state['duration_s']:.0f}s → {full_gate_state_file(repo)}")
+        (log.info if outcome == "PASS" else log.error)(line)
+        return state["exit_code"]
+    finally:
+        for d in links:
+            d.unlink(missing_ok=True)
+        subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "remove", "--force", str(wt)], capture_output=True)
+        subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "prune"], capture_output=True)
+        shutil.rmtree(td, ignore_errors=True)
+        held = _read_marker(lock) or {}
+        if held.get("pid") == os.getpid():
+            _clear_running_marker(repo)      # ours; a lock another process took over is not ours to release
+        else:
+            _refresh_legacy_running_mirror()
+        if handler is not None:
+            log.removeHandler(handler)
+            handler.close()
 
 
 # ═══════════════════════════════════════════════════════
@@ -5227,7 +5921,8 @@ EXECUTOR_CMDS = ("run", "queue", "parallel", "watch")   # the subcommands that f
 # [ORCH-YORSIE-SAFETY-1] the subcommands that act on ONE repo's tree. Each is named its repo — --repo, or
 # the brief's own header — or refused: there is no default to fall back to. The rest (deps, sit:report,
 # flaky, handback-scan) read orchestrator state only and run without one.
-REPO_CMDS = EXECUTOR_CMDS + ("status", "branches")
+# [ORCH-GATE-COST-1] D4: `full-gate` runs one repo's suites — named with --repo, or refused.
+REPO_CMDS = EXECUTOR_CMDS + ("status", "branches", "full-gate")
 
 
 def _named_repo(a) -> tuple[str, Optional[str]]:
@@ -5324,6 +6019,16 @@ def main():
     vp.add_argument("--commit", default=None, help="the commit to show (default: the orch log's merge line, else "
                                                    "the route branch, else the newest merge-target commit "
                                                    "touching the handback)")
+
+    # [ORCH-GATE-COST-1] D4 (D-S7CORE29-02): the FULL SIT + unit suites, nightly (queue daemon) and on demand.
+    fgp = sp.add_parser("full-gate", help="Run the FULL SIT and unit suites on a ref in a detached worktree; exit 0 "
+                                          "only when nothing is new; refused (exit 2) while the repo's fire lock is "
+                                          "held or a route is live; never merges or pushes")
+    fgp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml) — required")
+    fgp.add_argument("--ref", default="", help="the ref to gate (default: the repo's merge_target)")
+    fgp.add_argument("--dry-run", action="store_true", help="enumerate and print the plan; run nothing, take no lock")
+    fgp.add_argument("--log-file", default=None, help=argparse.SUPPRESS)   # the queue daemon's: it holds the stdout
+    fgp.add_argument("--trigger", default="on-demand", choices=("on-demand", "nightly"), help=argparse.SUPPRESS)
 
     a = ap.parse_args()
 
@@ -5437,6 +6142,9 @@ def main():
 
     elif a.cmd == "verify":
         sys.exit(verify_route(a.stem, a.commit))
+
+    elif a.cmd == "full-gate":
+        sys.exit(full_gate(a.ref, a.dry_run, a.log_file, a.trigger))
 
     else:
         ap.print_help()

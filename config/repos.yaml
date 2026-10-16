@@ -85,6 +85,14 @@ repos:
     sit_list_cmd: "npx vitest list --config vitest.sit.config.ts"
     sit_batch_files: 10
     sit_batch_pause_s: 90
+    # ORCH-GATE-COST-1 (S7-CORE-30, D-S7CORE29-02): per merge, SIT runs the files RELATED to the branch's diff —
+    # the installed vitest's own `list --changed <merge base>` (files only, nothing run), plus the SIT files the
+    # branch changes, plus an optional core set:
+    #   sit_core_files: [sit/integration/<file>.integration.test.ts, ...]   # absent ⇒ none; not set (Gemma decides)
+    # The FULL SIT + unit suites run nightly — `orchestrator.py full-gate --repo clinical-mp`, by the queue daemon
+    # once per local day at or after this time, only while it is running and idle — and on demand before a
+    # tester session. Quoted: unquoted, YAML reads 02:30 as the integer 150.
+    full_gate_nightly: "02:30"
 
   orchestrator:
     project_dir: /home/gkassa/spectricom-orchestrator
