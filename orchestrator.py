@@ -2342,6 +2342,9 @@ class _SitBatchedRun:
     stdout: str = ""
     stderr: str = ""
     red_output: str = ""   # tails of the RED batches only, for F-20 classification
+    # [ORCH-SIT-ISOLATION-ATTRIBUTED-1] D1: the files the RED batches name (_sit_named_files), read from each WHOLE batch
+    # text — vitest prints its FAIL lines before the unhandled-error blocks, so red_output's tail can hold none of them
+    named: dict = field(default_factory=dict)
     counts: dict = field(default_factory=dict)
     tallies: dict = field(default_factory=dict)
     batches: int = 0
@@ -2391,6 +2394,8 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
         if r.returncode != 0:
             out.returncode = out.returncode or r.returncode
             out.red_output += head + raw[-10000:]
+            for f, src in _sit_named_files(raw).items():
+                out.named[f] = list(dict.fromkeys(out.named.get(f, []) + src))
         status = "PASS" if r.returncode == 0 else f"exit {r.returncode}"
         log.info(f"🧪 SIT batch {i}/{len(batches)}: {status} — {_describe_collection(c)} in {d:.1f}s")
         if c["test_files_total"] != len(files):
@@ -2440,23 +2445,43 @@ def _sit_failing_files(text: str) -> list:
     return out
 
 
+# [ORCH-SIT-ISOLATION-ATTRIBUTED-1] D3: where an isolation suspect was named from
+SIT_NAMED_FAIL = "FAIL line"
+SIT_NAMED_ERROR = "error attribution"
+
+
+def _sit_named_files(text: str) -> dict:
+    """[ORCH-SIT-ISOLATION-ATTRIBUTED-1] D1: every file the runner output names for a failure or an error — a
+    `FAIL <file>` / `FAIL <file> > <test>` line (_sit_failing_files) or vitest's attribution of an unhandled error
+    (`This error originated in "<file>" test file`) — normalised, each once, mapped to where it was named from
+    (SIT_NAMED_FAIL and/or SIT_NAMED_ERROR). _sit_failing_files itself is unchanged: V2 and the full gate read it."""
+    named = {f: [SIT_NAMED_FAIL] for f in _sit_failing_files(text)}
+    for f in _GATE_ERROR_FILE_RE.findall(_ANSI_RE.sub("", text or "")):
+        src = named.setdefault(_norm_test_path(f), [])
+        if SIT_NAMED_ERROR not in src:
+            src.append(SIT_NAMED_ERROR)
+    return named
+
+
 def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list,
-                 archive: Optional[Path] = None) -> SitIsolation:
+                 archive: Optional[Path] = None, named_from: Optional[dict] = None) -> SitIsolation:
     """[GATE-SIT-2] Re-run each failing file ALONE — one `sit_cmd -- <file>` invocation per file,
     in listing order, after ONE refill pause. Copies the [ORCH-6] unit-gate shape: a file that
     passes alone was its batch's (`contaminated`), a file that fails alone is the product's
     (`confirmed`), and a measurement that cannot be read stops the leg with `error` — fail
     closed, never a verdict about the file. More failing files than a batch holds is not
-    contamination-shaped: recorded as `skipped`, nothing re-run."""
+    contamination-shaped: recorded as `skipped`, nothing re-run.
+    [ORCH-SIT-ISOLATION-ATTRIBUTED-1] D3: `named_from` (file -> where it was named from, _sit_named_files) is said
+    beside each file in the leg's line; None ⇒ the files alone, as before."""
+    said = ", ".join(f"{f} ({' + '.join(named_from[f])})" if named_from and named_from.get(f) else f for f in files)
     iso = SitIsolation(pause_s=plan.pause_s, batches=len(plan.batches))
     if len(files) > plan.batch_files:
         iso.skipped = (f"{len(files)} failing files exceed the batch size {plan.batch_files} — "
                        f"not contamination-shaped, not re-run")
-        log.warning(f"⚠️  SIT gate isolation skipped: {iso.skipped}")
+        log.warning(f"⚠️  SIT gate isolation skipped: {iso.skipped}: {said}")
         log.warning(f"🛡 sit-isolation: SKIPPED — {iso.skipped}")
         return iso
-    log.info(f"🔬 SIT gate: {len(files)} failing file(s) — confirming in isolation before verdict: "
-             f"{', '.join(files)}")
+    log.info(f"🔬 SIT gate: {len(files)} failing file(s) — confirming in isolation before verdict: {said}")
     for i, batch in enumerate(plan.batches, 1):
         for f in files:
             if f in batch:
@@ -2624,14 +2649,25 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
         # failing files: re-measure those files alone before anything decides. A run that
         # D-S7CORE10-02 already calls environment (0 failed / a transport signal) is never
         # re-run. `passed` stays False whatever this finds — the classifier decides.
+        # [ORCH-SIT-ISOLATION-ATTRIBUTED-1] D1: "named" = by a FAIL line or an error attribution, in a red batch's
+        # WHOLE text (b.named) — `raw` keeps 10,000 chars of each, which can hold neither. No extra run.
         isolation: Optional[SitIsolation] = None
         if (plan is not None and r.returncode != 0 and batch_mismatch is None
                 and isinstance(tests_failed, int) and tests_failed >= 1 and _sit_env_signal(raw) is None):
-            named = set(_sit_failing_files(raw))
+            named = b.named
             suspects = [f for f in plan.files if _norm_test_path(f) in named]
             if suspects:
-                isolation = _sit_isolate(sit_cmd, repo_path, plan, suspects, archive)
+                isolation = _sit_isolate(sit_cmd, repo_path, plan, suspects, archive,
+                                         named_from={f: named[_norm_test_path(f)] for f in suspects})
                 clock = clock or isolation.clock
+            else:
+                # D2: owed-shaped, and no file to re-run — the verdict below is HEAD's, and the log says why
+                stray = list(named)
+                also = (f"; named, not a file of this run: {', '.join(stray[:BRIEFS_ONLY_NAMED_FILES])}"
+                        f"{' …' if len(stray) > BRIEFS_ONLY_NAMED_FILES else ''}") if stray else ""
+                log.warning(f"⚠️  SIT gate: isolation not engaged: no failing file named — {tests_failed} failed "
+                            f"assertion(s), no F-20 signal, and no red batch names a file of this run by a FAIL line "
+                            f"or an error attribution{also}; nothing re-run alone")
         error, detail = None, None
         if batch_mismatch:
             # AC-SR-05: the batches do not add up to the suite. Not a verdict about anything.
@@ -4272,6 +4308,9 @@ def _env_file_keys(path: Optional[Path]) -> set:
 # [ORCH-11] rule 1 — the failing FILES named in the runner output (`FAIL sit/x.test.ts`), so
 # the environment verdict says which files were down, not just how many.
 _GATE_FAIL_FILE_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(\S+)", re.MULTILINE)
+# [ORCH-SIT-ISOLATION-ATTRIBUTED-1] D1 — the other form vitest 4.1.4 names a file in: an unhandled error attributed to
+# the test file running when it was thrown, printed on stderr AFTER every FAIL line (route 281's only file naming).
+_GATE_ERROR_FILE_RE = re.compile(r'This error originated in "([^"\n]+)" test file')
 
 
 def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: int,
