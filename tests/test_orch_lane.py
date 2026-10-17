@@ -588,7 +588,8 @@ def canon(tmp_path, monkeypatch):
 
 def _kbrief(tmp_path, line):
     p = tmp_path / "b.md"
-    p.write_text(f"#!queue repo=x\n\n# t\n{line}## Estimated runtime: 60-90 min\n")
+    p.write_text(f"#!queue repo=x\n\n# t\n{line}## Estimated runtime: 60-90 min\n"
+                 "## Test scope: targeted (D-S7CORE30-05)\n")
     return p
 
 

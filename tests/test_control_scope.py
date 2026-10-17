@@ -339,7 +339,8 @@ def kanban(tmp_path, monkeypatch):
 
 def _brief(tmp_path, kanban_line, name="b.md"):
     p = tmp_path / name
-    p.write_text(f"#!queue repo=x\n\n# t\n## Repo: x\n{kanban_line}## Estimated runtime: 75-110 min\n")
+    p.write_text(f"#!queue repo=x\n\n# t\n## Repo: x\n{kanban_line}## Estimated runtime: 75-110 min\n"
+                 "## Test scope: targeted (D-S7CORE30-05)\n")
     return p
 
 
@@ -394,13 +395,14 @@ class TestP3Kanban:
 
     def test_negative_control_a2_and_a8_still_report_beside_a1(self, kanban, tmp_path):
         p = tmp_path / "small.md"
-        p.write_text("## Kanban: SCP_Kanban row 1\n## Estimated runtime: 12 min\n")
+        p.write_text("## Kanban: SCP_Kanban row 1\n## Estimated runtime: 12 min\n"
+                     "## Test scope: targeted (D-S7CORE30-05)\n")
         fails = prefire.check(p)
         assert len(fails) == 1 and fails[0].startswith("A2 SIZING")
 
     def test_report_names_the_row_it_passed(self, kanban, tmp_path, capsys):
         assert prefire.report(_brief(tmp_path, "## Kanban: SCP_Kanban row 1\n"))
-        assert ("Assertions: ✅ A1/A2/A8 pass — SCP_Kanban row 1 READY (SCP_Kanban_v0-10.md); "
+        assert ("Assertions: ✅ A1/A2/A8/A9/A10 pass — SCP_Kanban row 1 READY (SCP_Kanban_v0-10.md); "
                 "declared 75m (floor 30m)") in capsys.readouterr().out
 
     def test_force_says_it_skipped_a1(self, caplog, monkeypatch):

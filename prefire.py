@@ -25,8 +25,15 @@ ENFORCED:
                       × 1.25), so a line that gives no upper bound fails, micro-fire or not, and
                       the pass line names the timeout the route will run under.
   A8  no skip-sit   — 'skip-sit' must not appear in a feature brief (5.5).
+  A9  test scope    — exactly one '## Test scope: targeted (D-S7CORE30-05)' or
+                      '## Test scope: full — D-S7CORE<n>-<n>' (the George decision that ordered full
+                      suites for that brief) header line.  [ORCH-PREFIRE-TEST-SCOPE-1] D-S7CORE30-05.
+  A10 no full suite — a targeted brief has no line instructing a suite the pre-merge gate already runs
+                      (`npm test` without ' -- <path or pattern>', `sit:gate`, a merge-base baseline,
+                      `pytest` without a path — staged off, A10_BARE_PYTEST) unless that line negates
+                      it (do not / don't / never / not run).
 
-NOT enforced here: A3-A7, A9.
+NOT enforced here: A3-A7, nor SESSION-BOOT's own A9 (System Prompt v5-38) — this A9 is not that one.
 
 Bypass: orchestrator --force, which already means "ALL safety checks bypassed"
 and logs a warning.  There is deliberately no second, quieter override.
@@ -162,6 +169,76 @@ def find_skip_sit(filepath: Path) -> list[str]:
         if _NEGATION.search(raw[:idx]):
             continue          # "No `--skip-sit`: ..." — a compliance note
         hits.append(raw.strip()[:160])
+    return hits
+
+
+# ── A9 / A10: the test scope ─────────────────────────────────────────────────
+# [ORCH-PREFIRE-TEST-SCOPE-1] D-S7CORE30-05 (George 2026-10-16 14:43: no duplicate regression runs). The
+# pre-merge gate runs the full suites right after the executor, and nightly + before every tester session;
+# a brief that has the executor run one too pays for it twice. Nothing checked the gates paragraph existed.
+_TEST_SCOPE_LINE = re.compile(r'^##\s*Test scope\s*:(?P<text>.*)$', re.MULTILINE)
+_TEST_SCOPE_TARGETED = re.compile(r'targeted\s*\(D-S7CORE30-05\)')
+_TEST_SCOPE_FULL = re.compile(r'full\s*[—–-]\s*D-S7CORE\d+-\d+')      # full — <the George decision>
+A9_REFUSAL = ("A9 TEST-SCOPE — the brief does not declare its test scope "
+              "(`## Test scope: targeted (D-S7CORE30-05)`)")
+
+# A10. The gates paragraph says the opposite on the same line ("Do NOT run the full `npm test`, a merge-base
+# baseline, or `npm run sit:gate`"), so a line that negates is allowed — anywhere on it, unlike A8's.
+_A10_NEGATION = re.compile(r"\b(?:do\s+not|don['’]t|never|not\s+run)\b", re.IGNORECASE)
+_A10_SUITES = (
+    # `npm test` / `npm run test` not given ` -- <path or pattern>` (flags after the `--` are not one)
+    re.compile(r"\bnpm\s+(?:run\s+)?test(?![\w:-])(?!\s+--\s+(?:-\S*\s+)*[^\s`-])", re.IGNORECASE),
+    re.compile(r"\bsit:gate\b", re.IGNORECASE),
+    re.compile(r"\bmerge-base\s+baseline\b", re.IGNORECASE),
+)
+_PYTEST = re.compile(r"\bpytest(?![\w-]|\.\w)", re.IGNORECASE)        # not pytest.ini, pytest-xdist, _pytest
+# STOP (b) of route 283's brief: ON, this clause refuses brief 286, queued at the time, on its gates line
+# (:48 "Gates: `pytest` on the changed/new test files only" — no path, no negation). Staged OFF; turn it on
+# once no queued brief has such a line (283 handback, found-and-left). The other three clauses are on.
+A10_BARE_PYTEST = False
+_PATH_ARG = re.compile(r"/|\.py\b|::|^<")                                 # tests/x.py, x.py::t, <changed paths>
+
+
+def _bare_pytest(raw: str) -> bool:
+    """A `pytest` given no path: the first word after it that is not a flag, up to the code span's end (or
+    the line's), is not a path. '`pytest -q`', '`pytest` on the changed files' are bare; '`pytest
+    tests/test_prefire.py`', 'pytest -q <changed paths>' are not."""
+    for m in _PYTEST.finditer(raw):
+        words = [w for w in raw[m.end():].split("`", 1)[0].replace("*", " ").split() if not w.startswith("-")]
+        if not words or not _PATH_ARG.search(words[0]):
+            return True
+    return False
+
+
+def parse_test_scope(filepath: Path) -> tuple[Optional[str], str]:
+    """A9. ('targeted' | 'full', the header line) when the brief carries exactly one '## Test scope:' line
+    and it is `targeted (D-S7CORE30-05)` or `full — D-S7CORE<n>-<n>`; (None, what is wrong) otherwise —
+    '' when there is no such line."""
+    lines = [(m.group(0).strip(), m.group("text").strip())
+             for m in _TEST_SCOPE_LINE.finditer(_read(filepath)[:_HEADER_CHARS])]
+    if not lines:
+        return None, ""
+    if len(lines) > 1:
+        return None, "%d '## Test scope:' lines, exactly one: %s" % (len(lines), " | ".join(l for l, _ in lines))
+    line, text = lines[0]
+    if _TEST_SCOPE_TARGETED.fullmatch(text):
+        return "targeted", line
+    if _TEST_SCOPE_FULL.fullmatch(text):
+        return "full", line
+    return None, "'%s' is neither that nor `full — <D-S7COREnn-nn>`" % line
+
+
+def find_full_suite_instructions(filepath: Path) -> list[str]:
+    """A10. 'line N: <text>' for every line that instructs a suite the gate runs — `npm test` with no
+    ` -- <path or pattern>`, `sit:gate`, a merge-base baseline, `pytest` with no path (A10_BARE_PYTEST) —
+    and does not also negate it. Applied to a `targeted` brief only."""
+    hits: list[str] = []
+    for n, raw in enumerate(_read(filepath).splitlines(), 1):
+        if not (any(p.search(raw) for p in _A10_SUITES) or (A10_BARE_PYTEST and _bare_pytest(raw))):
+            continue
+        if _A10_NEGATION.search(raw):
+            continue          # "**Do NOT run the full `npm test`** …" — the gates paragraph
+        hits.append("line %d: %s" % (n, raw.strip()[:160]))
     return hits
 
 
@@ -315,6 +392,19 @@ def check(filepath: Path) -> list[str]:
             "Offending line(s): %s" % " | ".join(hits[:3])
         )
 
+    scope, why = parse_test_scope(filepath)
+    if scope is None:
+        failures.append(A9_REFUSAL + ("; %s" % why if why else ""))
+    elif scope == "targeted":
+        suites = find_full_suite_instructions(filepath)
+        if suites:
+            failures.append(
+                "A10 FULL-SUITE — the brief is `## Test scope: targeted` but instructs a suite the "
+                "orchestrator's pre-merge gate runs right after the executor (D-S7CORE30-05). Name the "
+                "paths, or say it is not to be run on that line. Offending line(s): %s%s"
+                % (" | ".join(suites[:3]), " (+%d more)" % (len(suites) - 3) if len(suites) > 3 else "")
+            )
+
     return failures
 
 
@@ -345,7 +435,8 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
             detail = "declared %dm (floor %dm)" % (est, SIZING_FLOOR_MIN)
         else:
             detail = "micro-fire: %s" % trig
-        print("  Assertions: ✅ A1/A2/A8 pass — %s; %s; %s" % (row, detail, _timeout_detail(filepath, timeout)))
+        print("  Assertions: ✅ A1/A2/A8/A9/A10 pass — %s; %s; %s" % (row, detail, _timeout_detail(filepath, timeout)))
+        print("  %s" % parse_test_scope(filepath)[1].lstrip("# "))     # A9: the scope it passed on
         return True
 
     print("\n%s" % bar)

@@ -27,6 +27,7 @@ import orchestrator  # noqa: E402
 import prefire  # noqa: E402
 
 KANBAN_LINE = "## Kanban: SCP_Kanban row 1\n"
+SCOPE_LINE = "## Test scope: targeted (D-S7CORE30-05)\n"     # A9 (ORCH-PREFIRE-TEST-SCOPE-1)
 RUNTIME_FAIL = "A2 RUNTIME — '{line}' gives no route timeout; write '<n>-<m> min'"
 
 
@@ -45,7 +46,7 @@ def ready_row(tmp_path, monkeypatch):
 
 def brief(tmp_path: Path, body: str) -> Path:
     p = tmp_path / "b.md"
-    p.write_text("#!queue repo=orchestrator\n" + KANBAN_LINE + body, encoding="utf-8")
+    p.write_text("#!queue repo=orchestrator\n" + KANBAN_LINE + SCOPE_LINE + body, encoding="utf-8")
     return p
 
 
@@ -133,7 +134,7 @@ class TestP1:
         assert orchestrator.prefire_timeout(b) == (180, "brief-declared", 225)
         assert prefire.report(b, timeout=orchestrator.prefire_timeout(b)) is True, "a warning, not a failure"
         out = capsys.readouterr().out
-        assert "✅ A1/A2/A8 pass" in out
+        assert "✅ A1/A2/A8/A9/A10 pass" in out
         assert "declared 120m (floor 30m); timeout 180 min (brief-declared) ⚠ clamped to 180 min from 225" in out
 
     def test_negative_control_ninety_to_one_twenty_is_150_unclamped(self, tmp_path, capsys, caplog):
