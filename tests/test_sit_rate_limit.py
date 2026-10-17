@@ -551,4 +551,6 @@ class TestRepoConfig:
         mp = cfg["repos"]["clinical-mp"]
         assert mp[orchestrator.SIT_LIST_CMD_KEY].strip()
         assert int(mp[orchestrator.SIT_BATCH_FILES_KEY]) > 0
-        assert int(mp[orchestrator.SIT_BATCH_PAUSE_KEY]) > 0
+        # D-S7CORE31-03 (S7-CORE-31): 0 is a legitimate pause on the local dev stack (both Medplum limiters off);
+        # the key must still be declared as a non-negative integer.
+        assert int(mp[orchestrator.SIT_BATCH_PAUSE_KEY]) >= 0
