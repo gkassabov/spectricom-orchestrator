@@ -244,3 +244,28 @@ The file is in the run's related set (`chosen.txt:27`). So with this change, 281
 
 ## Closes capability advancement: none
 ## Gates journey: none
+
+## Re-gate (S7-CORE-31)
+
+Route 282br (`briefs/282br-orch-sit-isolation-attributed-1-regate.md`, Kanban row 285), on branch `orch-orch-282br-orch-sit-isolation-attributed-1-regate` from `main` `d1ea1a6`.
+
+- **Why the re-gate (§0.1-§0.2, quoted).** `logs/orchestrator/orch-282b-orch-sit-isolation-attributed-1-20261017-135237.log` 14:08:01: `FINAL STATUS: failed | gate: FAIL(product) — build: exit 1`, with `1 failed, 1304 passed in 84.10s`. The one failure was `FAILED tests/test_sit_rate_limit.py::TestRepoConfig::test_clinical_mp_declares_batching` (`tests/test_sit_rate_limit.py:554` `assert int(mp[orchestrator.SIT_BATCH_PAUSE_KEY]) > 0` → `E assert 0 > 0`). That 0 came from `dc8ec4e` (`sit_batch_pause_s: 90` → `0`, D-S7CORE31-03), and `d1ea1a6` relaxed the pin to `>= 0` on main.
+  - That is §1.1 above. But the orchestrator repo's gate is the plain build gate `pytest -q tests/` (same log, 14:06:38). It has no merge-base baseline, so a failure that also fails at the merge base still fails the route. §1.1's "the baseline unit gate should not count it" does not apply to this repo.
+- **§0.3.** `git log --oneline main..orch-orch-282b-orch-sit-isolation-attributed-1` → `f4f6e18`, `93316e1`. The merge base is `dc8ec4e`.
+- **Cherry-pick.** `git cherry-pick 93316e1 f4f6e18` exit 0, no conflicts. It produced `5f64afc` (work) and `4d0c936` (handback).
+  - `git patch-id --stable`: `93316e1` and `5f64afc` are both `7cba4397…`, and `f4f6e18` and `4d0c936` are both `558f20ff…`. The patches are identical.
+  - `git diff --stat orch-orch-282b-orch-sit-isolation-attributed-1 4d0c936` → only `tests/test_sit_rate_limit.py | 4 +++-`, which is `d1ea1a6` itself.
+  - Nothing else changed.
+- **Targeted (at `4d0c936`, D-S7CORE30-05).**
+  - `python3 -m pytest -q tests/test_sit_isolation_attributed.py` → **19 passed** in 0.30 s.
+  - `python3 -m pytest -q tests/test_sit_rate_limit.py` → **65 passed** in 0.45 s, including `test_clinical_mp_declares_batching`.
+  - `python3 -m py_compile orchestrator.py` OK.
+  - The full suite was not run here: the orchestrator's pre-merge gate runs it.
+- **P1.** `git diff --stat main` (working tree, this note included):
+
+```
+ ...82b-orch-sit-isolation-attributed-1.handback.md | 271 ++++++++++++++++
+ orchestrator.py                                    |  53 +++-
+ tests/test_sit_isolation_attributed.py             | 347 +++++++++++++++++++++
+ 3 files changed, 664 insertions(+), 7 deletions(-)
+```
