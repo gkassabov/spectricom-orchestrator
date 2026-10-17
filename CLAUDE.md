@@ -40,3 +40,8 @@ If you omit it, the file is saved as output_001.py which requires manual renamin
 - Never hardcode token values — use TONI_MAX_TOKENS, never max_tokens=4000
 - Never change existing constants like TONI_MAX_TOKENS without explicit instruction
 - Prefer editing 5 lines over rewriting 200 lines
+
+---
+
+## Test scope — no duplicate regression runs (source: `~/SPECTRICOM-SHARED-RULES.md` §7, D-S7CORE30-05)
+Run only: typecheck / build, lint on changed files, tests related to the files you changed, and your own new or changed SIT/integration tests alone. **Never run a full suite or a baseline** (bare `npm test`, `npm run sit:gate`, a merge-base baseline, bare `pytest`) — the orchestrator's pre-merge gate runs them right after you, and the full suites run nightly and before every tester session. A brief that orders full suites says so in its `## Test scope: full — <George decision>` header; nothing else does.
