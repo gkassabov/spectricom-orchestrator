@@ -93,6 +93,11 @@ repos:
     # once per local day at or after this time, only while it is running and idle — and on demand before a
     # tester session. Quoted: unquoted, YAML reads 02:30 as the integer 150.
     full_gate_nightly: "02:30"
+    # ORCH-FULLGATE-LOCAL-FILES-1 (S7-CORE-31): git-ignored files the full gate's detached worktree needs and does
+    # not get from git — symlinked in from this checkout beside the dependency trees, by path, never read. The
+    # first full gate (2026-10-16, a4f0e18) lost 31 SIT files at setup without this one: probe-identity.ts reads
+    # it when ADMIN_PASSWORD is unset. A listed file this checkout lacks ⇒ SIT BLOCKED before any batch, named.
+    full_gate_link_files: [".medplum-admin-credentials.local"]
 
   orchestrator:
     project_dir: /home/gkassa/spectricom-orchestrator

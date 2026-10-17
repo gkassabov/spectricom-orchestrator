@@ -393,6 +393,13 @@ BRIEFS_ONLY_NAMED_FILES = 5
 FULL_GATE_PREFIX = "full-gate-"
 FULL_GATE_WORKTREE_PREFIX = "orch-full-gate-"
 FULL_GATE_HISTORY_KEEP = 10   # results kept in the state file; the newest with a SIT measurement is "previous"
+# [ORCH-FULLGATE-LOCAL-FILES-1] D1 (S7-CORE-31): `full_gate_link_files: [<repo-relative path>, ...]` in repos.yaml —
+# git-ignored files the SIT suite reads that a fresh worktree lacks (clinical-mp: .medplum-admin-credentials.local,
+# read by sit/integration/probe-identity.ts when ADMIN_PASSWORD is unset; the first full gate, 2026-10-16, spent
+# 12 batches / 1421 s to find 31 files down at setup). Symlinked into the full gate's worktree beside
+# _link_unit_deps, by path — never opened. A listed path not linked ⇒ the SIT leg BLOCKED before any batch (D2).
+# Absent ⇒ nothing linked, as before.
+FULL_GATE_LINK_FILES_KEY = "full_gate_link_files"
 
 # ═══════════════════════════════════════════════════════
 # PRE-MERGE GATE POLICY (S7-CORE-4 [ORCH-1] — gate-then-merge)
@@ -4681,13 +4688,86 @@ def _full_gate_refusal(repo_name: str) -> Optional[str]:
     return None
 
 
-def _full_gate_sit(wt: Path, archive: Path, previous: Optional[dict]) -> dict:
+@dataclass
+class FullGateLocalFiles:
+    """[ORCH-FULLGATE-LOCAL-FILES-1] what FULL_GATE_LINK_FILES_KEY put into a full gate's worktree — paths only."""
+    src: Path
+    links: list = field(default_factory=list)       # the symlinks made, torn down with _link_unit_deps's
+    linked: list = field(default_factory=list)      # repo-relative paths linked (checked only: present)
+    not_linked: list = field(default_factory=list)  # (path, why) — D2: the SIT leg is BLOCKED before any batch
+    missing: list = field(default_factory=list)     # the not_linked paths `src` does not have
+
+    @property
+    def listed(self) -> int:
+        return len(self.linked) + len(self.not_linked)
+
+    @property
+    def blocked(self) -> Optional[str]:
+        """D2: the SIT leg's BLOCKED sentence — `full_gate_link_files: <path> not in <checkout>` — or None."""
+        if not self.not_linked:
+            return None
+        return f"{FULL_GATE_LINK_FILES_KEY}: " + "; ".join(f"{p} {why}" for p, why in self.not_linked)
+
+    def as_state(self) -> dict:
+        return {"linked": list(self.linked), "not_linked": [p for p, _ in self.not_linked]}
+
+
+def _link_full_gate_files(src: Path, dst: Optional[Path]) -> FullGateLocalFiles:
+    """[ORCH-FULLGATE-LOCAL-FILES-1] D1/D2: symlink each path FULL_GATE_LINK_FILES_KEY lists from the checkout `src`
+    into the full gate's worktree `dst`, as _link_unit_deps links the dependency trees; `dst` None only checks (the
+    dry run enumerating in the checkout). A path is not linked — and said, with why — when it is not repo-relative,
+    `src` does not have it, `dst` has it already (tracked, or under a linked tree) or the link fails.
+    Existence only: no file is opened, so no value can reach a log (canon §23.9d)."""
+    raw = ACTIVE_REPO_CONFIG.get(FULL_GATE_LINK_FILES_KEY) or []
+    out = FullGateLocalFiles(src=src)
+    for rel in ([raw] if isinstance(raw, str) else raw if isinstance(raw, list) else [raw]):
+        p = Path(str(rel))
+        if not isinstance(rel, str) or not rel.strip() or p.is_absolute() or ".." in p.parts:
+            out.not_linked.append((str(rel), "is not a repo-relative path"))
+            continue
+        s = src / p
+        if not s.exists():
+            out.not_linked.append((rel, f"not in {src}"))
+            out.missing.append(rel)
+            continue
+        if dst is None:
+            out.linked.append(rel)
+            continue
+        d = dst / p
+        if d.exists() or d.is_symlink():
+            out.not_linked.append((rel, "is in the worktree already (tracked, or under a linked tree) — not linked over"))
+            continue
+        try:
+            d.parent.mkdir(parents=True, exist_ok=True)
+            d.symlink_to(s.resolve(), target_is_directory=s.is_dir())
+        except OSError as e:
+            out.not_linked.append((rel, f"could not be linked ({e.strerror or type(e).__name__})"))
+            continue
+        out.links.append(d)
+        out.linked.append(rel)
+    return out
+
+
+def _describe_local_files(lf: dict) -> str:
+    """[ORCH-FULLGATE-LOCAL-FILES-1] D3: `local files linked 1/2: a (not linked: b)` — a leg's state["local_files"]."""
+    linked, missed = lf.get("linked") or [], lf.get("not_linked") or []
+    return (f"local files linked {len(linked)}/{len(linked) + len(missed)}"
+            f"{': ' + ', '.join(linked) if linked else ''}{' (not linked: ' + ', '.join(missed) + ')' if missed else ''}")
+
+
+def _full_gate_sit(wt: Path, archive: Path, previous: Optional[dict],
+                   local: Optional[FullGateLocalFiles] = None) -> dict:
     """The full SIT leg on the worktree, judged as the per-merge gate judges a red (F-20, GATE-SIT-2 isolation,
     GATE-CLOCK-1), then compared against the previous full-gate's SIT failures: a confirmed failing file it did
     not have is new. No previous SIT measurement ⇒ every failing file is new."""
     env_name, env_path = _gate_env_file(wt)
     if env_name and not env_path.is_file():
         return {"ran": False, "outcome": "BLOCKED", "signal": "env-file-missing", "detail": f"{env_path} not found",
+                "failing_files": None, "new": []}
+    if local is not None and local.blocked:
+        # [ORCH-FULLGATE-LOCAL-FILES-1] D2: every SIT file that reads it fails at setup — known only after the whole
+        # suite (2026-10-16: 31 files down, 12 batches, 1421 s). Said now, before any batch; the unit leg still runs.
+        return {"ran": False, "outcome": "BLOCKED", "signal": "local-file-missing", "detail": local.blocked,
                 "failing_files": None, "new": []}
     so = run_sit_post_merge(wt, archive)
     out = {"ran": True, "collection": so.collection, "batches": so.batches, "duration_s": round(so.duration_s, 2),
@@ -4820,6 +4900,7 @@ def _full_gate_dry_run(ref: str, sha: str, ck: Optional[str], refusal: Optional[
     head = _git_read("git rev-parse HEAD", PROJECT_ROOT)
     clean = not _git_read("git status --porcelain", PROJECT_ROOT)
     rc = 0
+    local = None
     if "sit" in gates:
         if head == sha and clean:
             where, plan = f"the project checkout {PROJECT_ROOT} (clean, at {sha[:7]})", _sit_plan(PROJECT_ROOT)
@@ -4829,6 +4910,9 @@ def _full_gate_dry_run(ref: str, sha: str, ck: Optional[str], refusal: Optional[
                 add = subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "add", "--detach", str(wt), sha],
                                      capture_output=True, text=True)
                 links = _link_unit_deps(PROJECT_ROOT, wt) if add.returncode == 0 else []
+                if add.returncode == 0:
+                    local = _link_full_gate_files(PROJECT_ROOT, wt)     # [ORCH-FULLGATE-LOCAL-FILES-1] D1
+                    links += local.links
                 plan = _sit_plan(wt) if add.returncode == 0 else SitPlan(error="worktree-failed",
                                                                          detail=add.stderr.strip()[-300:])
                 for d in links:
@@ -4850,6 +4934,17 @@ def _full_gate_dry_run(ref: str, sha: str, ck: Optional[str], refusal: Optional[
                   f"{SIT_TIMEOUT}s per batch")
     else:
         print(f"  SIT: not gated for {ACTIVE_REPO_NAME} (PRE_MERGE_GATES)")
+    # [ORCH-FULLGATE-LOCAL-FILES-1] D2: each listed local file, present or missing — never opened
+    local = local if local is not None else _link_full_gate_files(PROJECT_ROOT, None)
+    for rel in local.linked:
+        print(f"  local file {rel} ({FULL_GATE_LINK_FILES_KEY}): present in {PROJECT_ROOT} — would be linked into "
+              f"the worktree")
+    for rel, why in local.not_linked:
+        effect = ("a real run's SIT leg would be BLOCKED before any batch, the unit leg still runs" if "sit" in gates
+                  else "SIT is not gated here, so nothing is BLOCKED")
+        print(f"  local file {rel} ({FULL_GATE_LINK_FILES_KEY}): {'MISSING' if rel in local.missing else 'NOT LINKED'}"
+              f" — {rel} {why}; {effect}")
+        rc = 1 if "sit" in gates else rc
     if test_cmd and ACTIVE_REPO_NAME in _unit_gate_eligible_repos():
         hit = (_unit_cache_lookup(SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck, persist=False)
                if ck else None)
@@ -4915,11 +5010,23 @@ def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = No
                           "detail": (add.stderr or "").strip()[-300:], "failing_files": None, "new": []}
         else:
             links = _link_unit_deps(PROJECT_ROOT, wt)
+            local = _link_full_gate_files(PROJECT_ROOT, wt)     # [ORCH-FULLGATE-LOCAL-FILES-1] D1: torn down with them
+            links += local.links
             gates = tuple((PRE_MERGE_GATES.get(repo) or {}).get("gates") or ())
-            sit = (_full_gate_sit(wt, SIT_ARCHIVE_DIR, _full_gate_previous(prior, "sit")) if "sit" in gates else
+            if local.listed:
+                log.info(f"🔗 full-gate {repo}: {FULL_GATE_LINK_FILES_KEY} — {_describe_local_files(local.as_state())}")
+            if local.blocked:
+                (log.error if "sit" in gates else log.warning)(
+                    f"⛔ full-gate {repo}: {local.blocked} — "
+                    + ("the SIT leg is BLOCKED before any batch; the unit leg runs" if "sit" in gates
+                       else "SIT is not gated here"))
+            sit = (_full_gate_sit(wt, SIT_ARCHIVE_DIR, _full_gate_previous(prior, "sit"), local) if "sit" in gates else
                    {"ran": False, "outcome": "not gated", "detail": f"{repo}: no SIT leg (PRE_MERGE_GATES)",
                     "failing_files": None, "new": []})
             unit = _full_gate_unit(wt, SIT_ARCHIVE_DIR, sha, ck, ref, _full_gate_previous(prior, "unit"))
+            if local.listed:
+                for l in (sit, unit):                           # D3: each leg says what it ran with
+                    l["local_files"] = local.as_state()
         legs = (sit, unit)
         outcome = ("NEW FAILURES" if any(l.get("new") for l in legs)
                    else "BLOCKED" if any(l.get("outcome") == "BLOCKED" for l in legs) else "PASS")
@@ -4946,7 +5053,8 @@ def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = No
 
         def _leg(name: str, l: dict) -> str:
             new = f"; NEW: {', '.join(l['new'])}" if l.get("new") else ""
-            return f"{name} {l.get('outcome')} ({l.get('collection') or l.get('detail') or '-'}){new}"
+            files = f"; {_describe_local_files(l['local_files'])}" if l.get("local_files") else ""
+            return f"{name} {l.get('outcome')} ({l.get('collection') or l.get('detail') or '-'}){files}{new}"
         line = (f"🌙 full-gate {repo} @ {sha[:7]} ({ref}): {outcome} — {_leg('sit', sit)} | {_leg('unit', unit)} "
                 f"| {state['duration_s']:.0f}s → {full_gate_state_file(repo)}")
         (log.info if outcome == "PASS" else log.error)(line)
