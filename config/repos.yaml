@@ -84,7 +84,10 @@ repos:
     # SIT_BATCH_PAUSE_S in orchestrator.py; each SIT_TIMEOUT is the budget of one batch.
     sit_list_cmd: "npx vitest list --config vitest.sit.config.ts"
     sit_batch_files: 10
-    sit_batch_pause_s: 90
+    # D-S7CORE31-03 (S7-CORE-31, George 2026-10-17 12:48 "do 2"): no pause between batches on this LOCAL dev stack —
+    # both Medplum limiters are off here (MEDPLUM_DEFAULT_RATE_LIMIT -1, MEDPLUM_DEFAULT_FHIR_QUOTA 1000000) and no
+    # recent gate log shows a 429. Back to 90 on the first 429. Was 90.
+    sit_batch_pause_s: 0
     # ORCH-GATE-COST-1 (S7-CORE-30, D-S7CORE29-02): per merge, SIT runs the files RELATED to the branch's diff —
     # the installed vitest's own `list --changed <merge base>` (files only, nothing run), plus the SIT files the
     # branch changes, plus an optional core set:
