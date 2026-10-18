@@ -537,6 +537,9 @@ class GateVerdict:
     detail: Optional[str] = None    # what triggered it — never a secret value
     collection: Optional[str] = None  # [ORCH-2] "7 files/18 tests, 6.6s" when the SIT summary parsed; None otherwise
     unit_collection: Optional[str] = None  # [ORCH-3] both sides of the unit baseline; None when the unit gate did not run
+    # [ORCH-BASELINE-REUSE-1] R3: the unit gate's outcome, on a PASS that ran the unit gate — the landing stores its
+    # branch run (_unit_cache_store_landed). None on every other verdict.
+    unit: Optional["UnitGateOutcome"] = None
 
     @property
     def label(self) -> str:
@@ -2874,6 +2877,11 @@ class UnitGateOutcome:
     # order/load-dependent, not a regression. Never empty on a FAIL(product) verdict alone.
     flaky_files: tuple = ()
     confirm: Optional[UnitSuiteRun] = None   # [GATE-CLOCK-1] the confirmation leg, when it ran
+    # [ORCH-BASELINE-REUSE-1] R3 · R2e: the commit the branch leg ran on (HEAD before it), and why the tree it measured
+    # was NOT that commit (HEAD moved during it, or something uncommitted outside briefs_subdir before it) — None
+    # when it was. Both None when the branch leg did not run. No verdict reads either.
+    branch_sha: Optional[str] = None
+    branch_tree_why: Optional[str] = None
 
     @property
     def clock(self) -> Optional[ClockViolation]:
@@ -3468,7 +3476,8 @@ def _unit_cache_lookup(archive: Path, repo_name: str, sha: str, cmd: str, repo_p
 
 
 def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: UnitSuiteRun,
-                      repo_path: Optional[Path] = None, content_key: Optional[str] = None):
+                      repo_path: Optional[Path] = None, content_key: Optional[str] = None,
+                      landed_as: Optional[str] = None):
     """Persist a MEASURED baseline. AC-O5-02: files, tests, failures, duration and the SHA.
     The suite output is deliberately NOT stored — it is only ever used to F-20-classify the
     BRANCH leg, and keeping 20KB per commit forever buys nothing.
@@ -3479,7 +3488,10 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
     measurement, so it is carried forward.
 
     [ORCH-GATE-COST-1] D2: keyed by `sha`'s content key, which the entry records beside `sha` (the commit
-    actually measured). A content key that cannot be read leaves the measurement uncached, said."""
+    actually measured). A content key that cannot be read leaves the measurement uncached, said.
+
+    [ORCH-BASELINE-REUSE-1] R1: `landed_as` — a landed route's branch run (`sha` the gated tip it measured), stored
+    for the commit it landed as; the entry then says so in two additive fields, `measured_as` and `landed_as`."""
     if run.clock is not None:
         return   # BASELINE-TRUST-1: never cached — the field below would be false
     ck = content_key or _unit_content_key(repo_path or _unit_cache_repo(), sha)
@@ -3508,6 +3520,8 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         "tests_xfailed": run.tests_xfailed, "tests_xpassed": run.tests_xpassed,   # [ORCH-ADMISSION-PARSER-1]
         # [CONFIG-TRUTH-1] additive: an entry without it predates GATE-CLOCK-1 and was never judged
         "clock": "plausible",
+        # [ORCH-BASELINE-REUSE-1] R1 additive: an entry without them was measured as a baseline leg
+        **({"measured_as": "route-branch", "landed_as": landed_as} if landed_as else {}),
         **flaky,
     }
     _unit_cache_write(archive, entries, "the baseline (the next route will re-measure)")
@@ -3550,6 +3564,70 @@ def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str,
         seen[f] = {"count": prior.get("count", 0) + 1, "last_seen": now}
     entry["flaky_seen"] = seen
     _unit_cache_write(archive, entries, "the flaky-file set")
+
+
+def _unit_cache_store_landed(repo_path: Path, verdict, merged_sha: Optional[str], archive: Path,
+                             route_tip: Optional[str] = None):
+    """[ORCH-BASELINE-REUSE-1] R1-R4: after a route LANDED, store its gate's branch run as the cached baseline of
+    the commit it landed as, so the next route off that tree reads `[cache]` instead of measuring the same tree
+    again (290ea → 290eaa: 552.4 s, then 556.2 s on the same 1311 files). Stored only if ALL of R2 hold — (a) a PASS
+    with a unit branch run, (b) that leg judged plausible, complete and cacheable, (c) the baseline the gate
+    accepted was measured, cached or not needed, (d) no flake and no branch failing file outside that baseline,
+    (e) the leg measured commit T and the landing merged T, (f) the merged commit's non-briefs tree is T's,
+    (g) no judged entry for that tree yet — else nothing, and one line naming the first that failed.
+
+    Called only after a landing succeeded; never on a conflict or a not-landed route. Never raises and never
+    changes the route: any exception is one warning line and nothing stored."""
+    m7 = (merged_sha or "?")[:7]
+    try:
+        cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
+        uo = verdict.unit if verdict is not None and verdict.outcome is GateOutcome.PASS else None
+        b = uo.branch if uo is not None and uo.ran else None
+        base = set(uo.baseline.failing_files) if uo is not None and uo.baseline is not None else set()
+        tip, ck_m, ck_t, why = (uo.branch_sha if uo is not None else None), None, None, None
+        if b is None:
+            why = ("(a) no unit branch run — " + (f"the unit gate was {uo.signal or 'not run'}" if uo is not None
+                                                  else (getattr(verdict, "detail", None) or "no unit gate outcome")))
+        elif b.clock is not None:
+            why = f"(b) the branch leg's clock is implausible ({b.clock})"
+        elif b.error is not None or not _unit_is_cacheable(b):
+            why = f"(b) the branch leg is not a cacheable measurement ({b.error or b.collection or 'nothing parsed'})"
+        elif uo.baseline_source not in ("measured", "cache", "not-needed"):
+            why = (f"(c) the baseline the gate accepted is {uo.baseline_source} — only a measured, cached or "
+                   f"not-needed one vouches for the branch run")
+        elif uo.flaky_files:
+            why = f"(d) the gate confirmed flaky file(s) in isolation: {', '.join(uo.flaky_files)}"
+        elif set(b.failing_files) - base:
+            why = (f"(d) the branch run fails file(s) the accepted baseline does not: "
+                   f"{', '.join(sorted(set(b.failing_files) - base))}")
+        elif not tip or uo.branch_tree_why:
+            why = f"(e) the branch leg did not measure a commit — {uo.branch_tree_why or 'no commit recorded'}"
+        elif tip != route_tip:
+            why = f"(e) the landing merged {(route_tip or '?')[:7]}, not the gated tip {tip[:7]}"
+        elif None in (ck_m := _unit_content_key(repo_path, merged_sha), ck_t := _unit_content_key(repo_path, tip)):
+            why = f"(f) the content key of {m7 if ck_m is None else tip[:7]} could not be read (git ls-tree)"
+        elif ck_m != ck_t:
+            why = (f"(f) the merged commit's non-briefs tree is not the gated tip's ({tip[:7]}) — {MERGE_TARGET} "
+                   f"gained a non-briefs change between fork and merge")
+        elif (prior := _unit_cache_lookup(archive, ACTIVE_REPO_NAME, merged_sha, cmd, content_key=ck_m)) \
+                and _unit_cache_judged(prior):
+            why = (f"(g) a judged entry already stands for this tree (measured at {str(prior.get('sha'))[:7]}, "
+                   f"{str(prior.get('measured_at') or '?')[:19]}) — the first measurement stands")
+        if why:
+            log.info(f"♻️  Unit baseline: route branch run NOT cached for {m7} — {why}")
+            return
+        _unit_cache_store(archive, ACTIVE_REPO_NAME, tip, cmd, b, repo_path=repo_path, content_key=ck_m,
+                          landed_as=merged_sha)
+        e = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, merged_sha, cmd, content_key=ck_m)
+        if not e or e.get("landed_as") != merged_sha:
+            log.info(f"♻️  Unit baseline: route branch run NOT cached for {m7} — the cache write did not land "
+                     f"(see the warning above)")
+            return
+        log.info(f"♻️  Unit baseline: route branch run cached for {m7} (gated tip {tip[:7]}, non-briefs tree "
+                 f"identical) — {b.collection}; the next route off this tree reads it")
+    except Exception as e:
+        log.warning(f"♻️  Unit baseline: route branch run NOT cached for {m7} — the check raised "
+                    f"{type(e).__name__}: {e}; nothing stored")
 
 
 def _flaky_collect(archive: Path, repo_filter: str = "") -> dict:
@@ -3930,12 +4008,13 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
         run = _unit_run_from_cache(hit, f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]}"
                                         + ("" if same else f" (measured at {at[:7]})"))
         measured_at = hit.get("measured_at", "?")[:19]
-        note = (f"read from cache — cache hit by content: measured at {at[:7]}, merge base {base_sha[:7]}, "
+        how = " (a route's branch run)" if hit.get("measured_as") else ""   # [ORCH-BASELINE-REUSE-1] R4
+        note = (f"read from cache — cache hit by content: measured at {at[:7]}{how}, merge base {base_sha[:7]}, "
                 f"non-briefs tree identical (measured {measured_at}, "
                 f"{run.collection or 'collection unknown'} in {run.duration_s:.1f}s); "
                 f"not re-run (the baseline for a tree does not change)")
-        log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} by content (measured at {at[:7]}, non-briefs tree "
-                 f"identical) — {run.collection}; no baseline run")
+        log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} by content (measured at {at[:7]}{how}, non-briefs "
+                 f"tree identical) — {run.collection}; no baseline run")
         log.info(f'🛡 baseline-trust: CLEAN — cache hit at {base_sha[:7]}, measured {measured_at} on a clock '
                  f'judged plausible (cache entry "clock": "{hit["clock"]}")')
         return run, "cache", note
@@ -4046,26 +4125,54 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
 
     label = branch_name or "HEAD"
     log.info(f"🧪 Unit baseline gate [{ACTIVE_REPO_NAME}]: {test_cmd} — branch {label} vs merge-base {base_sha[:7]}")
+    # [ORCH-BASELINE-REUSE-1] R3 · R2e: is the tree the branch leg measures a commit? HEAD before == after it, and
+    # nothing outside briefs_subdir uncommitted or untracked before it (git-ignored paths are not the commit's either
+    # way). Recorded on the outcome for the landing's cache store; no verdict reads it.
+    tip, tree_why, briefs = _git_read("git rev-parse HEAD", repo_path), None, _active_briefs_subdir()
+    try:
+        st = subprocess.run(["git", "-C", str(repo_path), "--no-optional-locks", "status", "--porcelain",
+                             "--untracked-files=all", "-z"], capture_output=True, text=True, timeout=120)
+        fields = st.stdout.split("\0") if st.returncode == 0 and isinstance(st.stdout, str) else None
+    except Exception:
+        fields = None
+    if not tip or fields is None:
+        tree_why = "HEAD or `git status` could not be read before it"
+    else:
+        dirty, it = [], iter(fields)
+        for f in it:   # `XY path`, and a rename's or copy's source path as the next field
+            for p in [f[3:]] + ([next(it, "")] if f[:1] in ("R", "C") else []):
+                if p and not _under_subdir(p, briefs):
+                    dirty.append(p)
+        if dirty:
+            tree_why = (f"uncommitted outside {briefs}/ before it: {', '.join(dirty[:5])}"
+                        + (f", … +{len(dirty) - 5} more" if len(dirty) > 5 else ""))
     branch_run = _run_unit_suite(test_cmd, repo_path, label)
+    after = _git_read("git rev-parse HEAD", repo_path)
+    if tree_why is None and after != tip:
+        tree_why = f"HEAD moved during it ({tip[:7]} → {after[:7] or '?'})"
     log.info(f"🧪 Unit gate branch run — {branch_run.describe}")
     archive = archive_path or SIT_ARCHIVE_DIR
     branch_run.clock = _judge_leg("unit-branch", branch_run.clocks, archive,
                                   red=branch_run.exit_code != 0 or bool(branch_run.failures),
                                   completed=branch_run.error is None)
 
+    def _finish(o: UnitGateOutcome) -> UnitGateOutcome:
+        o.branch_sha, o.branch_tree_why = tip or None, tree_why
+        return _unit_done(o, started, repo_path, archive_path)
+
     baseline_run = None
     baseline_note = None
     if branch_run.error == "timeout":
         detail = f"branch suite exceeded {UNIT_GATE_TIMEOUT}s — no product verdict was produced"
         log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment)")
-        return _unit_done(UnitGateOutcome(passed=False, signal="timeout", detail=detail, env=True,
-                                          ran=True, branch=branch_run), started, repo_path, archive_path)
+        return _finish(UnitGateOutcome(passed=False, signal="timeout", detail=detail, env=True,
+                                       ran=True, branch=branch_run))
     if branch_run.tests_total == 0 or branch_run.test_files_total == 0:
         # §2.4 / AC-O3-07: a green exit over an empty collection tested nothing.
         detail = f"branch suite collected NOTHING ({branch_run.collection}) — nothing was tested"
         log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not PASS, not FAIL(product)")
-        return _unit_done(UnitGateOutcome(passed=False, signal="zero-collection", detail=detail, env=True,
-                                          ran=True, branch=branch_run), started, repo_path, archive_path)
+        return _finish(UnitGateOutcome(passed=False, signal="zero-collection", detail=detail, env=True,
+                                       ran=True, branch=branch_run))
 
     # [ORCH-5]'s green-branch fast path is the one consumer of `failures` that reads an
     # ABSOLUTE threshold rather than a delta, so it is the one the [ORCH-8] correction
@@ -4083,18 +4190,14 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         # measurement happened.
         baseline_source = "not-needed"
         log.info(f"✅ UNIT BASELINE GATE PASSED — branch green: {branch_run.describe}; baseline {baseline_note}")
-        return _unit_done(UnitGateOutcome(passed=True, ran=True, branch=branch_run,
-                                          baseline_note=baseline_note, baseline_source=baseline_source,
-                                          detail=f"branch green ({branch_run.collection})"),
-                          started, repo_path, archive_path)
+        return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run,
+                                       baseline_note=baseline_note, baseline_source=baseline_source,
+                                       detail=f"branch green ({branch_run.collection})"))
 
     # [ORCH-5]: measured once per merge base, then reused. The measurement is still OURS and
     # still on the merge base — it is simply not repeated for a commit that has not changed.
     baseline_run, baseline_source, baseline_note = _unit_baseline_measure_or_reuse(
         repo_path, base_sha, test_cmd, archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME)
-
-    def _finish(o: UnitGateOutcome) -> UnitGateOutcome:
-        return _unit_done(o, started, repo_path, archive_path)
 
     if baseline_source == "implausible":
         # [BASELINE-TRUST-1] P-BASE: the branch has failures, so any verdict here is a comparison,
@@ -4597,7 +4700,7 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
     if sit_na:
         reason += f"; {sit_na}"
     v = GateVerdict(GateOutcome.PASS, None, None, reason,
-                    collection=sit_collection, unit_collection=unit_collection)
+                    collection=sit_collection, unit_collection=unit_collection, unit=uo)
     log.info(f"✅ Pre-merge gate{where}: {v.label}")
     return v
 
@@ -5537,6 +5640,9 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                         if unlanded is None:
                             retire_batch_file(batch_file)   # QUEUE-RETIRE-1, as below
                             subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                            # [ORCH-BASELINE-REUSE-1] R3: the worktree's detached HEAD is the commit that landed
+                            _unit_cache_store_landed(proj, verdict, _git_read("git rev-parse HEAD", proj),
+                                                     SIT_ARCHIVE_DIR, route_tip=route_tip)
                         else:
                             status = Status.FAILED
                             gate_error = f"{unlanded}; gate was {gate_outcome}"
@@ -5581,6 +5687,9 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                                 retire_batch_file(batch_file)
                                 # Clean up feature branch
                                 subprocess.run(f"git branch -d {branch_name}", shell=True, capture_output=True, cwd=str(proj))
+                                # [ORCH-BASELINE-REUSE-1] R3: landed — its branch run may be the next route's baseline
+                                _unit_cache_store_landed(proj, verdict, post_merge_tip, SIT_ARCHIVE_DIR,
+                                                         route_tip=route_tip)
                         else:
                             # [ORCH-CONFLICT-1] a merge that did not land is never `passed`. Abort it
                             # so MERGE_TARGET is left at its pre-merge tip with a clean tree; keep
