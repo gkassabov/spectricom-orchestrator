@@ -52,7 +52,7 @@ from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, DEFAULT_EXECUT
                           FOREGROUND_BOUND_VARS, ClockViolation, LegClocks, QueueRepo,
                           check_bg_ceiling_invariants, check_branch_freshness_invariants,
                           check_clock_plausibility, check_foreground_invariants,
-                          check_handback_invariants, check_route_landed_invariants,
+                          check_handback_invariants, check_route_landed_invariants, clock_slow_note,
                           executor_default, load_outstanding_work_rules, queue_header)
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
@@ -382,7 +382,13 @@ UNIT_FLAKY_QUARANTINE_THRESHOLD = 2
 # build gate records nothing at all. An implausible leg is never written here.
 GATE_DURATIONS_FILE = "gate-durations.json"
 GATE_DURATIONS_VERSION = 1
-GATE_DURATIONS_KEEP = 20   # newest plausible samples kept per (repo, leg kind); the median reads them all
+GATE_DURATIONS_KEEP = 20   # newest plausible samples kept per (repo, leg kind, bucket); the median reads them all
+# [ORCH-CLOCKGUARD-1] K3: a leg that runs a list of files it was handed (a SIT batch, the isolation re-runs, the unit
+# confirmation) is judged against legs of its kind over about as many files — route 282c's 1-file isolation leg must
+# not be compared with a batch. (lo, hi, label), hi None = no bound; the label is the sample's "files". A sample
+# stored without one (before K3) is its leg kind's, read by every bucket; none is rewritten. A whole-suite leg
+# (build, sit-run, unit-branch, unit-baseline) has no file count and reads its whole kind, as before.
+GATE_DURATIONS_BUCKETS = ((1, 1, "1"), (2, 10, "2-10"), (11, None, "11+"))
 # [ORCH-GATE-COST-1] D1 (D-S7CORE29-02): a merge whose diff touches only briefs_subdir runs no build, SIT or
 # unit leg — routes 267 and 268 paid 46 and 45 min of gates for a brief and a handback (L-150). The verdict
 # names the files, at most this many, then how many more.
@@ -1875,22 +1881,46 @@ def _gate_durations_load(archive: Path) -> dict:
     return repos if isinstance(repos, dict) else {}
 
 
-def _gate_durations_history(archive: Path, kind: str) -> list:
-    """The recorded plausible wall durations of (ACTIVE_REPO_NAME, kind), oldest first."""
+def _gate_files_bucket(files: Optional[int]) -> Optional[str]:
+    """[ORCH-CLOCKGUARD-1] K3: the GATE_DURATIONS_BUCKETS label of a leg over `files` files; None = no file count."""
+    if files is None:
+        return None
+    for lo, hi, label in GATE_DURATIONS_BUCKETS:
+        if files >= lo and (hi is None or files <= hi):
+            return label
+    return None
+
+
+def _gate_durations_in(sample: dict, bucket: Optional[str]) -> bool:
+    """[ORCH-CLOCKGUARD-1] K3: whether a leg in `bucket` reads `sample` — its own bucket's samples and the kind's
+    unbucketed ones; a leg with no bucket reads the whole kind."""
+    return bucket is None or sample.get("files") in (None, bucket)
+
+
+def _gate_durations_history(archive: Path, kind: str, files: Optional[int] = None) -> list:
+    """The recorded plausible wall durations of (ACTIVE_REPO_NAME, kind), oldest first — [ORCH-CLOCKGUARD-1] K3:
+    of a leg over `files` files, those of its bucket (_gate_durations_in)."""
+    bucket = _gate_files_bucket(files)
     samples = ((_gate_durations_load(archive).get(ACTIVE_REPO_NAME) or {}).get(kind)) or []
     return [float(s["d_wall"]) for s in samples
-            if isinstance(s, dict) and isinstance(s.get("d_wall"), (int, float))]
+            if isinstance(s, dict) and isinstance(s.get("d_wall"), (int, float)) and _gate_durations_in(s, bucket)]
 
 
-def _gate_durations_record(archive: Path, kind: str, d_wall: float, d_mono: float):
-    """Append one PLAUSIBLE sample to (ACTIVE_REPO_NAME, kind), keeping the newest GATE_DURATIONS_KEEP."""
+def _gate_durations_record(archive: Path, kind: str, d_wall: float, d_mono: float, files: Optional[int] = None):
+    """Append one PLAUSIBLE sample to (ACTIVE_REPO_NAME, kind), keeping the newest GATE_DURATIONS_KEEP.
+    [ORCH-CLOCKGUARD-1] K3: a leg over `files` files stores its bucket as "files", and the cap is on what that
+    bucket reads — another bucket's samples are kept; an unbucketed one ages out as the bucket fills."""
     repos = _gate_durations_load(archive)
     kinds = repos.get(ACTIVE_REPO_NAME)
     if not isinstance(kinds, dict):
         kinds = repos[ACTIVE_REPO_NAME] = {}
+    bucket = _gate_files_bucket(files)
     samples = [s for s in (kinds.get(kind) or []) if isinstance(s, dict)]
-    samples.append({"at": datetime.now().isoformat(), "d_wall": round(d_wall, 2), "d_monotonic": round(d_mono, 2)})
-    kinds[kind] = samples[-GATE_DURATIONS_KEEP:]
+    samples.append({"at": datetime.now().isoformat(), "d_wall": round(d_wall, 2), "d_monotonic": round(d_mono, 2),
+                    **({} if bucket is None else {"files": bucket})})
+    read = [i for i, s in enumerate(samples) if _gate_durations_in(s, bucket)]
+    old = set(read[:-GATE_DURATIONS_KEEP])
+    kinds[kind] = [s for i, s in enumerate(samples) if i not in old]
     try:
         archive.mkdir(parents=True, exist_ok=True)
         (archive / GATE_DURATIONS_FILE).write_text(
@@ -1900,22 +1930,27 @@ def _gate_durations_record(archive: Path, kind: str, d_wall: float, d_mono: floa
 
 
 def _judge_leg(kind: str, clocks: Optional[tuple], archive: Path, *, red: bool,
-               completed: bool = True) -> Optional[ClockViolation]:
+               completed: bool = True, files: Optional[int] = None) -> Optional[ClockViolation]:
     """[GATE-CLOCK-1] P-CLOCK and P-SAY for ONE leg that ran: exactly one `🛡 clock-plausibility:`
-    line, CLEAN or IMPLAUSIBLE, green or red. The leg's wall duration joins the (repo, kind) history
+    line, CLEAN, SLOW or IMPLAUSIBLE, green or red. The leg's wall duration joins the (repo, kind) history
     iff it is plausible and ran to completion (a timeout's duration is its budget, not a sample).
     `clocks` is (start, end) LegClocks; None ⇒ the leg was not measured now (a cache hit, a stub) —
-    not engaged, no line. Returns the violation, or None when plausible."""
+    not engaged, no line. Returns the violation, or None when plausible.
+    [ORCH-CLOCKGUARD-1] K1: SLOW (clock_slow_note) is a plausible leg on agreeing measured clocks that is
+    clause 3's outlier — said, recorded, and None: the verdict is what the leg measured. K3: `files` is how
+    many files the leg ran when it was handed a list; its history is that bucket's (_gate_files_bucket)."""
     if clocks is None:
         return None
     start, end = clocks
-    history = _gate_durations_history(archive, kind)
+    history = _gate_durations_history(archive, kind, files)
     found = check_clock_plausibility(kind, start, end, history)
     d_boot = ("n/a (no CLOCK_BOOTTIME)" if start.boottime is None or end.boottime is None
               else f"{end.boottime - start.boottime:.1f}s")
-    hist = (f"outlier clause against the median of {len(history)} plausible samples"
+    bucket = _gate_files_bucket(files)
+    of = "" if bucket is None else f"bucket: {bucket} file{'' if bucket == '1' else 's'}"
+    hist = (f"outlier clause against the median of {len(history)} plausible samples{f' ({of})' if of else ''}"
             if len(history) >= CLOCK_HISTORY_MIN else
-            f"outlier clause dormant ({len(history)} < {CLOCK_HISTORY_MIN} plausible samples)")
+            f"outlier clause dormant ({len(history)} < {CLOCK_HISTORY_MIN} plausible samples{f'; {of}' if of else ''})")
     if found:
         v = found[0]
         what = "red: not a product verdict" if red else "green: stays green"
@@ -1923,25 +1958,30 @@ def _judge_leg(kind: str, clocks: Optional[tuple], archive: Path, *, red: bool,
                     f"[{what}; not recorded]")
         return v
     d_wall, d_mono = end.wall - start.wall, end.monotonic - start.monotonic
-    log.info(f"🛡 clock-plausibility: CLEAN — {kind} Δwall {d_wall:.1f}s, Δmonotonic {d_mono:.1f}s, "
-             f"Δboottime {d_boot}; {hist}")
+    slow = clock_slow_note(kind, start, end, history)
+    if slow:
+        log.info(f"🛡 clock-plausibility: SLOW — {slow} (Δmonotonic {d_mono:.1f}s, Δboottime {d_boot}); {hist} "
+                 f"[{'red' if red else 'green'}: the verdict is what the leg measured]")
+    else:
+        log.info(f"🛡 clock-plausibility: CLEAN — {kind} Δwall {d_wall:.1f}s, Δmonotonic {d_mono:.1f}s, "
+                 f"Δboottime {d_boot}; {hist}")
     if completed:
-        _gate_durations_record(archive, kind, d_wall, d_mono)
+        _gate_durations_record(archive, kind, d_wall, d_mono, files)
     return None
 
 
-def _run_leg(kind: str, archive: Path, cmd: str, **kwargs) -> tuple:
+def _run_leg(kind: str, archive: Path, cmd: str, *, files: Optional[int] = None, **kwargs) -> tuple:
     """[GATE-CLOCK-1] subprocess.run(cmd, **kwargs) as one timed leg of `kind`: returns
     (CompletedProcess, ClockViolation | None). A leg that raises — its timeout included — is judged
     as incomplete and red, the verdict is attached to the exception as `gate_clock`, and the
-    exception propagates to the caller's own handler."""
+    exception propagates to the caller's own handler. `files`: _judge_leg's (ORCH-CLOCKGUARD-1 K3)."""
     c0 = _leg_clocks()
     try:
         r = subprocess.run(cmd, **kwargs)
     except Exception as e:
-        e.gate_clock = _judge_leg(kind, (c0, _leg_clocks()), archive, red=True, completed=False)
+        e.gate_clock = _judge_leg(kind, (c0, _leg_clocks()), archive, red=True, completed=False, files=files)
         raise
-    return r, _judge_leg(kind, (c0, _leg_clocks()), archive, red=r.returncode != 0)
+    return r, _judge_leg(kind, (c0, _leg_clocks()), archive, red=r.returncode != 0, files=files)
 
 
 def _gate_env_file(repo_path: Path) -> tuple[Optional[str], Optional[Path]]:
@@ -2385,7 +2425,7 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
             time.sleep(plan.pause_s)
         cmd = f"{sit_cmd} -- {' '.join(shlex.quote(f) for f in files)}"
         started = time.time()
-        r, clock = _run_leg(kind, archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path),
+        r, clock = _run_leg(kind, archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path), files=len(files),
                             shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
         out.clock = out.clock or clock
         d = time.time() - started
@@ -2532,7 +2572,7 @@ def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list,
              f"contaminated: {', '.join(iso.contaminated) or '(none)'}; "
              f"confirmed: {', '.join(iso.confirmed) or '(none)'}")
     iso.clock = _judge_leg("sit-isolation", (c0, _leg_clocks()), archive or SIT_ARCHIVE_DIR,
-                           red=bool(iso.error or iso.confirmed), completed=iso.error is None)
+                           red=bool(iso.error or iso.confirmed), completed=iso.error is None, files=len(files))
     # [ORCH-HANDBACK-SILENT-PASS] P-SAY: exactly one verdict line per engagement, on every path.
     if iso.error:
         log.error(f"🛡 sit-isolation: BLOCKED — {iso.error}: {iso.detail}")
@@ -4256,7 +4296,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         if confirm_run is not None:
             confirm_run.clock = _judge_leg("unit-confirm", confirm_run.clocks, archive,
                                            red=flakes is None or bool(regressions),
-                                           completed=confirm_run.error is None)
+                                           completed=confirm_run.error is None, files=len(new_files))
         if flakes is None:
             # decision 4: fail closed. A confirmation pass that did not complete is not
             # evidence of health — never PASS, never FAIL(product).
@@ -4442,10 +4482,14 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
          An unreadable isolation measurement ⇒ BLOCKED(environment) `isolation-unmeasurable`;
          any file confirmed failing alone ⇒ FAIL(product); only contaminated files ⇒ PASS
          `batch-contamination`, named. No isolation, or a skipped one ⇒ the product fall-through.
+         [ORCH-CLOCKGUARD-1] K2: a file confirmed failing alone is FAIL(product) naming it, and rule 4
+         never voids it — route 282c's real red was BLOCKED on the isolation leg's outlier clause. A
+         violation on the isolation leg itself (`isolation.clock`) is said beside the file ("measured on
+         an implausible clock — re-run before believing"); another leg's is said, and changes nothing.
 
     S7-CORE-16 [GATE-CLOCK-1], the last clause before the product verdict:
       4. A red whose gate timed a leg across a clock jump, a suspend or a > 5× outlier (`clock`,
-         the gate's first implausible leg) ⇒ BLOCKED(environment) `clock-implausible`: the
+         the gate's first implausible leg; the outlier only with a boottime missing — ORCH-CLOCKGUARD-1 K1) ⇒ BLOCKED(environment) `clock-implausible`: the
          measurement is not evidence about the product. It never touches rules 1-3's own
          BLOCKED or PASS results — a sleep can manufacture failures, it cannot manufacture passes."""
     text = _ANSI_RE.sub("", output or "")
@@ -4481,8 +4525,15 @@ def _classify_gate_failure(gate: str, output: str, repo_path: Path, exit_code: i
         if isolation.confirmed:
             also = (f"; contaminated (passed alone, not counted): {', '.join(isolation.contaminated)}"
                     if isolation.contaminated else "")
+            own = (f" (measured on an implausible clock — re-run before believing: {isolation.clock})"
+                   if isolation.clock is not None else "")
+            other = (f"; another leg's clock ({clock}) does not void a file confirmed alone"
+                     if clock is not None and clock is not isolation.clock else "")
             product = (f"no F-20 environment signal in gate output{seen}; confirmed failing alone: "
-                       f"{', '.join(isolation.confirmed)}{also} — product verdict stands")
+                       f"{', '.join(isolation.confirmed)}{own}{also}{other} — product verdict stands")
+            if clock is not None:
+                log.info(f"🔎 F-20 {gate} gate: confirmed failing alone, the clock does not void it — {clock}")
+            return GateVerdict(GateOutcome.FAIL_PRODUCT, gate, f"exit {exit_code}", product)
         elif isolation.contaminated:
             why = "; ".join(
                 f"{f} failed in batch {isolation.batch_of.get(f, '?')}/{isolation.batches or '?'} beside "
@@ -5004,7 +5055,7 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
     flakes, regressions, confirm = _unit_confirm_new_files(wt, test_cmd, label, suspects)
     if confirm is not None:
         confirm.clock = _judge_leg("unit-confirm", confirm.clocks, archive, red=flakes is None or bool(regressions),
-                                   completed=confirm.error is None)
+                                   completed=confirm.error is None, files=len(suspects))
         out["confirm_clock"] = "plausible" if confirm.clock is None else str(confirm.clock)
     if flakes is None:
         return {**out, "outcome": "BLOCKED", "signal": "confirmation-unmeasurable",

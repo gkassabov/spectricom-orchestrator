@@ -302,13 +302,13 @@ class TestBounds:
     def test_outlier_5_0x_is_plausible_5_01x_is_not(self):
         h = [100.0, 100.0, 100.0]
         assert _judge(500.0, 500.0, history=h) == []
-        assert _judge(501.0, 501.0, history=h) == ["outlier-vs-history"]
+        assert _judge(501.0, 501.0, history=h) == []   # ORCH-CLOCKGUARD-1 K1: boottime known ⇒ SLOW, not a violation
 
     def test_two_samples_the_outlier_clause_does_not_fire(self):
         assert _judge(100_000.0, 100_000.0, history=[100.0, 100.0]) == []
 
     def test_median_not_mean(self):
-        assert _judge(501.0, 501.0, history=[100.0, 100.0, 100_000.0]) == ["outlier-vs-history"]
+        assert _judge(501.0, 501.0, history=[100.0, 100.0, 100_000.0]) == []   # ORCH-CLOCKGUARD-1 K1
 
     def test_boottime_unavailable_skips_only_the_suspend_clause(self):
         assert _judge(100.0, 100.0, d_boot=False) == []
@@ -404,14 +404,14 @@ class TestHistory:
             gate.suite.script("branch", GREEN, 0, SECOND_FIRE)
             assert gate.run().outcome is orchestrator.GateOutcome.PASS
         assert gate.samples("unit-branch") == [336.7] * 3
-        # 1700 s on a sane clock, > 5 × 336.7 = 1683.5 — a red outlier is not a product verdict
+        # 1700 s on a sane clock, > 5 × 336.7 = 1683.5 — ORCH-CLOCKGUARD-1 K1: boottime known ⇒ SLOW, the red stands
         gate.suite.script("branch", BRANCH_59, 1, (1700.0, 1700.0, 1700.0))
         gate.suite.script("baseline", BASE_59[4], 1, (338.8, 338.8, 338.8))
         gate.suite.script("confirm", CONFIRM_59, 1, (7.4, 7.4, 7.4))
         v = gate.run()
-        assert (v.outcome, v.signal) == (orchestrator.GateOutcome.BLOCKED_ENV, "clock-implausible"), v.label
-        assert "unit-branch outlier-vs-history" in v.detail
-        assert gate.samples("unit-branch") == [336.7] * 3
+        assert (v.outcome, v.signal) == (orchestrator.GateOutcome.FAIL_PRODUCT, "regression"), v.label
+        assert "unit-branch outlier-vs-history" not in v.detail
+        assert gate.samples("unit-branch") == [336.7] * 3 + [1700.0]
 
     def test_history_is_capped(self, gate):
         keep = orchestrator.GATE_DURATIONS_KEEP

@@ -1069,11 +1069,18 @@ def check_foreground_invariants(site: str, env: Optional[Mapping[str, str]],
 #
 #     plausible(l) ⇔ |Δwall − Δmonotonic| ≤ CLOCK_WALL_JUMP_S               (no NTP / Hyper-V step)
 #                  ∧ (Δboottime unknown ∨ Δboottime − Δmonotonic ≤ CLOCK_SUSPEND_S)  (no kernel suspend)
-#                  ∧ (|H| < CLOCK_HISTORY_MIN ∨ Δwall ≤ CLOCK_OUTLIER_FACTOR · median(H))
+#                  ∧ (Δboottime known ∨ |H| < CLOCK_HISTORY_MIN ∨ Δwall ≤ CLOCK_OUTLIER_FACTOR · median(H))
 #
 # The caller maps an implausible RED leg to BLOCKED(environment) `clock-implausible` — a sleep can
 # manufacture failures — keeps an implausible GREEN leg green, saying so (it cannot manufacture
 # passes), and never records an implausible leg's duration into H.
+#
+# [ORCH-CLOCKGUARD-1] (S7-CORE-31) K1: route 282c's isolation leg took 70.1 s against a 7.7 s median with
+# Δwall ≈ Δmonotonic ≈ Δboottime — a slow leg on a sound clock, called implausible, and a real red was voided.
+# With both boottimes known the suspend clause measures a sleep directly, so the outlier clause is only a note
+# there (clock_slow_note: `SLOW`), never a violation; with a boottime missing it stays the only suspend detector.
+# H is the (repo, leg kind, file-count bucket) history (K3, orchestrator._gate_files_bucket). K2: the caller
+# never voids a file the SIT isolation leg confirmed failing alone (orchestrator._classify_gate_failure).
 
 CLOCK_WALL_JUMP_S = 60.0
 CLOCK_SUSPEND_S = 60.0
@@ -1114,16 +1121,18 @@ def check_clock_plausibility(leg_kind: str, clocks_start: LegClocks, clocks_end:
                              history: Sequence[float]) -> list[ClockViolation]:
     """[GATE-CLOCK-1] EMPTY WHEN PLAUSIBLE. Pure: no I/O and no clock read — the caller reads the
     clocks and the history. The set is ONE leg of kind `leg_kind`; `history` is the recorded
-    plausible wall durations of the same (repo, leg kind). At most one violation — the FIRST that
-    applies, in this order:
+    plausible wall durations of the same (repo, leg kind, file-count bucket). At most one violation —
+    the FIRST that applies, in this order:
 
       1. wall-jump           — |Δwall − Δmonotonic| > CLOCK_WALL_JUMP_S (either direction);
       2. suspended           — both boottimes known and Δboottime − Δmonotonic > CLOCK_SUSPEND_S;
-      3. outlier-vs-history  — len(history) >= CLOCK_HISTORY_MIN and
+      3. outlier-vs-history  — a boottime missing, len(history) >= CLOCK_HISTORY_MIN and
                                Δwall > CLOCK_OUTLIER_FACTOR × median(history).
 
     Fewer than CLOCK_HISTORY_MIN samples ⇒ clause 3 does not apply; no default median is invented.
     A missing boottime (non-Linux) skips clause 2 only.
+    [ORCH-CLOCKGUARD-1] K1: both boottimes known ⇒ clause 2 measures a suspend, and clause 3 is not a
+    violation: the same arithmetic is clock_slow_note's SLOW note, never this function's.
     """
     d_wall = clocks_end.wall - clocks_start.wall
     d_mono = clocks_end.monotonic - clocks_start.monotonic
@@ -1138,11 +1147,38 @@ def check_clock_plausibility(leg_kind: str, clocks_start: LegClocks, clocks_end:
         return _v("wall-jump")
     if d_boot is not None and d_boot - d_mono > CLOCK_SUSPEND_S:
         return _v("suspended")
-    if len(history) >= CLOCK_HISTORY_MIN:
-        median = statistics.median(history)
-        if d_wall > CLOCK_OUTLIER_FACTOR * median:
-            return _v("outlier-vs-history", median)
+    median = _clock_outlier_median(d_wall, history)
+    if median is not None and d_boot is None:
+        return _v("outlier-vs-history", median)
     return []
+
+
+def _clock_outlier_median(d_wall: float, history: Sequence[float]) -> Optional[float]:
+    """Clause 3's arithmetic: median(history) when len(history) >= CLOCK_HISTORY_MIN and
+    Δwall > CLOCK_OUTLIER_FACTOR × that median; else None."""
+    if len(history) < CLOCK_HISTORY_MIN:
+        return None
+    median = statistics.median(history)
+    return median if d_wall > CLOCK_OUTLIER_FACTOR * median else None
+
+
+def clock_slow_note(leg_kind: str, clocks_start: LegClocks, clocks_end: LegClocks,
+                    history: Sequence[float]) -> Optional[str]:
+    """[ORCH-CLOCKGUARD-1] K1 · NONE UNLESS SLOW. Pure, like check_clock_plausibility, over the same
+    arguments. A leg whose clocks are measured and agree — both boottimes known, no violation — but
+    whose Δwall is clause 3's outlier (> CLOCK_OUTLIER_FACTOR × the median of >= CLOCK_HISTORY_MIN
+    samples) is slow, not implausible: `<leg> Δwall <x>s > <f> × median <m>s; clocks agree`. A note,
+    never a verdict. None for a leg that is not slow, a dormant history, a boottime missing (clause 3
+    is then check_clock_plausibility's violation) or a leg that is implausible."""
+    if clocks_start.boottime is None or clocks_end.boottime is None:
+        return None
+    if check_clock_plausibility(leg_kind, clocks_start, clocks_end, history):
+        return None
+    d_wall = clocks_end.wall - clocks_start.wall
+    median = _clock_outlier_median(d_wall, history)
+    if median is None:
+        return None
+    return f"{leg_kind} Δwall {d_wall:.1f}s > {CLOCK_OUTLIER_FACTOR:g} × median {median:.1f}s; clocks agree"
 
 
 # ── EXECUTOR-DEFAULT-1 · the pipeline's one default executor (S7-CORE-16 · D-S7CORE15-01) ──────
