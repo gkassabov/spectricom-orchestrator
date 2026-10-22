@@ -39,6 +39,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import admission   # [ORCH-CAPACITY-1] C1: whether a route may start now; C4: the wall it runs under
+import prefire     # [ORCH-DEPENDS-ON-1] D4: a brief's `## Depends-on:` routes, judged as A11 judges them
 # QUEUE-RETIRE-1: one implementation of the trunk invariant, shared by the boot path and the
 # tests. It lives with the other boot asserts; nothing here reimplements it.
 from canon_assert import (DEFAULT_EXECUTOR_EFFORT, DEFAULT_EXECUTOR_MODEL, EXECUTOR_ENV,
@@ -64,7 +65,8 @@ CONTROL_ACK_WAIT_S = 15    # how long `pause` / `resume` wait for the acknowledg
 # What only the running daemon knows. A CLI process that saves state (enqueue, clear, a script's
 # reset) writes these back as it found them, never its own — it is not the daemon.
 DAEMON_OWNED_KEYS = ("daemon_status", "started_at", "current_batch", "paused_reason", "paused_at",
-                     "pid", "control_ack", "control_result", "waiting", "full_gate_nightly", "full_gate_running")
+                     "pid", "control_ack", "control_result", "waiting", "full_gate_nightly", "full_gate_running",
+                     "depends_waiting")
 # [ORCH-LANE-1] O2 · S7-CORE-19: 104 sat unfired behind `[QUEUE] PAUSED — max-consecutive:10`, a line in the
 # daemon log and nowhere else, until Gemma read that log. Every pause the daemon takes writes its NOTICE
 # here (reason, at, next brief, the exact resume command) and sends it to Slack when a webhook is
@@ -289,6 +291,37 @@ def status_line(st: dict) -> str:
     waiting = f" | waiting: {st['waiting']}" if st.get("waiting") and st.get("daemon_status") == "running" else ""
     return (f"daemon_status={st.get('daemon_status') or '-'} paused_reason={st.get('paused_reason') or '-'} "
             f"paused_at={st.get('paused_at') or '-'} | {who} | updated_at={st.get('updated_at') or '-'}{waiting}")
+
+
+# [ORCH-DEPENDS-ON-1] D4 · F-289: a brief whose unmet dependency the queue can no longer merge — in failed/, held/,
+# done/ unmerged, or nowhere — is parked here with a `<stem>.reason` line beside it: not failed/, not a pause.
+def depends_on_held_dir() -> Path:
+    """queue/held/depends-on/, resolved per call: QUEUE_DIR is patched in tests and the tray must follow it."""
+    return QUEUE_DIR / "held" / "depends-on"
+
+
+def depends_held() -> list:
+    """D4: the briefs parked in queue/held/depends-on/, each with its reason line — read off the disk, so `status`
+    from any process shows what the daemon held."""
+    tray = depends_on_held_dir()
+    out = []
+    for brief in sorted(tray.glob("*.md")) if tray.is_dir() else []:
+        try:
+            reason = (tray / f"{brief.stem}.reason").read_text(encoding="utf-8").strip()
+        except OSError:
+            reason = None
+        out.append({"file": brief.name, "reason": reason})
+    return out
+
+
+def depends_on_line(waiting, held) -> str:
+    """D4: what `status` adds to line 1 while a queued brief waits on a dependency, or one is held by it."""
+    parts = []
+    if isinstance(waiting, dict) and waiting:
+        parts.append("waiting: " + ", ".join(f"{b} ← {', '.join(s)}" for b, s in waiting.items()))
+    if held:
+        parts.append("held in queue/held/depends-on/: " + ", ".join(h["file"] for h in held))
+    return "⏳ depends-on " + " · ".join(parts) if parts else ""
 
 
 def request_control(action: str, reset_consecutive: bool = False, wait_s: float = CONTROL_ACK_WAIT_S,
@@ -563,6 +596,8 @@ class QueueDaemon:
         self.waiting = None            # [ORCH-CAPACITY-1] C1: why admission holds the next brief, None when not
         self._waiting_said = None      # C1: the reason last logged — one line per change of reason
         self.persisted_timeout = None  # C4: a persisted timeout_seconds, reported at start, never applied
+        self.depends_waiting = {}      # [ORCH-DEPENDS-ON-1] D4: {queued brief: the queued stems it waits on}
+        self._depends_unmovable = set()   # D4: held briefs that would not leave queue/ — passed over, said once
         # [ORCH-GATE-COST-1] D4: per repo {"ran_day", "deferred_day", "deferred", "skipped_day", "last"} — persisted, so
         # a restart never runs a second full gate the same day; and the run in hand, None between runs
         self.full_gate = {}
@@ -608,6 +643,7 @@ class QueueDaemon:
                 "control_ack": self.control_ack,       # P-RESUME: the last request applied
                 "control_result": self.control_result,
                 "waiting": self.waiting,               # [ORCH-CAPACITY-1] C1
+                "depends_waiting": self.depends_waiting,   # [ORCH-DEPENDS-ON-1] D4
                 "full_gate_nightly": self.full_gate,   # [ORCH-GATE-COST-1] D4
                 "full_gate_running": self.full_gate_running,
                 "queue": [f.name for f in self._scan_queue()],
@@ -647,6 +683,8 @@ class QueueDaemon:
                 "paused_reason": self.paused_reason,
                 "paused_at": self.paused_at,
                 "waiting": self.waiting,
+                "depends_waiting": self.depends_waiting,   # [ORCH-DEPENDS-ON-1] D4
+                "depends_held": depends_held(),
                 "started_at": self.started_at,
                 "current_batch": self.current_batch,
                 "current_elapsed_s": elapsed,
@@ -857,6 +895,66 @@ class QueueDaemon:
             if brief.exists():
                 self._mark_paused(f"refused-unmovable:{brief.name}")
             self._save_state()
+
+    def _next_brief(self, queue: list) -> Optional[Path]:
+        """[ORCH-DEPENDS-ON-1] D4 · F-289: the brief to fire — the first in filename order whose `## Depends-on:`
+        routes are all merged, judged by prefire.dependency_status (A11's own reading: canon_assert.route_merged).
+
+        A brief whose unmet dependencies are all still in queue/ waits where it is — said WAITING once, no pause —
+        and the next brief is taken. One with an unmet dependency the queue can no longer merge (failed/, held/,
+        done/ unmerged, nowhere) is parked in queue/held/depends-on/ on the way (_hold_depends_on). A brief with
+        no line is taken as today; so is one whose line cannot be read — A11 refuses it at the fire. None: nothing
+        may fire now."""
+        names = {b.name for b in queue}
+        waiting = {b: s for b, s in self.depends_waiting.items() if b in names}
+        self._depends_unmovable &= names
+        chosen = None
+        for brief in queue:
+            try:
+                deps, unreadable = prefire.dependency_status(brief, QUEUE_DIR, repo_route)
+            except Exception as e:      # never the loop's end: the fire's own A11 judges it again
+                print(f"[QUEUE] {brief.name}: its '## Depends-on:' could not be judged ({e}) — taken as it stands")
+                deps, unreadable = [], str(e)
+            unmet = [] if unreadable else [d for d in deps if not d.merged]
+            if not unmet:
+                waiting.pop(brief.name, None)
+                chosen = brief
+                break
+            if all(d.queued for d in unmet):
+                if brief.name not in waiting:
+                    print(f"[QUEUE] ⏳ {brief.name}: WAITING depends-on {'; '.join(map(str, unmet))} — not fired "
+                          f"until it merges; the next eligible brief fires")
+                waiting[brief.name] = [d.stem for d in unmet]
+                continue
+            waiting.pop(brief.name, None)
+            self._hold_depends_on(brief, unmet)
+        if waiting != self.depends_waiting:
+            with self.lock:
+                self.depends_waiting = waiting
+                self._save_state()
+        return chosen
+
+    def _hold_depends_on(self, brief: Path, unmet: list):
+        """D4: park a brief whose unmet dependency the queue cannot merge in queue/held/depends-on/, its reason in
+        `<stem>.reason` beside it. Nothing fired, so it is not a route: no completed/failed entry, no
+        stop_on_failure, no consecutive count, no pause. One that will not move stays in queue/, passed over by
+        _next_brief and never fired, said once."""
+        if brief.name in self._depends_unmovable:
+            return
+        reason = (f"HELD depends-on {'; '.join(map(str, unmet))} — the queue cannot merge it, so this brief is "
+                  f"not fired; move it back to queue/ once that route is merged")
+        tray = depends_on_held_dir()
+        if not _safe_move(brief, tray / brief.name):
+            self._depends_unmovable.add(brief.name)
+            print(f"[QUEUE] ⏸ {brief.name}: {reason} — it could not be moved to {tray}; it stays in queue/, "
+                  f"passed over")
+            return
+        try:
+            (tray / f"{brief.stem}.reason").write_text(f"{datetime.now().isoformat()} {brief.name}: {reason}\n",
+                                                       encoding="utf-8")
+        except OSError as e:
+            print(f"[QUEUE] could not write {brief.stem}.reason in {tray}: {e}")
+        print(f"[QUEUE] ⏸ {brief.name}: {reason} → {tray}/")
 
     def _poll_control(self):
         """[QUEUE-PAUSE-OPAQUE] P-RESUME, the daemon half: apply the request `pause` / `resume` left in
@@ -1121,8 +1219,10 @@ class QueueDaemon:
             if self._full_gate_step():   # D4: a scheduler step between routes — never over one
                 continue
 
-            queue = self._scan_queue()
-            if not queue:
+            # [ORCH-DEPENDS-ON-1] D4: filename order, less a brief waiting on a dependency still queued; one whose
+            # dependency the queue cannot merge is parked in queue/held/depends-on/ on the way. None: nothing to fire.
+            next_batch = self._next_brief(self._scan_queue())
+            if next_batch is None:
                 if self.waiting:
                     with self.lock:
                         self.waiting = self._waiting_said = None
@@ -1130,7 +1230,6 @@ class QueueDaemon:
                 time.sleep(10)
                 continue
 
-            next_batch = queue[0]
             batch_name = next_batch.name
             # [ORCH-YORSIE-SAFETY-1] Y1: a brief names its repo or is refused — before the fire lock and
             # before current_batch, so nothing fires and the next brief is taken at once.
@@ -1500,8 +1599,11 @@ def main(argv: list) -> int:
         # [ORCH-GATE-COST-1] D4: and each repo's last full-gate result, from state/full-gate-<repo>.json.
         summary = full_gate_summary()
         fg = full_gate_line(st, summary)
+        # [ORCH-DEPENDS-ON-1] D4: the briefs the daemon passes over for a queued dependency, and those it held.
+        deps = depends_on_line(st.get("depends_waiting"), depends_held())
         if not argv[1:]:
-            print(status_line(st) + (f" | {pause_notice_line(notice)}" if notice else "") + (f" | {fg}" if fg else ""))
+            print(status_line(st) + (f" | {pause_notice_line(notice)}" if notice else "") + (f" | {fg}" if fg else "")
+                  + (f" | {deps}" if deps else ""))
         r = d.get_status()
         r.update({k: st.get(k) for k in DAEMON_OWNED_KEYS})
         r["config"] = {**r["config"], **_executor_of(st)}   # the daemon's executor, not this process's

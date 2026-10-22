@@ -541,6 +541,18 @@ def _landed(repo: QueueRepo, branch: str) -> Optional[tuple[str, str, str]]:
     return None
 
 
+def route_merged(repo: QueueRepo, brief: str) -> Optional[tuple[str, str, str]]:
+    """THE answer to "is `brief`'s route on `repo`'s merge target?" — (commit, subject, evidence), or None.
+
+    [ORCH-DEPENDS-ON-1] D2 · A13: `brief` is a queue filename or its stem; the route is the branch
+    `repo.branch_for(brief)`, judged by _landed's three detectors. B6 (check_queue_trunk_invariants) and
+    prefire's A11 — which the daemon's depends-on order reads too (prefire.dependency_status) — both ask
+    here; neither reads git for it. None, unreadable included, is each caller's safe answer: B6 retires
+    nothing, A11 fires nothing.
+    """
+    return _landed(repo, repo.branch_for(brief))
+
+
 def queue_header(path: Path) -> dict[str, str]:
     """`#!queue model=… effort=… repo=…` on line 1 → {key: value}; no header ⇒ {}.
 
@@ -579,7 +591,7 @@ def check_queue_trunk_invariants(queue_dir: Path, repo: QueueRepo) -> list[Viola
         if declared and declared != repo.name:
             continue
         branch = repo.branch_for(brief.name)
-        landed = _landed(repo, branch)
+        landed = route_merged(repo, brief.name)
         if landed is None:
             continue
         sha, subject, evidence = landed

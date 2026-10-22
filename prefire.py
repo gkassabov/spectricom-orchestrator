@@ -32,6 +32,11 @@ ENFORCED:
                       (`npm test` without ' -- <path or pattern>', `sit:gate`, a merge-base baseline,
                       `pytest` without a path — staged off, A10_BARE_PYTEST) unless that line negates
                       it (do not / don't / never / not run).
+  A11 depends-on    — every route a '## Depends-on: <brief-stem>[@<repo>][, …]' line names (default repo: the
+                      brief's `#!queue … repo=`) is on its repo's merge target — canon_assert.route_merged, the
+                      predicate B6 asks. The failure names each unmet stem and where its brief sits; a line that
+                      cannot be read is a refusal. No line, no dependency.  [ORCH-DEPENDS-ON-1] F-289: 309b ran
+                      on top of a STOPPED 309a. queue_daemon orders the queue by the same answer (D4).
 
 NOT enforced here: A3-A7, nor SESSION-BOOT's own A9 (System Prompt v5-38) — this A9 is not that one.
 
@@ -42,12 +47,14 @@ and logs a warning.  There is deliberately no second, quieter override.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import yaml
 
-from canon_assert import disk_family
+import canon_assert   # A11: route_merged, read off the module at call time
+from canon_assert import QueueRepo, disk_family, queue_header
 
 # System Prompt 5.19.3 — briefs target >= 30 min Toni, ideally 45-90.
 SIZING_FLOOR_MIN = 30
@@ -349,6 +356,110 @@ def check_kanban(filepath: Path) -> tuple[Optional[str], str]:
     return None, f"{family} row {row} READY ({newest[1]})"
 
 
+# ── A11: the routes a brief depends on ───────────────────────────────────────
+# [ORCH-DEPENDS-ON-1] PDLC v0-34 F-289 · L-184: filename order is not dependency order — 309b ran on top of a
+# STOPPED 309a. A brief that needs another route's code names it, and fires only once that route is on its repo's
+# merge target. queue_daemon reads the same dependency_status to order the queue (D4).
+QUEUE_DIR = Path(__file__).resolve().parent / "queue"      # where a dependency's brief is looked for; tests patch it
+_DEPENDS_ON_LINE = re.compile(r'^##\s*Depends[- ]on\s*:(?P<text>.*)$', re.MULTILINE | re.IGNORECASE)
+_DEPENDENCY = re.compile(r'(?P<stem>[A-Za-z0-9][A-Za-z0-9_-]*)(?:@(?P<repo>[A-Za-z0-9][A-Za-z0-9_-]*))?')
+A11_GRAMMAR = "'## Depends-on: <brief-stem>[@<repo>][, …]' (a queue filename without .md)"
+QUEUED = "queue/"
+
+
+@dataclass(frozen=True)
+class Dependency:
+    """One declared dependency, judged: the repo it must be merged on, whether it is, and where its brief sits."""
+    stem: str
+    target: str                  # '<repo>/<merge target>'
+    merged: Optional[str]        # '<sha8> [<evidence>]' when its route is on the merge target, else None
+    where: tuple = ()            # the trays holding <stem>.md, when not merged: 'queue/', 'queue/failed/', …
+
+    @property
+    def queued(self) -> bool:
+        """Still in queue/ itself — the queue may yet merge it."""
+        return QUEUED in self.where
+
+    def __str__(self) -> str:
+        if self.merged:
+            return f"{self.stem} merged on {self.target} ({self.merged})"
+        where = " + ".join(self.where) or "nowhere — not in queue/, queue/failed/, queue/held/ or queue/done/"
+        return f"{self.stem} (not merged on {self.target}; {where})"
+
+
+def parse_depends_on(filepath: Path) -> tuple[list[tuple[str, Optional[str]]], Optional[str]]:
+    """D1. ([(stem, repo or None)], None) from the brief's one '## Depends-on:' line, [] when it has none; ([], what
+    is wrong) when one is there and cannot be read — no stem, an entry that is not `<stem>[@<repo>]` (markdown `*`
+    and backticks stripped), the brief itself, more than one such line. Never a silent pass."""
+    lines = [m.group(0).strip() for m in _DEPENDS_ON_LINE.finditer(_read(filepath)[:_HEADER_CHARS])]
+    if not lines:
+        return [], None
+    if len(lines) > 1:
+        return [], "%d '## Depends-on:' lines, exactly one: %s" % (len(lines), " | ".join(lines))
+    entries = [e.strip() for e in _MD.sub("", lines[0].split(":", 1)[1]).split(",")]
+    if entries == [""]:
+        return [], "'%s' names no brief" % lines[0]
+    out: list[tuple[str, Optional[str]]] = []
+    for entry in entries:
+        m = _DEPENDENCY.fullmatch(entry)
+        if not m:
+            return [], ("'%s' is not a brief stem[@repo]" % entry if entry else "an empty entry in '%s'" % lines[0])
+        if m.group("stem") == filepath.stem:
+            return [], "'%s' is this brief itself" % entry
+        if (m.group("stem"), m.group("repo")) not in out:
+            out.append((m.group("stem"), m.group("repo")))
+    return out, None
+
+
+def queue_repo(name: str) -> Optional[QueueRepo]:
+    """A11: a repo name → what canon_assert.route_merged needs, from `repos:` in config/repos.yaml (the keys and
+    defaults queue_daemon.repo_route reads); None when no such repo is configured."""
+    repos = _config_value("repos")
+    r = repos.get(name) if isinstance(repos, dict) else None
+    if not isinstance(r, dict) or not r.get("project_dir"):
+        return None
+    return QueueRepo(name=name, path=Path(r["project_dir"]), merge_target=r.get("merge_target", "main"),
+                     branch_prefix=r.get("branch_prefix", "orch"))
+
+
+def dependency_trays(queue_dir: Path, stem: str) -> tuple:
+    """Where `<stem>.md` sits: 'queue/', 'queue/failed/', 'queue/held/<sub>/', 'queue/done/' — every one it is in."""
+    name, queue_dir = f"{stem}.md", Path(queue_dir)
+    found = [QUEUED] if (queue_dir / name).is_file() else []
+    if (queue_dir / "failed" / name).is_file():
+        found.append("queue/failed/")
+    held = queue_dir / "held"
+    if held.is_dir():
+        found += ["queue/%s/" % p.parent.relative_to(queue_dir).as_posix()
+                  for p in sorted(held.rglob(name)) if p.is_file()]
+    if (queue_dir / "done" / name).is_file():
+        found.append("queue/done/")
+    return tuple(found)
+
+
+def dependency_status(filepath: Path, queue_dir: Path,
+                      resolve: Callable[[str], Optional[QueueRepo]]) -> tuple[list[Dependency], Optional[str]]:
+    """D3 / D4. Every dependency the brief declares, judged — or ([], why its line cannot be read). `resolve` maps a
+    repo name to its QueueRepo (None: not configured): A11 passes queue_repo, the daemon its repo_route. Merged is
+    canon_assert.route_merged's answer and nobody else's (A13). No line ⇒ ([], None), and nothing is asked."""
+    declared, why = parse_depends_on(filepath)
+    if why or not declared:
+        return [], why
+    own = queue_header(filepath).get("repo")
+    judged: list[Dependency] = []
+    for stem, named in declared:
+        if not (named or own):
+            return [], "'%s' names no repo and the brief has no `#!queue … repo=` — write %s@<repo>" % (stem, stem)
+        repo = resolve(named or own)
+        if repo is None:
+            return [], "'%s' is looked for on repo '%s', which config/repos.yaml does not name" % (stem, named or own)
+        landed = canon_assert.route_merged(repo, stem)
+        judged.append(Dependency(stem, f"{repo.name}/{repo.merge_target}",
+                                 f"{landed[0][:8]} [{landed[2]}]" if landed else None,
+                                 () if landed else dependency_trays(queue_dir, stem)))
+    return judged, None
+
+
 def check(filepath: Path) -> list[str]:
     """Return a list of assertion failures. Empty list == all checks pass."""
     failures: list[str] = []
@@ -405,6 +516,15 @@ def check(filepath: Path) -> list[str]:
                 % (" | ".join(suites[:3]), " (+%d more)" % (len(suites) - 3) if len(suites) > 3 else "")
             )
 
+    deps, why = dependency_status(filepath, QUEUE_DIR, queue_repo)
+    if why:
+        failures.append("A11 DEPENDS-ON — the '## Depends-on:' line cannot be read: %s. Write %s, or no line "
+                        "when the brief depends on no route" % (why, A11_GRAMMAR))
+    unmet = [d for d in deps if not d.merged]
+    if unmet:
+        failures.append("A11 DEPENDS-ON — not merged, so not fired: %s. A brief fires only once every route it "
+                        "depends on is on its repo's merge target (F-289)" % "; ".join(map(str, unmet)))
+
     return failures
 
 
@@ -435,8 +555,12 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
             detail = "declared %dm (floor %dm)" % (est, SIZING_FLOOR_MIN)
         else:
             detail = "micro-fire: %s" % trig
-        print("  Assertions: ✅ A1/A2/A8/A9/A10 pass — %s; %s; %s" % (row, detail, _timeout_detail(filepath, timeout)))
+        print("  Assertions: ✅ A1/A2/A8/A9/A10/A11 pass — %s; %s; %s"
+              % (row, detail, _timeout_detail(filepath, timeout)))
         print("  %s" % parse_test_scope(filepath)[1].lstrip("# "))     # A9: the scope it passed on
+        deps, _ = dependency_status(filepath, QUEUE_DIR, queue_repo)
+        if deps:                                                        # A11: what each dependency merged as
+            print("  Depends-on: %s" % "; ".join(map(str, deps)))
         return True
 
     print("\n%s" % bar)

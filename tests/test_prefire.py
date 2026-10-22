@@ -259,7 +259,7 @@ def test_P2_full_scope_lets_a_bare_pytest_pass(tmp_path, monkeypatch):
 def test_D3_report_names_a9_and_a10_and_the_scope_it_passed_on(tmp_path, capsys):
     assert prefire.report(scoped(tmp_path, FULL)) is True
     passed, scope = capsys.readouterr().out.splitlines()
-    assert passed.startswith("  Assertions: ✅ A1/A2/A8/A9/A10 pass — SCP_Kanban row 1 READY")
+    assert passed.startswith("  Assertions: ✅ A1/A2/A8/A9/A10/A11 pass — SCP_Kanban row 1 READY")
     assert scope == "  Test scope: full — D-S7CORE30-99"
 
 

@@ -402,7 +402,7 @@ class TestP3Kanban:
 
     def test_report_names_the_row_it_passed(self, kanban, tmp_path, capsys):
         assert prefire.report(_brief(tmp_path, "## Kanban: SCP_Kanban row 1\n"))
-        assert ("Assertions: ✅ A1/A2/A8/A9/A10 pass — SCP_Kanban row 1 READY (SCP_Kanban_v0-10.md); "
+        assert ("Assertions: ✅ A1/A2/A8/A9/A10/A11 pass — SCP_Kanban row 1 READY (SCP_Kanban_v0-10.md); "
                 "declared 75m (floor 30m)") in capsys.readouterr().out
 
     def test_force_says_it_skipped_a1(self, caplog, monkeypatch):

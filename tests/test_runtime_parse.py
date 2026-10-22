@@ -134,7 +134,7 @@ class TestP1:
         assert orchestrator.prefire_timeout(b) == (180, "brief-declared", 225)
         assert prefire.report(b, timeout=orchestrator.prefire_timeout(b)) is True, "a warning, not a failure"
         out = capsys.readouterr().out
-        assert "✅ A1/A2/A8/A9/A10 pass" in out
+        assert "✅ A1/A2/A8/A9/A10/A11 pass" in out
         assert "declared 120m (floor 30m); timeout 180 min (brief-declared) ⚠ clamped to 180 min from 225" in out
 
     def test_negative_control_ninety_to_one_twenty_is_150_unclamped(self, tmp_path, capsys, caplog):
