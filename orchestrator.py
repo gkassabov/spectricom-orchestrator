@@ -925,6 +925,103 @@ def toni_child_env(route_timeout_s: int, base: Optional[Mapping[str, str]] = Non
     return env
 
 
+# [ORCH-TONI-GUARDS-1] (S7-CORE-33) What ships without a Bash sandbox (330b STOP (b), its R3). Every fire gets
+# `--settings <ORCH_DIR>/executor/settings/<repo>.json`. That file holds deny rules on credential and agent-control
+# files, which the CLI honours under --dangerously-skip-permissions, and the PreToolUse kill hook. The fire's env
+# loses the names below. A repo with no usable settings file is refused, never fired unguarded.
+# TONI_GUARDS=off (any case) gives the fire as it was before this route, byte-for-byte, and says so on every fire.
+# Bash commands are still unsandboxed: see README "Executor guards".
+TONI_GUARDS_VAR = "TONI_GUARDS"
+TONI_SETTINGS_DIR = ORCH_DIR / "executor" / "settings"
+TONI_KILL_HOOK = "executor/hooks/kill_switch.sh"   # every settings file's PreToolUse command runs it
+# Dropped from the fire's env: names logged, values never. TONI_GUARDS_HOME moves the kill hook's state dir. It is
+# for the tests and the canary only, so a real fire's hook always reads the dir `queue_daemon.py kill` writes to.
+TONI_ENV_DROP = frozenset({"SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "GROQ_API_KEY",
+                           "GOOGLE_APPLICATION_CREDENTIALS", "TONI_GUARDS_HOME"})
+TONI_ENV_DROP_PREFIXES = ("AWS_",)
+TONI_ENV_SET = {"npm_config_ignore_scripts": "true"}   # no install-time package scripts (the s1ngularity vector)
+
+
+@dataclass(frozen=True)
+class ToniGuards:
+    """[ORCH-TONI-GUARDS-1] One fire's guards: the settings file, its sha256 (first 12 hex digits), its deny-rule
+    count, and `refusal` (why the fire must not happen) when the file is missing or unusable."""
+    repo: str
+    settings: Path
+    sha: str = ""
+    deny: int = 0
+    refusal: str = ""
+
+
+def toni_guards_off(env: Optional[Mapping[str, str]] = None) -> bool:
+    """TONI_GUARDS=off (any case, surrounding spaces ignored). Anything else, or unset, is on."""
+    return (os.environ if env is None else env).get(TONI_GUARDS_VAR, "").strip().lower() == "off"
+
+
+def toni_guards(repo: str) -> Optional[ToniGuards]:
+    """[ORCH-TONI-GUARDS-1] None when TONI_GUARDS=off. Otherwise <TONI_SETTINGS_DIR>/<repo>.json, read now.
+    It must be a JSON object with a non-empty permissions.deny list and an all-tools PreToolUse command that runs
+    TONI_KILL_HOOK; otherwise `refusal` says which part is missing. Reason: in non-interactive mode the CLI ignores
+    an invalid settings file without any error (its --help, under -p), and that would be an unguarded fire."""
+    if toni_guards_off():
+        return None
+    path = TONI_SETTINGS_DIR / f"{repo}.json"
+    if not repo:
+        return ToniGuards(repo, path, refusal="no repo named, so there is no settings file to fire with")
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return ToniGuards(repo, path, refusal=f"no settings file for repo {repo} ({path})")
+    except OSError as e:
+        return ToniGuards(repo, path, refusal=f"settings file {path} unreadable ({e.strerror or e})")
+    sha = hashlib.sha256(raw).hexdigest()[:12]
+    try:
+        cfg = json.loads(raw)
+    except ValueError as e:
+        return ToniGuards(repo, path, sha, refusal=f"settings file {path} is not JSON ({e})")
+    if not isinstance(cfg, dict):
+        return ToniGuards(repo, path, sha, refusal=f"settings file {path} is not a JSON object")
+    perms, hooks = cfg.get("permissions"), cfg.get("hooks")
+    deny = perms.get("deny") if isinstance(perms, dict) else None
+    if not isinstance(deny, list) or not deny:
+        return ToniGuards(repo, path, sha, refusal=f"settings file {path} has no permissions.deny rules")
+    pre = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    if not (isinstance(pre, list) and any(
+            isinstance(m, dict) and m.get("matcher", "") in ("*", "") and isinstance(m.get("hooks"), list)
+            and any(isinstance(h, dict) and TONI_KILL_HOOK in str(h.get("command", "")) for h in m["hooks"])
+            for m in pre)):
+        return ToniGuards(repo, path, sha, len(deny),
+                          refusal=f"settings file {path} has no PreToolUse kill hook ({TONI_KILL_HOOK}, matcher \"*\")")
+    return ToniGuards(repo, path, sha, len(deny))
+
+
+def toni_guarded_env(env: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
+    """[ORCH-TONI-GUARDS-1] A copy of `env` without the TONI_ENV_DROP names and TONI_ENV_DROP_PREFIXES names, with
+    TONI_ENV_SET overriding; plus the sorted list of names it dropped (names only, never a value). Mutates nothing."""
+    dropped = sorted(k for k in env if k in TONI_ENV_DROP or k.startswith(TONI_ENV_DROP_PREFIXES))
+    gone = set(dropped)
+    out = {k: v for k, v in env.items() if k not in gone}
+    out.update(TONI_ENV_SET)
+    return out, dropped
+
+
+def _toni_guards_apply(guards: Optional[ToniGuards], env: dict[str, str]) -> Optional[dict[str, str]]:
+    """[ORCH-TONI-GUARDS-1] The env the fire spawns with, after the fire's one `🛡 guards:` line: ON (scrubbed),
+    OFF (TONI_GUARDS=off: `env` as given), or BLOCKED (None: the fire is refused)."""
+    if guards is None:
+        log.warning(f"🛡 guards: OFF ({TONI_GUARDS_VAR}=off) — no --settings, no kill hook, env not scrubbed: "
+                    f"the unguarded fire")
+        return env
+    if guards.refusal:
+        log.error(f"⛔ Toni NOT fired — guards: {guards.refusal}")
+        log.error(f"🛡 guards: BLOCKED — {guards.refusal}; not fired ({TONI_GUARDS_VAR}=off fires without guards)")
+        return None
+    env, dropped = toni_guarded_env(env)
+    log.info(f"🛡 guards: ON (settings {guards.repo} sha {guards.sha}, deny {guards.deny}, env dropped "
+             f"[{', '.join(dropped)}], " + ", ".join(f"{k}={v}" for k, v in TONI_ENV_SET.items()) + ")")
+    return env
+
+
 def _toni_trailer(out_log: Path, exit_note: str):
     """[ORCH-TIMEOUT-HOLD-1] the trailer fire_toni's normal path writes, for the paths that never reach
     it: `Finished:` and `Exit: <code> (<why>)`, appended — so handback-scan, the guard's
@@ -945,10 +1042,13 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         brief_rel = batch_file.relative_to(project)
     except ValueError:
         brief_rel = batch_file.name
+    guards = toni_guards(ACTIVE_REPO_NAME)   # [ORCH-TONI-GUARDS-1] None when TONI_GUARDS=off
+    settings_flag = f"--settings {shlex.quote(str(guards.settings))} " if guards and not guards.refusal else ""
     cmd = (
         f"cd {project} && "
         f"stdbuf -oL "
         f"claude --dangerously-skip-permissions "
+        f"{settings_flag}"
         f"--model {TONI_MODEL} --effort {TONI_EFFORT} "
         f'"Read {brief_rel} and execute all briefs in order. Run every command in the foreground and '
         f'wait for it to finish; never use run_in_background — background tasks are killed when your '
@@ -965,7 +1065,9 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
     log.info(f"Firing Toni: {batch_file.name}")
     log.info(f"  Project: {project}")
     log.info(f"  Timeout: {route_timeout_s // 60}m")
-    env = toni_child_env(route_timeout_s)
+    env = _toni_guards_apply(guards, toni_child_env(route_timeout_s))
+    if env is None:
+        return -2, str(out_log)
     v = check_bg_ceiling_invariants("orchestrator.fire_toni", env, route_timeout_s)
     if v:
         log.error(f"⛔ Toni NOT fired — bg-wait ceiling: {v[0]}")

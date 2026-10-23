@@ -47,6 +47,8 @@ C = {
     "executor-exit": "_executor_exit_hold",
     # BASELINE-TRUST-1 (route 67): a seventh, one line per baseline the unit gate needs
     "baseline-trust": "_unit_baseline_measure_or_reuse",
+    # ORCH-TONI-GUARDS-1 (route 394): an eighth, one line per fire: ON, OFF (TONI_GUARDS=off) or BLOCKED
+    "guards": "_toni_guards_apply",
 }
 # the canon_assert predicates behind C: every call site must sit in a function that speaks
 C_PREDICATES = {"check_handback_invariants", "check_bg_ceiling_invariants", "check_clock_plausibility",

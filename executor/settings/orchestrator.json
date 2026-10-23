@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Edit(~/.aws/**)",
+      "Read(~/.config/gcloud/**)",
+      "Edit(~/.config/gcloud/**)",
+      "Read(~/.config/gh/**)",
+      "Edit(~/.config/gh/**)",
+      "Read(~/.git-credentials)",
+      "Edit(~/.git-credentials)",
+      "Read(~/.npmrc)",
+      "Edit(~/.npmrc)",
+      "Read(~/.docker/config.json)",
+      "Edit(~/.docker/config.json)",
+      "Read(~/.claude/**)",
+      "Edit(~/.claude/**)",
+      "Read(//mnt/c/**)",
+      "Edit(//mnt/c/**)",
+      "Edit(**/.claude/**)",
+      "Edit(**/.mcp.json)",
+      "Edit(**/.github/workflows/**)",
+      "Edit(**/.husky/**)",
+      "Edit(**/.vscode/tasks.json)",
+      "Edit(//**/.claude/**)",
+      "Edit(//**/.mcp.json)",
+      "Edit(//**/.github/workflows/**)",
+      "Edit(//**/.husky/**)",
+      "Edit(//**/.vscode/tasks.json)"
+    ],
+    "allow": [
+      "Read(~/spectricom-orchestrator/queue/**)",
+      "Read(~/spectricom-orchestrator/logs/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/kill_switch.sh\" || exit 2"
+          }
+        ]
+      }
+    ]
+  }
+}

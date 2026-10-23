@@ -24,13 +24,16 @@ Can also run standalone for testing:
                                                  # no daemon running; anything else is refused, exit 1
   python3 queue_daemon.py check        # boot assert B6: queued briefs whose route already merged
   python3 queue_daemon.py check-logs   # ORCH-STDOUT-1: recorded routes without a readable log
+  python3 queue_daemon.py kill [--reason "<text>"]   # ORCH-TONI-GUARDS-1: write KILL (every fire's tool calls are
+                                       # denied, nothing fires), then end the running fire's process groups
+  python3 queue_daemon.py unkill --reason "<text>"   # remove KILL; logged, with the reason, in logs/kill-switch.log
 
   ORCH-GATE-COST-1 D4: a repo with `full_gate_nightly: "HH:MM"` in config/repos.yaml gets
   `orchestrator.py full-gate --repo <it>` once a local day, between routes, while running and idle;
   `status` line 1 names each repo's last full-gate result.
 """
 
-import os, re, sys, json, time, shlex, shutil, threading, subprocess
+import os, re, sys, json, time, shlex, shutil, signal, threading, subprocess
 from pathlib import Path
 from datetime import datetime, time as dtime
 from typing import Optional
@@ -78,8 +81,35 @@ PAUSE_NOTICE_NAME = "queue-paused.json"
 START_PAUSED_REASON = "start:queue-non-empty"
 USAGE = ("Usage: python3 queue_daemon.py [--start-running] | enqueue <file> | status [--json] | pause | "
          "resume [--reset-consecutive] [--reason <paused_reason>] | config <key> <value> | check | check-logs "
-         "| clear\n  With no command it runs the daemon loop: paused at start when work is queued; "
-         "--start-running fires the queue at once.")
+         "| clear | kill [--reason \"<text>\"] | unkill --reason \"<text>\"\n  With no command it runs the daemon "
+         "loop: paused at start when work is queued; --start-running fires the queue at once.")
+
+# [ORCH-TONI-GUARDS-1] (S7-CORE-33) The kill switch.
+#  · `kill` writes ORCH_DIR/KILL, then ends the running fire's process groups.
+#  · executor/hooks/kill_switch.sh, in every executor/settings/<repo>.json, denies every tool call of a fire while
+#    KILL exists.
+#  · The daemon fires nothing while KILL exists.
+#  · `unkill --reason` removes KILL.
+# Every kill and unkill is one line, printed and appended to logs/kill-switch.log.
+KILL_FILE_NAME = "KILL"
+KILL_LOG_NAME = "kill-switch.log"
+KILL_GRACE_S = 5.0          # SIGTERM to each of the fire's process groups; SIGKILL to what is left after this
+NO_REASON = "(no reason given)"
+
+
+def kill_file() -> Path:
+    """[ORCH-TONI-GUARDS-1] ORCH_DIR/KILL, resolved per call like control_file(). The hook's default state dir is
+    $HOME/spectricom-orchestrator, the same dir as ORCH_DIR."""
+    return ORCH_DIR / KILL_FILE_NAME
+
+
+def read_kill() -> Optional[dict]:
+    """None when there is no KILL. Otherwise its JSON ({} when it is empty, not JSON or not a file). The hook
+    denies on existence alone."""
+    p = kill_file()
+    if not (p.exists() or p.is_symlink()):
+        return None
+    return _read_json(p) if p.is_file() else {}
 
 
 def control_file() -> Path:
@@ -552,6 +582,151 @@ def route_log_path(repo_name: str, batch_name: str, when: datetime) -> Path:
     return path
 
 
+# ── [ORCH-TONI-GUARDS-1] kill / unkill ──────────────────────────────────────────────────────────────────────────
+def _proc_table() -> dict:
+    """{pid: (ppid, pgid, state)} for every process /proc shows. A process that ends mid-read is left out."""
+    table = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[1].split()
+            table[int(d)] = (int(f[1]), int(f[2]), f[0])
+        except (OSError, IndexError, ValueError):
+            continue
+    return table
+
+
+def fire_process_groups(table: Optional[dict] = None) -> list:
+    """Each live fire, and every process group in the tree under it.
+    A fire is a child of a live route's orchestrator process (the pid in a running*.json marker, at the root or in
+    state/) that leads its own process group, as fire_toni's Popen(preexec_fn=os.setsid) makes it.
+    Every group in the tree is included because the CLI starts each Bash command in a session of its own: killing
+    the fire's group alone would leave a running command behind.
+    Never included: the orchestrator's group (the daemon's) or this process's.
+    Returns [{"batch", "repo", "orch_pid", "leader", "groups", "pids"}]."""
+    table = _proc_table() if table is None else table
+    children: dict = {}
+    for pid, (ppid, _pgid, _state) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    state_dir = ORCH_DIR / "state"
+    markers = sorted(ORCH_DIR.glob("running*.json")) + (sorted(state_dir.glob("running*.json"))
+                                                         if state_dir.is_dir() else [])
+    fires, seen, own = [], set(), os.getpgrp()
+    for m in markers:
+        data = _read_json(m)
+        opid = data.get("pid")
+        if not isinstance(opid, int) or isinstance(opid, bool) or opid not in table or table[opid][2] == "Z":
+            continue
+        for leader in sorted(children.get(opid, [])):
+            if leader in seen or table[leader][1] != leader:
+                continue
+            tree, todo = [], [leader]
+            while todo:
+                p = todo.pop()
+                tree.append(p)
+                todo.extend(children.get(p, []))
+            seen.update(tree)
+            groups = sorted({table[p][1] for p in tree} - {own, table[opid][1]})
+            fires.append({"batch": data.get("batch_id") or Path(str(data.get("batch_file") or "?")).stem,
+                          "repo": data.get("repo") or "?", "orch_pid": opid, "leader": leader,
+                          "groups": groups, "pids": sorted(tree)})
+    return fires
+
+
+def _live_groups(groups) -> list:
+    """The groups in `groups` with a member that is not a zombie."""
+    live = {pgid for _ppid, pgid, state in _proc_table().values() if state != "Z"}
+    return [g for g in groups if g in live]
+
+
+def _signal_groups(groups, sig) -> None:
+    for g in groups:
+        try:
+            os.killpg(g, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _kill_say(line: str) -> None:
+    """One kill-switch line: printed, and appended to logs/kill-switch.log with a timestamp."""
+    print(line)
+    log = ORCH_DIR / "logs" / KILL_LOG_NAME
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {line}\n")
+    except OSError as e:
+        print(f"🛡 kill switch: could not append to {log}: {e}")
+
+
+def kill(reason: str, grace_s: Optional[float] = None) -> int:
+    """`queue_daemon.py kill [--reason "<text>"]`. Writes KILL first, so the hook denies the next tool call at once.
+    A KILL already there is kept with its first reason. Then the running fire's process groups get SIGTERM, and
+    SIGKILL for whatever is still alive after the grace. Exit 1 only when KILL could not be written."""
+    grace = KILL_GRACE_S if grace_s is None else grace_s
+    p, prior, rc = kill_file(), read_kill(), 0
+    if prior is None:
+        try:
+            _write_json_atomic(p, {"reason": reason, "at": datetime.now().isoformat(timespec="seconds"),
+                                   "by": f"queue_daemon.py kill (pid {os.getpid()})"})
+            state = f"KILL written ({p})"
+        except OSError as e:
+            state, rc = f"KILL NOT written ({p}: {e}), so the hook does not see it", 1
+    else:
+        state = f"KILL already present ({p}: {prior.get('reason') or NO_REASON}, since {prior.get('at') or '?'}), kept"
+    fires = fire_process_groups()
+    groups = sorted({g for f in fires for g in f["groups"]})
+    if not fires:
+        what = "no live fire (no running*.json pid has a fire under it)"
+    else:
+        _signal_groups(groups, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and _live_groups(groups):
+            time.sleep(0.1)
+        left = _live_groups(groups)
+        _signal_groups(left, signal.SIGKILL)
+        what = "; ".join(f"fire {f['batch']} (repo {f['repo']}, orchestrator pid {f['orch_pid']}): pgid {f['leader']}"
+                         + (f" + Bash command group(s) {', '.join(str(g) for g in f['groups'] if g != f['leader'])}"
+                            if len(f["groups"]) > 1 else "") for f in fires)
+        what += (f" — SIGTERM; SIGKILL after {grace:g}s to {len(left)} group(s) still alive: "
+                 f"{', '.join(map(str, left))}" if left else f" — SIGTERM; all gone within {grace:g}s")
+    _kill_say(f"🛡 KILL — {reason}: {state}; {what}. Nothing fires until "
+              f"`python3 queue_daemon.py unkill --reason \"<text>\"`")
+    return rc
+
+
+def unkill(reason: str) -> int:
+    """`queue_daemon.py unkill --reason "<text>"`: removes KILL and logs it with the reason it had. Exit 1 when KILL
+    is still there afterwards."""
+    p, prior = kill_file(), read_kill()
+    if prior is None:
+        _kill_say(f"🛡 UNKILL — {reason}: no KILL at {p}, nothing to lift")
+        return 0
+    try:
+        if p.is_dir() and not p.is_symlink():
+            p.rmdir()
+        else:
+            p.unlink()
+    except OSError as e:
+        _kill_say(f"🛡 UNKILL FAILED — {reason}: {p} not removed ({e}); every fire's tool calls stay denied")
+        return 1
+    _kill_say(f"🛡 UNKILL — {reason}: {p} removed (it said: {prior.get('reason') or NO_REASON}, since "
+              f"{prior.get('at') or '?'}). The daemon fires again at its next poll; a stop-on-failure pause still "
+              f"needs `resume`")
+    return 0
+
+
+def _kill_args(cmd: str, args: list) -> Optional[str]:
+    """The reason given to `kill` / `unkill`: `--reason <text>`, not blank. For unkill it is required; kill without
+    it gets NO_REASON. None ⇒ usage, exit 2, nothing written."""
+    if not args and cmd == "kill":
+        return NO_REASON
+    if len(args) == 2 and args[0] == "--reason" and args[1].strip():
+        return args[1].strip()
+    return None
+
+
 class QueueDaemon:
     """Background queue processor for Toni batches."""
 
@@ -595,6 +770,7 @@ class QueueDaemon:
         self._pending_notice = None    # [ORCH-LANE-1] O2: a pause notice written, not yet sent
         self.waiting = None            # [ORCH-CAPACITY-1] C1: why admission holds the next brief, None when not
         self._waiting_said = None      # C1: the reason last logged — one line per change of reason
+        self._kill_said = None         # [ORCH-TONI-GUARDS-1] the KILL last logged — one line per KILL
         self.persisted_timeout = None  # C4: a persisted timeout_seconds, reported at start, never applied
         self.depends_waiting = {}      # [ORCH-DEPENDS-ON-1] D4: {queued brief: the queued stems it waits on}
         self._depends_unmovable = set()   # D4: held briefs that would not leave queue/ — passed over, said once
@@ -1294,6 +1470,14 @@ class QueueDaemon:
                     self._save_state()
                 continue
 
+            # [ORCH-TONI-GUARDS-1] the last check before the spawn: while KILL exists nothing fires. A wait, like
+            # admission's below: the brief stays first in queue/, said once per KILL, shown by `status` as waiting.
+            killed = read_kill()
+            if killed is not None:
+                self._wait_for_unkill(batch_name, killed)
+                continue
+            self._kill_said = None
+
             # [ORCH-CAPACITY-1] C1 · L-70: one Toni route at a time across every repo, and only with memory to
             # spare. A refusal is a wait, never a failure: nothing fires and the brief stays first in queue/. The
             # yes claims the slot (state/admitted-<pid>.json); the route adopts the claim (ORCH_ADMISSION_CLAIM)
@@ -1479,6 +1663,22 @@ class QueueDaemon:
         if self.status == "running":
             time.sleep(self.config["cooldown_seconds"] or PAUSED_POLL_S)
 
+    def _wait_for_unkill(self, batch_name: str, killed: dict):
+        """[ORCH-TONI-GUARDS-1] KILL exists: nothing fired, the brief stays in queue/, and the loop looks again after
+        PAUSED_POLL_S. One log line per KILL (per what it says); `status` line 1 shows it as `waiting: …`."""
+        why = f"KILL present ({kill_file()}: {killed.get('reason') or NO_REASON}, since {killed.get('at') or '?'})"
+        if why != self._kill_said:
+            print(f"[QUEUE] 🛡 {why} — {batch_name} not fired; nothing fires until "
+                  f"`cd {shlex.quote(str(ORCH_DIR))} && python3 queue_daemon.py unkill --reason \"<text>\"` "
+                  f"(ORCH-TONI-GUARDS-1)")
+            self._kill_said = why
+        with self.lock:
+            self.current_batch = None
+            self.waiting = f"{batch_name} — {why}"
+            self._save_state()
+        if self.status == "running":
+            time.sleep(PAUSED_POLL_S)
+
     def _run_route(self, cmd: str, batch_name: str, log_path: Path) -> int:
         """Run one route with its stdout+stderr going to `log_path`; return its exit code.
 
@@ -1585,6 +1785,13 @@ def main(argv: list) -> int:
             print("\\nQueue daemon stopped.")
         return 0
     cmd = argv[0]
+    if cmd in ("kill", "unkill"):
+        # [ORCH-TONI-GUARDS-1] before QueueDaemon(): no queue state is read or written, whatever state it is in
+        reason = _kill_args(cmd, argv[1:])
+        if reason is None:
+            print(USAGE, file=sys.stderr)
+            return 2
+        return kill(reason) if cmd == "kill" else unkill(reason)
     d = QueueDaemon()
     if cmd == "enqueue" and len(argv) > 1:
         r = d.enqueue(argv[1])

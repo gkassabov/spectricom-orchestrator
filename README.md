@@ -131,6 +131,56 @@ A9 / A10 test scope · A11 depends-on.
 - Fail closed: from row 393 on, a brief with no ALLOWED FILES section is refused. Any brief with an ALLOWED FILES section is refused while `prefire_opex_paths.json` is unreadable. A brief that names an agent-runtime path is refused while the canon folder, or the inventory in it, cannot be read.
 - Kill switch: `PREFIRE_OPEX=off` skips A12–A14 and prints a `⚠⚠ PREFIRE_OPEX=off … SKIPPED` line on every fire. `--force` still bypasses every check.
 
+## Executor guards (ORCH-TONI-GUARDS-1)
+
+This is what ships while there is no Bash sandbox (`briefs/330b-orch-toni-sandbox-1.handback.md`, STOP (b)).
+
+**Bash commands are still unsandboxed.** The deny rules below bind Claude Code's file tools only: Read, Edit, Write, Grep and Glob. A shell command such as `cat ~/.ssh/id_ed25519`, `curl …` or `rm ~/spectricom-orchestrator/KILL` runs with this user's full rights. It can read every path in the table, reach the network, and lift the kill switch.
+- Claude Code's Linux sandbox would close this gap, but it cannot be used here:
+  - it needs `bwrap` and `socat`, which are not installed (and `sudo` needs a password);
+  - even installed, it runs each command in its own network namespace, so live SITs could not reach Medplum on `localhost:8103` (330b R1).
+- The follow-on is an OpenShell evaluation (330b R8): Landlock filesystem rules with no bwrap, default-deny egress that can still name host loopback ports, and vaulted credentials.
+
+**Per-repo settings.** Each repo in `config/repos.yaml` has `executor/settings/<repo>.json`.
+- `fire_toni` passes it on every fire as `--settings <ORCH_DIR>/executor/settings/<repo>.json`.
+- Claude Code 2.1.283 honours its deny rules under `--dangerously-skip-permissions`. In the CLI's own words: "auto-approves every tool call (except explicit deny rules)".
+- Grep and Glob run the same check as Read, so the `Read(...)` rules cover them.
+
+| Rule | Paths | Why |
+|---|---|---|
+| `Read` + `Edit` deny | `~/.ssh/**`, `~/.aws/**`, `~/.config/gcloud/**`, `~/.config/gh/**`, `~/.git-credentials`, `~/.npmrc`, `~/.docker/config.json`, `~/.claude/**`, `//mnt/c/**` | credentials (`~/.claude/.credentials.json` is the CLI's OAuth token) and the OneDrive canon |
+| `Edit` deny | `**/.claude/**`, `**/.mcp.json`, `**/.github/workflows/**`, `**/.husky/**`, `**/.vscode/tasks.json`, each also as `//**/…` | agent-control and persistence files, under the working dir and anywhere on disk |
+| `Read` allow (orchestrator only) | `~/spectricom-orchestrator/queue/**`, `~/spectricom-orchestrator/logs/**` | orchestrator routes read the live trays and logs. Nothing denies them today; in Claude Code a deny would beat this allow |
+
+- `CLAUDE.md` is not denied, because routes legitimately edit it.
+- How rule paths are read: `~/` = home and `//` = filesystem root. **Never start a rule with one `/`**: in a `--settings` file that is relative to `executor/settings/`.
+- The CLI silently ignores a settings file that fails validation in non-interactive mode. Check an edited file with `claude doctor`, run in a scratch dir that holds a copy as `.claude/settings.json`: it lists invalid settings, and lists nothing when the file is valid.
+
+**Environment.**
+- Dropped from every fire's env, logged by name only: `SSH_AUTH_SOCK`, `GH_TOKEN`, `GITHUB_TOKEN`, `GROQ_API_KEY`, `AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, and `TONI_GUARDS_HOME` (the hook's test override).
+- Set: `npm_config_ignore_scripts=true`. `npm test` / `npm run x` still run their script, but no pre-, post- or install scripts run.
+
+**Kill switch.**
+- `python3 queue_daemon.py kill [--reason "<text>"]` does two things:
+  - It writes `~/spectricom-orchestrator/KILL`. From then on, the `PreToolUse` hook `executor/hooks/kill_switch.sh` (matcher `*`, in every settings file) denies every tool call of every fire.
+  - It sends SIGTERM to the running fire's process groups, then SIGKILL after 5 s. The groups are the fire's own (setsid) and each Bash command's.
+- The daemon fires nothing while `KILL` exists. The next brief waits in `queue/`, and `status` shows `waiting: … KILL present …`.
+- `python3 queue_daemon.py unkill --reason "<text>"` removes `KILL`. The reason is required.
+- Each kill and unkill is one line, printed and appended to `logs/kill-switch.log`.
+- A killed route ends as a failed (or INCOMPLETE) route, so with `stop_on_failure` the queue also pauses. After `unkill`, run `resume`.
+- The hook fails closed. Each of these denies the call:
+  - the state dir cannot be read;
+  - `KILL` is a dangling link or a directory;
+  - the hook script is missing (the settings command is `bash "<hook>" || exit 2`).
+
+**Fire lines and switches.**
+- Every fire logs exactly one of these lines:
+  - `🛡 guards: ON (settings <repo> sha <12 hex>, deny N, env dropped [...], npm_config_ignore_scripts=true)`
+  - `🛡 guards: OFF (TONI_GUARDS=off) …`
+  - `🛡 guards: BLOCKED — <why>; not fired …`
+- A repo with no settings file, or with one that is unreadable, not JSON, has no deny rules or has no kill hook, is refused (`BLOCKED`). It is never fired unguarded.
+- `TONI_GUARDS=off` (any case) fires exactly as before this route: no `--settings`, no env scrub, no hook. The daemon's refusal while `KILL` exists stays on, because only `unkill` lifts it.
+
 ## Project Structure
 
 ```
