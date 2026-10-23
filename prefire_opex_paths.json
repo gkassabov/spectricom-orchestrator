@@ -1,0 +1,59 @@
+{
+  "_about": "[ORCH-OPEX-PREFIRE-1] D-S7CORE33-20 (Codex v2-57). The paths prefire's A13 (OPX-2) and A14 (OPX-3) look for in a brief's ALLOWED FILES section. Data, not code: edit here, no code change. Keys under each list are the `#!queue … repo=` name; '*' applies to every repo; a brief with no repo= is judged against every list. Globs, matched case-insensitively against each path the section names: '**/' any directories (or none), a trailing '/**' the directory itself and everything under it, '*' within one name, '?' one character. A pattern without '/' matches any one name in the path (a file or a directory). A path matches when it, or a directory it sits under, matches; a glob in ALLOWED FILES matches when it reaches into the pattern's tree. Keys starting with '_' are notes.",
+  "agent_runtime": {
+    "_about": "A13 (OPX-2): code an agent runs on. A brief naming one cites an Agent Policy id (AP-…) listed in the latest SCP_Agent_Inventory_v*.md in the canon folder.",
+    "clinical-mp": [
+      "src/lib/agentic-runtime/**",
+      "src/daemon/**",
+      "src/lib/agentic-drafts/**",
+      "server/**/agent*"
+    ],
+    "orchestrator": [
+      "orchestrator.py",
+      "executor/**"
+    ],
+    "_orchestrator": "orchestrator.py is the whole file: the fire path (fire_toni) cannot be told apart from the rest of it by file name."
+  },
+  "protected": {
+    "_about": "A14 (OPX-3): never-autonomous paths. A brief naming one carries a George go (`## George go:` line, or a `## Briefs:` / `## Spec reference:` line matching George[^\\n]{0,80}\\b(go|GO|agreed|Agree)\\b).",
+    "*": [
+      "*.env*",
+      "Dockerfile*",
+      "docker-compose*",
+      "*.tf",
+      "*.tfvars",
+      "vercel.json",
+      "netlify.toml",
+      "fly.toml",
+      "Procfile",
+      ".github/workflows/**",
+      "deploy/**",
+      "infra/**",
+      "terraform/**",
+      "k8s/**",
+      "helm/**",
+      "*deploy*.sh"
+    ],
+    "_*": "Secrets (*.env*) and deploy / IaC files, in every repo.",
+    "clinical-mp": [
+      "src/lib/cds/**",
+      "src/lib/clinical/**",
+      "src/lib/fhir/**",
+      "src/lib/pros/**",
+      "src/lib/auth/**",
+      "src/components/auth/**",
+      "server/auth.ts",
+      "*access-policy*",
+      "*accesspolicy*",
+      "*client-application*",
+      "*clientapplication*",
+      "scripts/migrat*"
+    ],
+    "_clinical-mp": "CDS rules, clinical logic, FHIR mappings, PROs scoring, auth / AccessPolicy / ClientApplication code, migrations.",
+    "orchestrator": [
+      "executor/**",
+      "orchestrator.py"
+    ],
+    "_orchestrator": "orchestrator.py holds the merge code (merge_branch, run_batch's merge)."
+  }
+}

@@ -258,9 +258,11 @@ def test_P2_full_scope_lets_a_bare_pytest_pass(tmp_path, monkeypatch):
 # D3 · the report
 def test_D3_report_names_a9_and_a10_and_the_scope_it_passed_on(tmp_path, capsys):
     assert prefire.report(scoped(tmp_path, FULL)) is True
-    passed, scope = capsys.readouterr().out.splitlines()
+    # rule #8 [ORCH-OPEX-PREFIRE-1]: A12/A13/A14 print one line each after these two (tests/test_opex_prefire.py)
+    passed, scope, *opex = capsys.readouterr().out.splitlines()
     assert passed.startswith("  Assertions: ✅ A1/A2/A8/A9/A10/A11 pass — SCP_Kanban row 1 READY")
     assert scope == "  Test scope: full — D-S7CORE30-99"
+    assert [l.split()[0] for l in opex] == ["A12", "A13", "A14"]
 
 
 def test_D3_report_lists_a9_and_a10_refusals_like_a8s(tmp_path, capsys):
