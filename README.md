@@ -122,14 +122,15 @@ A9 / A10 test scope · A11 depends-on.
 
 | | Rule | Passes when |
 |---|---|---|
-| A12 (OPX-1) | Kanban row ≥ 393 | `## Operability & safety` has non-empty `Telemetry:`, `Failure mode…:`, `Rollback…:`, `Agent permissions…:`, `PHI…:` lines; "none" / "n/a" only with a reason (≥ 3 words). Rows below 393: `A12 — grandfathered (row N < 393)`. |
-| A13 (OPX-2) | ALLOWED FILES name an agent-runtime path | the brief cites an `AP-…` id listed in the newest `SCP_Agent_Inventory_v*.md` in the canon folder. No inventory file yet: warning, pass. |
-| A14 (OPX-3) | ALLOWED FILES name a never-autonomous path | the brief has a `## George go:` line, or a `## Briefs:` / `## Spec reference:` line matching `George[^\n]{0,80}\b(go\|GO\|agreed\|Agree)\b`. |
+| OPX-1 | Kanban row ≥ 393 | `## Operability & safety` has non-empty `Telemetry:`, `Failure mode…:`, `Rollback…:`, `Agent permissions…:`, `PHI…:` lines; "none" / "n/a" only with a reason (≥ 3 words). Rows below 393: `OPX-1 — grandfathered (row N < 393)`. |
+| OPX-2 | ALLOWED FILES name an agent-runtime path | the brief cites an `AP-…` id listed in the newest `SCP_Agent_Inventory_v*.md` in the canon folder. No inventory file yet: warning, pass. |
+| OPX-3 | ALLOWED FILES name a never-autonomous path | the brief has a `## George go:` line, or a `## Briefs:` / `## Spec reference:` line matching `George[^\n]{0,80}\b(go\|GO\|agreed\|Agree)\b`. |
 
 - The path lists are data: `prefire_opex_paths.json` (`agent_runtime` and `protected`, by `#!queue … repo=`; `*` = every repo). Edit them there, without a code change.
-- A13 and A14 read the ALLOWED FILES section(s): code spans, and bare words with a `/` or a file extension. Text after `Read only:` or `**Not**` on a line is ignored. A bare file name such as `negation.ts` has no directory, so it is matched by name only, and the clean line says how many such names there were.
+- OPX-2 and OPX-3 read the ALLOWED FILES section(s): code spans, and bare words with a `/` or a file extension. Text after `Read only:` or `**Not**` on a line is ignored. A bare file name such as `negation.ts` has no directory, so it is matched by name only, and the clean line says how many such names there were.
 - Fail closed: from row 393 on, a brief with no ALLOWED FILES section is refused. Any brief with an ALLOWED FILES section is refused while `prefire_opex_paths.json` is unreadable. A brief that names an agent-runtime path is refused while the canon folder, or the inventory in it, cannot be read.
-- Kill switch: `PREFIRE_OPEX=off` skips A12–A14 and prints a `⚠⚠ PREFIRE_OPEX=off … SKIPPED` line on every fire. `--force` still bypasses every check.
+- Kill switch: `PREFIRE_OPEX=off` skips OPX-1–OPX-3 and prints a `⚠⚠ PREFIRE_OPEX=off … SKIPPED` line on every fire. `--force` still bypasses every check. The variable kept its name through the rename below.
+- Old labels (ORCH-PREFIRE-RENAME-1): OPX-1, OPX-2 and OPX-3 were A12, A13 and A14 until route 330e. They were renamed because SESSION-BOOT's PRE-FIRE ASSERTION BLOCK uses A12 and A13 for other checks. Every pass/refuse decision is unchanged.
 
 ## Executor guards (ORCH-TONI-GUARDS-1)
 

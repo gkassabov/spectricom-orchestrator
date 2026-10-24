@@ -37,20 +37,21 @@ ENFORCED:
                       predicate B6 asks. The failure names each unmet stem and where its brief sits; a line that
                       cannot be read is a refusal. No line, no dependency.  [ORCH-DEPENDS-ON-1] F-289: 309b ran
                       on top of a STOPPED 309a. queue_daemon orders the queue by the same answer (D4).
-  A12 operability   — a brief on Kanban row >= 393 has '## Operability & safety' with a non-empty Telemetry: /
+  OPX-1 operability — a brief on Kanban row >= 393 has '## Operability & safety' with a non-empty Telemetry: /
                       Failure mode…: / Rollback…: / Agent permissions…: / PHI…: line ('none'/'n/a' only with a
-                      reason of >= 3 words); rows below are grandfathered.  [ORCH-OPEX-PREFIRE-1] D-S7CORE33-20 OPX-1.
-  A13 agent policy  — ALLOWED FILES naming an agent-runtime path (prefire_opex_paths.json `agent_runtime`) ⇒ the
+                      reason of >= 3 words); rows below are grandfathered.  [ORCH-OPEX-PREFIRE-1] D-S7CORE33-20.
+  OPX-2 agent policy — ALLOWED FILES naming an agent-runtime path (prefire_opex_paths.json `agent_runtime`) ⇒ the
                       brief cites an AP-… id the newest SCP_Agent_Inventory_v*.md in the canon folder lists. No
-                      inventory file yet ⇒ warning, pass.  OPX-2.
-  A14 George go     — ALLOWED FILES naming a never-autonomous path (prefire_opex_paths.json `protected`) ⇒ a
+                      inventory file yet ⇒ warning, pass.
+  OPX-3 George go   — ALLOWED FILES naming a never-autonomous path (prefire_opex_paths.json `protected`) ⇒ a
                       '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying George … go / agreed.
-                      OPX-3.  A13/A14 refuse a brief on row >= 393 with no ALLOWED FILES section (fail closed).
+                      OPX-2/-3 refuse a brief on row >= 393 with no ALLOWED FILES section (fail closed).
 
 NOT enforced here: A3-A7, nor SESSION-BOOT's own A9 (System Prompt v5-38) — this A9 is not that one.
+OPX-1/-2/-3 were labelled A12-A14 until ORCH-PREFIRE-RENAME-1: SESSION-BOOT's A12 and A13 are other checks.
 
 Bypass: orchestrator --force, which already means "ALL safety checks bypassed"
-and logs a warning.  The one narrower override is PREFIRE_OPEX=off, which skips A12-A14 only and says so on
+and logs a warning.  The one narrower override is PREFIRE_OPEX=off, which skips OPX-1/-2/-3 only and says so on
 every fire (D-S7CORE33-20's kill switch); there is deliberately no quiet one.
 """
 
@@ -472,15 +473,15 @@ def dependency_status(filepath: Path, queue_dir: Path,
     return judged, None
 
 
-# ── A12-A14: the OpEx pre-checks ─────────────────────────────────────────────
+# ── OPX-1/-2/-3: the OpEx pre-checks ─────────────────────────────────────────
 # [ORCH-OPEX-PREFIRE-1] D-S7CORE33-20 (Codex v2-57, George go 10-23 18:15): SCP adopts five OpEx controls as
-# MANDATORY — absence must block something. OPX-1 (A12): the brief says how its change is seen, degrades, is turned
+# MANDATORY — absence must block something. OPX-1: the brief says how its change is seen, degrades, is turned
 # off, what agent reach it grants and whether it touches PHI or a protected path (Toni_Brief_Authoring_Template_v1-2
-# `## Operability & safety`). OPX-2 (A13): agent-runtime code changes under a cited Agent Policy. OPX-3 (A14): a
+# `## Operability & safety`). OPX-2: agent-runtime code changes under a cited Agent Policy. OPX-3: a
 # never-autonomous path changes only on George's go. The path lists are data: prefire_opex_paths.json.
 OPEX_PATHS = Path(__file__).resolve().parent / "prefire_opex_paths.json"     # tests patch it
-OPEX_ENV = "PREFIRE_OPEX"                 # =off skips A12-A14, said on every fire
-OPEX_FROM_ROW = 393                       # A12: rows below were written before OPX-1 — grandfathered
+OPEX_ENV = "PREFIRE_OPEX"                 # =off skips OPX-1/-2/-3, said on every fire
+OPEX_FROM_ROW = 393                       # OPX-1: rows below were written before it — grandfathered
 OPEX_LABELS = ("Telemetry", "Failure mode", "Rollback", "Agent permissions", "PHI")
 AGENT_INVENTORY = "SCP_Agent_Inventory"   # <canon>/SCP_Agent_Inventory_v*.md, the newest
 _OPEX_HEADING = re.compile(r'^##\s*Operability\s*(?:&|and)\s*safety\b', re.IGNORECASE)
@@ -500,7 +501,8 @@ _GEORGE_GO = re.compile(r'George[^\n]{0,80}\b(go|GO|agreed|Agree)\b')
 
 @dataclass(frozen=True)
 class OpexVerdict:
-    """One of A12-A14 on one brief: `line` is what prefire prints ('A12 ✅ …', 'A12 ❌ …', 'A13 ⚠ …', 'A12 — …')."""
+    """One of OPX-1/-2/-3 on one brief: `line` is what prefire prints ('OPX-1 ✅ …', 'OPX-1 ❌ …', 'OPX-2 ⚠ …',
+    'OPX-1 — …')."""
     ok: bool
     line: str
 
@@ -570,14 +572,14 @@ def _answer_problem(answer: str) -> Optional[str]:
 
 
 def check_operability(filepath: Path) -> OpexVerdict:
-    """A12 (OPX-1). A brief whose Kanban row is ≥ OPEX_FROM_ROW carries `## Operability & safety` with a non-empty
+    """OPX-1. A brief whose Kanban row is ≥ OPEX_FROM_ROW carries `## Operability & safety` with a non-empty
     Telemetry: / Failure mode…: / Rollback…: / Agent permissions…: / PHI…: line, 'none'/'n/a' only with a reason.
     Rows below are grandfathered. No row: not judged here — A1 already refuses a brief that names none."""
     row = _kanban_row_number(filepath)
     if row is None:
-        return OpexVerdict(True, "A12 — not judged: no Kanban row number (A1 refuses the brief)")
+        return OpexVerdict(True, "OPX-1 — not judged: no Kanban row number (A1 refuses the brief)")
     if row < OPEX_FROM_ROW:
-        return OpexVerdict(True, "A12 — grandfathered (row %d < %d)" % (row, OPEX_FROM_ROW))
+        return OpexVerdict(True, "OPX-1 — grandfathered (row %d < %d)" % (row, OPEX_FROM_ROW))
     answers = operability_answers(filepath)
     if answers is None:
         wrong = "has no '## Operability & safety' section"
@@ -586,9 +588,9 @@ def check_operability(filepath: Path) -> OpexVerdict:
         bad = ["%s: %s" % (l, why) for l in OPEX_LABELS if l in answers for why in [_answer_problem(answers[l])] if why]
         wrong = "; ".join((["'## Operability & safety' has no %s line" % ", ".join(missing)] if missing else []) + bad)
         if not wrong:
-            return OpexVerdict(True, "A12 ✅ Operability & safety — Telemetry · Failure mode · Rollback · Agent "
+            return OpexVerdict(True, "OPX-1 ✅ Operability & safety — Telemetry · Failure mode · Rollback · Agent "
                                      "permissions · PHI answered (row %d ≥ %d)" % (row, OPEX_FROM_ROW))
-    return OpexVerdict(False, "A12 ❌ OPERABILITY — row %d ≥ %d (D-S7CORE33-20 OPX-1) and the brief %s. Five non-empty "
+    return OpexVerdict(False, "OPX-1 ❌ OPERABILITY — row %d ≥ %d (D-S7CORE33-20) and the brief %s. Five non-empty "
                               "lines are required — Telemetry: · Failure mode + degraded path: · Rollback / kill switch: · "
                               "Agent permissions (Rule of Two): · PHI & protected paths: — 'none' / 'n/a' only with a "
                               "reason" % (row, OPEX_FROM_ROW, wrong if answers is None else "is not complete: " + wrong))
@@ -676,14 +678,14 @@ def _list(items: list[str], n: int = 5) -> str:
 
 
 def _bare_note(paths: list[str]) -> str:
-    """A13/A14's clean line says how many paths carried no directory: `negation.ts` is matched by its name only, so a
+    """OPX-2/-3's clean line says how many paths carried no directory: `negation.ts` is matched by its name only, so a
     directory pattern (`src/lib/clinical/**`) cannot see it."""
     bare = [p for p in paths if "/" not in p and re.search(r"\.[A-Za-z]\w{0,5}$", p)]
     return " (%d named without a directory — matched by file name only)" % len(bare) if bare else ""
 
 
 def _unjudged(tag: str, filepath: Path, paths: Optional[list[str]]) -> Optional[OpexVerdict]:
-    """A13/A14 before their own question: no ALLOWED FILES section is a refusal from row OPEX_FROM_ROW on (they cannot
+    """OPX-2/-3 before their own question: no ALLOWED FILES section is a refusal from row OPEX_FROM_ROW on (they cannot
     read their input — fail closed), a note below it, and left to A1 when the brief names no row. None: go on."""
     if paths is None:
         row = _kanban_row_number(filepath)
@@ -698,43 +700,43 @@ def _unjudged(tag: str, filepath: Path, paths: Optional[list[str]]) -> Optional[
 
 
 def check_agent_policy(filepath: Path, paths: Optional[list[str]]) -> OpexVerdict:
-    """A13 (OPX-2). ALLOWED FILES naming an agent-runtime path ⇒ the brief cites an Agent Policy id (AP-…) that the
+    """OPX-2. ALLOWED FILES naming an agent-runtime path ⇒ the brief cites an Agent Policy id (AP-…) that the
     newest SCP_Agent_Inventory_v*.md in the canon folder lists. No inventory file there yet ⇒ a warning, and a pass;
     the canon folder or the inventory unreadable ⇒ a refusal."""
-    early = _unjudged("A13", filepath, paths)
+    early = _unjudged("OPX-2", filepath, paths)
     if early:
         return early
     try:
         named = _named(paths, opex_paths("agent_runtime", queue_header(filepath).get("repo")))
     except ValueError as e:
-        return OpexVerdict(False, "A13 ❌ AGENT-POLICY — the agent-runtime path list cannot be read: %s (fails closed)" % e)
+        return OpexVerdict(False, "OPX-2 ❌ AGENT-POLICY — the agent-runtime path list cannot be read: %s (fails closed)" % e)
     if not named:
-        return OpexVerdict(True, "A13 ✅ no agent-runtime path in ALLOWED FILES" + _bare_note(paths))
+        return OpexVerdict(True, "OPX-2 ✅ no agent-runtime path in ALLOWED FILES" + _bare_note(paths))
     canon = kanban_dir()
     if not canon.is_dir():
-        return OpexVerdict(False, "A13 ❌ AGENT-POLICY — ALLOWED FILES name agent-runtime path(s) %s and the canon folder "
+        return OpexVerdict(False, "OPX-2 ❌ AGENT-POLICY — ALLOWED FILES name agent-runtime path(s) %s and the canon folder "
                                   "%s is unreadable, so no policy id can be checked (fails closed)" % (_list(named), canon))
     newest = disk_family(canon, re.escape(AGENT_INVENTORY), AGENT_INVENTORY).newest
     if newest is None:
-        return OpexVerdict(True, "A13 ⚠ agent-runtime path(s) %s — no %s_v*.md in %s yet, so no policy id can be "
-                                 "checked: warning, pass (D-S7CORE33-20 OPX-2)" % (_list(named), AGENT_INVENTORY, canon))
+        return OpexVerdict(True, "OPX-2 ⚠ agent-runtime path(s) %s — no %s_v*.md in %s yet, so no policy id can be "
+                                 "checked: warning, pass (D-S7CORE33-20)" % (_list(named), AGENT_INVENTORY, canon))
     try:
         listed = set(_POLICY_ID.findall((canon / newest[1]).read_text(encoding="utf-8", errors="replace")))
     except OSError as e:
-        return OpexVerdict(False, "A13 ❌ AGENT-POLICY — %s unreadable (%s), so no policy id can be checked (fails "
+        return OpexVerdict(False, "OPX-2 ❌ AGENT-POLICY — %s unreadable (%s), so no policy id can be checked (fails "
                                   "closed)" % (newest[1], e))
     cited = list(dict.fromkeys(_POLICY_ID.findall(_read(filepath))))
     good = [c for c in cited if c in listed]
     if good:
-        return OpexVerdict(True, "A13 ✅ agent-runtime path(s) %s under %s (%s)" % (_list(named), ", ".join(good), newest[1]))
-    return OpexVerdict(False, "A13 ❌ AGENT-POLICY — ALLOWED FILES name agent-runtime path(s) %s and the brief cites no "
+        return OpexVerdict(True, "OPX-2 ✅ agent-runtime path(s) %s under %s (%s)" % (_list(named), ", ".join(good), newest[1]))
+    return OpexVerdict(False, "OPX-2 ❌ AGENT-POLICY — ALLOWED FILES name agent-runtime path(s) %s and the brief cites no "
                               "Agent Policy id that %s lists (%s)%s. Cite one, e.g. '## Agent policy: AP-…' "
-                              "(D-S7CORE33-20 OPX-2)" % (_list(named), newest[1], ", ".join(sorted(listed)) or "none",
+                              "(D-S7CORE33-20)" % (_list(named), newest[1], ", ".join(sorted(listed)) or "none",
                                                          "; cited but not listed: %s" % ", ".join(cited) if cited else ""))
 
 
 def george_go(filepath: Path) -> Optional[str]:
-    """A14: the brief's George go — a `## George go: …` line, else the first `## Briefs:` / `## Spec reference:` line
+    """OPX-3: the brief's George go — a `## George go: …` line, else the first `## Briefs:` / `## Spec reference:` line
     matching George[^\\n]{0,80}\\b(go|GO|agreed|Agree)\\b — as the text that says it; None when there is none."""
     text = _read(filepath)
     m = _GEORGE_GO_LINE.search(text)
@@ -748,26 +750,26 @@ def george_go(filepath: Path) -> Optional[str]:
 
 
 def check_george_go(filepath: Path, paths: Optional[list[str]]) -> OpexVerdict:
-    """A14 (OPX-3). ALLOWED FILES naming a never-autonomous path ⇒ the brief carries a George go."""
-    early = _unjudged("A14", filepath, paths)
+    """OPX-3. ALLOWED FILES naming a never-autonomous path ⇒ the brief carries a George go."""
+    early = _unjudged("OPX-3", filepath, paths)
     if early:
         return early
     try:
         named = _named(paths, opex_paths("protected", queue_header(filepath).get("repo")))
     except ValueError as e:
-        return OpexVerdict(False, "A14 ❌ NEVER-AUTONOMOUS — the protected path list cannot be read: %s (fails closed)" % e)
+        return OpexVerdict(False, "OPX-3 ❌ NEVER-AUTONOMOUS — the protected path list cannot be read: %s (fails closed)" % e)
     if not named:
-        return OpexVerdict(True, "A14 ✅ no never-autonomous path in ALLOWED FILES" + _bare_note(paths))
+        return OpexVerdict(True, "OPX-3 ✅ no never-autonomous path in ALLOWED FILES" + _bare_note(paths))
     go = george_go(filepath)
     if go:
-        return OpexVerdict(True, "A14 ✅ never-autonomous path(s) %s — George go: '%s'" % (_list(named), go[:100]))
-    return OpexVerdict(False, "A14 ❌ NEVER-AUTONOMOUS — ALLOWED FILES name protected path(s) %s and the brief carries "
+        return OpexVerdict(True, "OPX-3 ✅ never-autonomous path(s) %s — George go: '%s'" % (_list(named), go[:100]))
+    return OpexVerdict(False, "OPX-3 ❌ NEVER-AUTONOMOUS — ALLOWED FILES name protected path(s) %s and the brief carries "
                               "no George go: a '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying "
-                              "George … go / agreed (D-S7CORE33-20 OPX-3)" % _list(named))
+                              "George … go / agreed (D-S7CORE33-20)" % _list(named))
 
 
 def check_opex(filepath: Path) -> list[OpexVerdict]:
-    """A12, A13, A14 — [] when PREFIRE_OPEX=off (report() says so, loudly)."""
+    """OPX-1, OPX-2, OPX-3 — [] when PREFIRE_OPEX=off (report() says so, loudly)."""
     if opex_off():
         return []
     paths = allowed_paths(filepath)
@@ -839,7 +841,7 @@ def check(filepath: Path) -> list[str]:
         failures.append("A11 DEPENDS-ON — not merged, so not fired: %s. A brief fires only once every route it "
                         "depends on is on its repo's merge target (F-289)" % "; ".join(map(str, unmet)))
 
-    failures += [v.line for v in check_opex(filepath) if not v.ok]     # A12-A14 [ORCH-OPEX-PREFIRE-1]
+    failures += [v.line for v in check_opex(filepath) if not v.ok]     # OPX-1/-2/-3 [ORCH-OPEX-PREFIRE-1]
 
     return failures
 
@@ -864,9 +866,9 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
     failures = check(filepath)
     bar = "━" * 60
     if opex_off():
-        print("  ⚠⚠ %s=off — A12/A13/A14 (D-S7CORE33-20 OPX-1/-2/-3: Operability & safety, agent policy, George go) "
+        print("  ⚠⚠ %s=off — OPX-1/-2/-3 (D-S7CORE33-20: Operability & safety, agent policy, George go) "
               "SKIPPED for %s. Unset it to turn the OpEx pre-checks back on." % (OPEX_ENV, filepath.name))
-    opex = [v.line for v in check_opex(filepath) if v.ok]               # A12-A14: one line each; a ❌ is a failure
+    opex = [v.line for v in check_opex(filepath) if v.ok]               # OPX-1/-2/-3: one line each; a ❌ is a failure
     if not failures:
         _, row = check_kanban(filepath)
         est = parse_declared_estimate(filepath)
