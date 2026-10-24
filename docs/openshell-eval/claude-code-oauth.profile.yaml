@@ -1,0 +1,26 @@
+# ORCH-OPENSHELL-EVAL-1 (339a): provider profile for Claude Code on a subscription OAuth token.
+# The shipped providers/claude-code.yaml carries ANTHROPIC_API_KEY as x-api-key; Toni fires use
+# OAuth, which Claude Code reads from CLAUDE_CODE_OAUTH_TOKEN and sends as Authorization: Bearer.
+# The sandbox sees only an opaque placeholder; the supervisor swaps it on requests to the
+# endpoints below, from the binary below, and nowhere else.
+id: claude-code-oauth
+display_name: Claude Code (OAuth token)
+description: Claude Code CLI on a Claude subscription OAuth token
+category: agent
+inference_capable: true
+credentials:
+  - name: oauth_token
+    description: Claude Code OAuth token (claude setup-token), Authorization Bearer to api.anthropic.com only
+    env_vars: [CLAUDE_CODE_OAUTH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [oauth_token]
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/claude]

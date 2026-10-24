@@ -1,0 +1,20 @@
+# 339a vault test: a dummy credential bound to a scratch echo server on the gateway host.
+id: vault-echo-339a
+display_name: Vault echo test (339a)
+description: Dummy bearer credential bound to host.openshell.internal:18339 only
+category: data
+inference_capable: false
+credentials:
+  - name: token
+    description: dummy value, not a secret
+    env_vars: [VAULT_ECHO_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: host.openshell.internal
+    port: 18339
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries: [/usr/bin/curl]

@@ -1,0 +1,46 @@
+# v1 — used by sandbox `spike`. host_sit_ports has no protocol: localhost:8103 via fwd.js → HTTP 403
+# (request_authority_mismatch). Superseded by v2/v3; kept because the brief commits every policy used.
+# ORCH-OPENSHELL-EVAL-1 (339a) spike policy — OpenShell v0.1.5 policy schema v1.
+# Filesystem is an allowlist (Landlock): anything not listed is refused, so ~/.ssh, ~/.aws,
+# ~/.config/gh, ~/.claude and /mnt/c are denied by omission. They are also not mounted;
+# the Docker workload sees only the image plus the one bind-mounted worktree.
+version: 1
+filesystem_policy:
+  include_workdir: true            # /sandbox = HOME inside the sandbox (Claude Code's own state)
+  read_only:
+    - /usr
+    - /lib
+    - /lib64
+    - /bin
+    - /sbin
+    - /etc
+    - /opt/toni                    # fwd.js
+    - /proc
+    - /dev/urandom
+  read_write:
+    - /tmp
+    - /dev/null
+    - /home/gkassa/_eos/s7core33/openshell-eval/clinical-mp   # the temp worktree, bind-mounted at its host path
+landlock:
+  compatibility: hard_requirement  # refuse to start rather than run without the filesystem rules
+network_policies:
+  # Host services the clinical-mp SITs use. Policy never authorizes a loopback destination;
+  # host.openshell.internal is OpenShell's name for the gateway host. fwd.js (node) re-serves
+  # each port on the sandbox's own loopback so localhost:8103 in .env/SITs works unchanged.
+  host_sit_ports:
+    endpoints:
+      - host: host.openshell.internal
+        ports: [8103, 3001, 11434]
+    binaries:
+      - path: /usr/local/bin/node
+  # npm installs: npm is a node script, so the rule names the interpreter.
+  npm_registry:
+    endpoints:
+      - host: registry.npmjs.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+        allow_encoded_slash: true
+    binaries:
+      - path: /usr/local/bin/node
