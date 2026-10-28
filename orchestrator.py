@@ -3050,6 +3050,9 @@ class UnitSuiteRun:
     clocks: Optional[tuple] = None
     clock: Optional[ClockViolation] = None   # set by _judge_leg when the clocks disagree
     stderr_head: Optional[str] = None        # [ORCH-LANE-1] O5: the command's stderr head; None = no exit observed
+    # [ORCH-UNIT-RELATED-1] False on a baseline made from another measurement (a full-suite entry restricted to the
+    # related files, or no related file at the base): its `failures` counts FILES, so no count is compared with it.
+    count_comparable: bool = True
 
     @property
     def collection(self) -> Optional[str]:
@@ -3146,6 +3149,14 @@ class UnitGateOutcome:
     # when it was. Both None when the branch leg did not run. No verdict reads either.
     branch_sha: Optional[str] = None
     branch_tree_why: Optional[str] = None
+    # [ORCH-UNIT-RELATED-1] what the branch leg ran, when run_pre_merge_gates handed a diff to a repo whose related set
+    # is computable: "related 3/1543" | "full 1543" | "none" (no unit file relates; nothing ran). `scope_reason` is the
+    # why (the full-suite trigger, or how the set was made); `related_files` the set; `branch_cmd` the command run.
+    # All None/() on every other call — today's full suite, said nowhere.
+    scope: Optional[str] = None
+    scope_reason: Optional[str] = None
+    related_files: tuple = ()
+    branch_cmd: Optional[str] = None
 
     @property
     def clock(self) -> Optional[ClockViolation]:
@@ -3160,6 +3171,8 @@ class UnitGateOutcome:
         6 files/81 tests, 2 failed, 24.1s` — the [ORCH-2] shape, both sides declared.
         [ORCH-6] AC-O6-06: a confirmed flake is named here too, so it reaches FINAL STATUS
         on the PASS path (where flakes alone land) as well as the FAIL path."""
+        if self.scope == "none":
+            return self.detail   # [ORCH-UNIT-RELATED-1] nothing ran, and why
         if not self.ran or self.branch is None:
             return None
         base = self.baseline.describe if self.baseline else (self.baseline_note or "not measured")
@@ -3168,6 +3181,9 @@ class UnitGateOutcome:
         s = f"baseline {base} → branch {self.branch.describe}, {self.duration_s:.1f}s"
         if self.flaky_files:
             s += f" | flaky, confirmed in isolation (not blocking): {', '.join(self.flaky_files)}"
+        if self.scope:   # [ORCH-UNIT-RELATED-1]
+            s += (f" | unit scope: related {self.scope.split(' ', 1)[1]} files ({self.scope_reason})"
+                  if self.scope.startswith("related") else f" | unit scope: full suite: {self.scope_reason}")
         return s
 
     @property
@@ -3741,7 +3757,7 @@ def _unit_cache_lookup(archive: Path, repo_name: str, sha: str, cmd: str, repo_p
 
 def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: UnitSuiteRun,
                       repo_path: Optional[Path] = None, content_key: Optional[str] = None,
-                      landed_as: Optional[str] = None):
+                      landed_as: Optional[str] = None, related_files: Optional[tuple] = None):
     """Persist a MEASURED baseline. AC-O5-02: files, tests, failures, duration and the SHA.
     The suite output is deliberately NOT stored — it is only ever used to F-20-classify the
     BRANCH leg, and keeping 20KB per commit forever buys nothing.
@@ -3755,7 +3771,10 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
     actually measured). A content key that cannot be read leaves the measurement uncached, said.
 
     [ORCH-BASELINE-REUSE-1] R1: `landed_as` — a landed route's branch run (`sha` the gated tip it measured), stored
-    for the commit it landed as; the entry then says so in two additive fields, `measured_as` and `landed_as`."""
+    for the commit it landed as; the entry then says so in two additive fields, `measured_as` and `landed_as`.
+
+    [ORCH-UNIT-RELATED-1] `related_files`: a run of those files only (`cmd` is the related command, so the key is not
+    the full suite's); the entry says `scope: "related"` and names them. No baseline or full-gate reader takes one."""
     if run.clock is not None:
         return   # BASELINE-TRUST-1: never cached — the field below would be false
     ck = content_key or _unit_content_key(repo_path or _unit_cache_repo(), sha)
@@ -3786,6 +3805,7 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         "clock": "plausible",
         # [ORCH-BASELINE-REUSE-1] R1 additive: an entry without them was measured as a baseline leg
         **({"measured_as": "route-branch", "landed_as": landed_as} if landed_as else {}),
+        **({"scope": "related", "related_files": list(related_files)} if related_files is not None else {}),
         **flaky,
     }
     _unit_cache_write(archive, entries, "the baseline (the next route will re-measure)")
@@ -3856,6 +3876,18 @@ def _unit_cache_store_landed(repo_path: Path, verdict, merged_sha: Optional[str]
             why = f"(b) the branch leg's clock is implausible ({b.clock})"
         elif b.error is not None or not _unit_is_cacheable(b):
             why = f"(b) the branch leg is not a cacheable measurement ({b.error or b.collection or 'nothing parsed'})"
+        elif uo.related_files:
+            # [ORCH-UNIT-RELATED-1] a related-only run vouches for its files, never for the tree: kept as related-only
+            ck_m = _unit_content_key(repo_path, merged_sha)
+            if ck_m and not uo.flaky_files and not (set(b.failing_files) - base):
+                _unit_cache_store(archive, ACTIVE_REPO_NAME, tip or merged_sha, uo.branch_cmd, b, repo_path=repo_path,
+                                  content_key=ck_m, landed_as=merged_sha, related_files=uo.related_files)
+            log.info(f"♻️  Unit baseline: route branch run NOT cached as a full baseline for {m7} — a related-only run "
+                     f"({uo.scope} files); "
+                     + ("kept as a related-only entry, which no baseline or full-gate reader takes"
+                        if ck_m and not uo.flaky_files and not (set(b.failing_files) - base)
+                        else "not kept (a flake, a file outside the baseline, or no content key)"))
+            return
         elif uo.baseline_source not in ("measured", "cache", "not-needed"):
             why = (f"(c) the baseline the gate accepted is {uo.baseline_source} — only a measured, cached or "
                    f"not-needed one vouches for the branch run")
@@ -4244,7 +4276,7 @@ def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sh
 
 
 def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, archive: Path,
-                                    repo_name: str) -> tuple:
+                                    repo_name: str, related_files: Optional[tuple] = None) -> tuple:
     """Get the baseline for `base_sha`. Returns (UnitSuiteRun|None, source, note).
 
     `source` is one of "cache" | "measured" | "ancestor-cache" | "unmeasurable" | "implausible"
@@ -4318,7 +4350,8 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
         again = f" — re-measured once, the first leg was implausible ({first.clock})"
     log.info(f"🛡 baseline-trust: CLEAN — unit-baseline at {base_sha[:7]} {trust}")
     if _unit_is_cacheable(run):
-        _unit_cache_store(archive, repo_name, base_sha, cmd, run, repo_path=repo_path, content_key=ck)
+        _unit_cache_store(archive, repo_name, base_sha, cmd, run, repo_path=repo_path, content_key=ck,
+                          related_files=related_files)
         return run, "measured", (f"measured now at {base_sha[:7]} and cached for later routes off this "
                                  f"tree (briefs aside){again}")
     if _unit_is_measurement(run):
@@ -4354,8 +4387,225 @@ def _unit_gate_eligible_repos() -> set:
     return {n for n, r in repos.items() if isinstance(r, dict) and (r.get("test_cmd") or "").strip()}
 
 
+# ── [ORCH-UNIT-RELATED-1] the per-route unit leg runs the files related to the diff (D-S7CORE33-36 fix #1) ─────────
+# 132 min/day went to the full unit suite on every product route (9.7 min, ~1,543 files, median diff 12 files).
+# The branch leg now runs vitest's own related set — `list --changed <merge base>` on the unit config, enumerated
+# and never run, as the SIT leg's D3 set is — plus the test files the branch changes. It runs the FULL suite, and
+# says why, when (a) the diff touches a shared trigger, (b) this is the N-th gated route since the last full unit
+# run, (c) the set cannot be computed (or is empty while non-test source changed), or (d) ORCH_UNIT_RELATED=off.
+# The regression rule is unchanged; only the baseline it reads is restricted to the same files.
+UNIT_RELATED_VAR = "ORCH_UNIT_RELATED"            # `off` ⇒ the full suite every route, as before
+UNIT_FULL_TRIGGERS_KEY = "unit_full_triggers"     # repos.yaml globs; a pattern with no `/` matches a name anywhere
+UNIT_FULL_TRIGGERS_DEFAULT = ("package.json", "package-lock.json", "vitest*.config.*", "vite.config.*",
+                              "tsconfig*.json", "**/setupTests.*")
+UNIT_FULL_EVERY_KEY = "unit_full_every"           # repos.yaml: every N-th gated route runs the full suite
+UNIT_FULL_EVERY = 5
+UNIT_FULL_COUNTER_PREFIX = "unit-full-counter-"   # state/unit-full-counter-<repo>.json
+UNIT_RELATED_ARGS = "--changed {base} --filesOnly"
+_UNIT_TEST_FILE_RE = re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$")
+_UNIT_DOC_FILE_RE = re.compile(r"\.(?:md|txt)$", re.IGNORECASE)
+
+
+@dataclass
+class UnitScope:
+    """What the per-route branch leg runs. `files` None ⇒ the full suite (`reason` says why); () ⇒ nothing relates
+    and nothing ran (`reason` says so); else the related files, in the suite's listing order. `capable` False ⇒ this
+    repo has no related selection at all — today's full suite, no counter."""
+    capable: bool
+    files: Optional[tuple] = None
+    total: Optional[int] = None
+    reason: str = ""
+
+
+def _unit_full_counter_file(repo_name: str) -> Path:
+    return _running_marker_dir() / f"{UNIT_FULL_COUNTER_PREFIX}{_marker_repo_slug(repo_name)}.json"
+
+
+def _unit_full_counter_read(repo_name: str) -> Optional[int]:
+    """Related-only routes since the last full unit run; 0 when never written; None when unreadable (⇒ full)."""
+    f = _unit_full_counter_file(repo_name)
+    if not f.exists():
+        return 0
+    try:
+        n = json.loads(f.read_text()).get("since_full")
+        return n if isinstance(n, int) and n >= 0 else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _unit_full_counter_record(repo_name: str, full: bool, why: str):
+    """A full unit run (route or nightly) resets the counter; a related-only route adds one. Never raises."""
+    try:
+        n = 0 if full else (_unit_full_counter_read(repo_name) or 0) + 1
+        f = _unit_full_counter_file(repo_name)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"repo": repo_name, "since_full": n, "updated_at": datetime.now().isoformat(),
+                                   "last": ("full: " if full else "related: ") + why}, indent=2))
+        os.replace(tmp, f)
+    except Exception as e:
+        log.warning(f"⚠️  Unit gate: {UNIT_FULL_COUNTER_PREFIX}{repo_name}.json not written ({e}) — the next route "
+                    f"reads the old count")
+
+
+def _unit_trigger_hit(path: str, pattern: str) -> bool:
+    import fnmatch
+    pat = str(pattern).strip().strip("/")
+    if not pat:
+        return False
+    if "/" not in pat:
+        return fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pat)
+    if pat.startswith("**/") and fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pat[3:]):
+        return True
+    return fnmatch.fnmatchcase(path, pat) or (pat.endswith("/**") and path.startswith(pat[:-3] + "/"))
+
+
+def _unit_pkg_test_script(repo_path: Path) -> Optional[str]:
+    try:
+        return (json.loads((repo_path / "package.json").read_text()).get("scripts") or {}).get("test")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _unit_list_cmd(repo_path: Path, test_cmd: str) -> tuple:
+    """(`npx vitest list <config args>`, None) when test_cmd is a plain vitest run — `npm test` whose package.json
+    script is `vitest [run] [--config X]`, or that command itself; else (None, why). Nothing else is guessed."""
+    try:
+        toks = shlex.split(test_cmd)
+        if toks in (["npm", "test"], ["npm", "run", "test"]):
+            script = _unit_pkg_test_script(repo_path)
+            if not script:
+                return None, f"`{test_cmd}`: package.json has no scripts.test"
+            toks = shlex.split(script)
+    except ValueError as e:
+        return None, f"`{test_cmd}` does not parse ({e})"
+    toks = toks[1:] if toks[:1] == ["npx"] else toks
+    if toks[:1] != ["vitest"]:
+        return None, f"`{test_cmd}` is not a vitest run"
+    args = toks[2:] if toks[1:2] == ["run"] else toks[1:]
+    ok = (args == [] or (len(args) == 2 and args[0] in ("--config", "-c"))
+          or (len(args) == 1 and args[0].startswith("--config=")))
+    if not ok:
+        return None, f"`{test_cmd}` passes arguments the related listing does not read: {' '.join(args)}"
+    return " ".join(["npx", "vitest", "list", *(shlex.quote(a) for a in args)]), None
+
+
+def _unit_listing(repo_path: Path, cmd: str) -> tuple:
+    """([file, ...], None) from a `vitest list --filesOnly` run, or (None, why)."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"{cmd!r}: {type(e).__name__}"
+    said = _ANSI_RE.sub("", (r.stdout or "") + "\n" + (r.stderr or ""))
+    if r.returncode != 0 or _SIT_LIST_ERROR_RE.search(said):
+        return None, f"{cmd!r} exit {r.returncode}: {((r.stderr or r.stdout or '').strip()[-300:]) or 'no output'}"
+    files, _ = _parse_sit_listing(r.stdout)
+    return [_norm_test_path(f) for f in files], None
+
+
+def _unit_scope(repo_path: Path, test_cmd: str, diff: "BranchDiff") -> UnitScope:
+    """[ORCH-UNIT-RELATED-1] decide the branch leg's files. Every path that cannot decide says so and is the full
+    suite — the decision only ever fails toward more testing."""
+    list_cmd, why = _unit_list_cmd(repo_path, test_cmd)
+    if list_cmd is None:
+        return UnitScope(capable=False, reason=f"related selection not available for {ACTIVE_REPO_NAME} — {why}")
+    if os.environ.get(UNIT_RELATED_VAR, "").strip().lower() == "off":
+        return UnitScope(capable=True, reason=f"(d) {UNIT_RELATED_VAR}=off")
+    if diff is None or diff.paths is None or not diff.base:
+        return UnitScope(capable=True, reason=f"(c) the branch's diff is unknown "
+                                              f"({diff.error if diff is not None else 'not computed'})")
+    raw = ACTIVE_REPO_CONFIG.get(UNIT_FULL_TRIGGERS_KEY)
+    triggers = list(UNIT_FULL_TRIGGERS_DEFAULT if raw is None else ([raw] if isinstance(raw, str) else raw))
+    core = ACTIVE_REPO_CONFIG.get(SIT_CORE_FILES_KEY) or []
+    core = [_norm_test_path(str(c)) for c in ([core] if isinstance(core, str) else core)]
+    paths = [_norm_test_path(p) for p in diff.paths]
+    hits = [f"{p} ({t})" for p in paths for t in triggers if _unit_trigger_hit(p, t)]
+    hits += [f"{p} ({SIT_CORE_FILES_KEY})" for p in paths if p in core]
+    if hits:
+        return UnitScope(capable=True, reason=(f"(a) the diff touches a shared trigger ({UNIT_FULL_TRIGGERS_KEY}): "
+                                               + ", ".join(hits[:BRIEFS_ONLY_NAMED_FILES])
+                                               + (f", … +{len(hits) - BRIEFS_ONLY_NAMED_FILES} more"
+                                                  if len(hits) > BRIEFS_ONLY_NAMED_FILES else "")))
+    every = _unit_repo_timeout(UNIT_FULL_EVERY_KEY, UNIT_FULL_EVERY)
+    since = _unit_full_counter_read(ACTIVE_REPO_NAME)
+    if since is None:
+        return UnitScope(capable=True, reason=f"(b) {_unit_full_counter_file(ACTIVE_REPO_NAME).name} is unreadable — "
+                                              f"the count since the last full unit run is unknown")
+    if since >= every - 1:
+        return UnitScope(capable=True, reason=f"(b) route {since + 1} since the last full unit run "
+                                              f"({UNIT_FULL_EVERY_KEY} {every})")
+    suite, why = _unit_listing(repo_path, f"{list_cmd} --filesOnly")
+    if suite is None or not suite:
+        return UnitScope(capable=True, reason=f"(c) the unit suite could not be enumerated — {why or 'no file listed'}")
+    affected, why = _unit_listing(repo_path, f"{list_cmd} {UNIT_RELATED_ARGS.format(base=shlex.quote(diff.base))}")
+    if affected is None:
+        return UnitScope(capable=True, total=len(suite), reason=f"(c) the related set could not be computed — {why}")
+    member = set(suite)
+    changed = set(paths)
+    chosen = (set(affected) | changed) & member
+    files = tuple(f for f in suite if f in chosen)
+    how = (f"{len(set(affected) & member)} affected by the diff against merge-base {diff.base[:7]} (--changed), "
+           f"{len(changed & member)} changed by the branch")
+    if files:
+        return UnitScope(capable=True, files=files, total=len(suite), reason=how)
+    briefs = _active_briefs_subdir()
+    source = [p for p in paths if not (_UNIT_TEST_FILE_RE.search(p) or _UNIT_DOC_FILE_RE.search(p)
+                                       or _under_subdir(p, briefs))]
+    if source:
+        return UnitScope(capable=True, total=len(suite),
+                         reason=(f"(c) the related set is empty while non-test source changed: "
+                                 f"{', '.join(source[:BRIEFS_ONLY_NAMED_FILES])}"
+                                 + (f", … +{len(source) - BRIEFS_ONLY_NAMED_FILES} more"
+                                    if len(source) > BRIEFS_ONLY_NAMED_FILES else "")))
+    return UnitScope(capable=True, files=(), total=len(suite),
+                     reason=f"unit: no unit test file relates to this diff ({len(paths)} changed files, no non-test "
+                            f"source) — {how}")
+
+
+def _unit_baseline_related(repo_path: Path, base_sha: str, test_cmd: str, files: tuple, archive: Path,
+                           repo_name: str) -> tuple:
+    """[ORCH-UNIT-RELATED-1] the merge-base baseline for the related files: (run, source, note), as
+    _unit_baseline_measure_or_reuse returns. The judged FULL-suite measurement of the base's tree, restricted to
+    the files, when there is one; else the base measured on those of the files it has (a related-scoped cache
+    entry); none of them at the base ⇒ an empty baseline — no file there, so no failure there."""
+    ck = _unit_content_key(repo_path, base_sha)
+    hit = _unit_cache_lookup(archive, repo_name, base_sha, test_cmd, content_key=ck) if ck else None
+    if hit and _unit_cache_judged(hit) and (hit.get("scope") or "full") == "full" and hit.get("failures") is not None:
+        at = str(hit.get("sha") or "?")
+        mine = tuple(sorted(set(hit.get("failing_files") or ()) & set(files)))
+        run = UnitSuiteRun(ref=f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]} (cache at {at[:7]}, restricted to the "
+                               f"{len(files)} related files)", exit_code=1 if mine else 0,
+                           duration_s=float(hit.get("duration_s") or 0.0), runner=hit.get("runner"),
+                           failures=len(mine), failing_files=mine, failures_source="derived", count_comparable=False)
+        note = (f"read from cache — the full-suite measurement at {at[:7]} (measured "
+                f"{str(hit.get('measured_at') or '?')[:19]}, {hit.get('failures')} failure(s) over "
+                f"{len(hit.get('failing_files') or ())} file(s)) restricted to the {len(files)} related file(s): "
+                f"{len(mine)} failing; the count is files, not tests, and is not compared")
+        log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} by content (measured at {at[:7]}) — restricted to "
+                 f"the {len(files)} related file(s): {', '.join(mine) or 'none failing'}; no baseline run")
+        log.info(f'🛡 baseline-trust: CLEAN — cache hit at {base_sha[:7]}, measured '
+                 f'{str(hit.get("measured_at") or "?")[:19]} on a clock judged plausible (cache entry "clock": '
+                 f'"{hit["clock"]}"), restricted to the related files')
+        return run, "cache", note
+    try:
+        r = subprocess.run(["git", "-C", str(repo_path), "ls-tree", "-r", "--name-only", base_sha, "--", *files],
+                           capture_output=True, text=True, timeout=120)
+        there = set(r.stdout.split("\n")) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        there = None
+    at_base = tuple(f for f in files if there is None or f in there)
+    if not at_base:
+        note = f"none of the {len(files)} related file(s) exists at merge-base {base_sha[:7]} — nothing failed there"
+        log.info(f"🧬 Unit baseline: {note}; no baseline run")
+        return (UnitSuiteRun(ref=f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]} (no related file there)", exit_code=0,
+                             failures=0, failing_files=(), failures_source="derived", count_comparable=False),
+                "absent-at-base", note)
+    return _unit_baseline_measure_or_reuse(repo_path, base_sha, _unit_confirm_cmd(test_cmd, at_base), archive,
+                                           repo_name, related_files=at_base)
+
+
 def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
-                  archive_path: Optional[Path] = None) -> UnitGateOutcome:
+                  archive_path: Optional[Path] = None, diff: Optional["BranchDiff"] = None) -> UnitGateOutcome:
     """Baseline unit-suite gate. Halts iff the branch has a confirmed regression.
 
     [ORCH-6b] decision 1 — a regression is a named test FILE that fails in isolation on the
@@ -4364,6 +4614,10 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     the boolean that decides the verdict — the same tree measures too noisily run to run for
     a count alone to carry signal.
     §2.4 — zero collection is BLOCKED(environment), never FAIL(product) and never a PASS.
+
+    [ORCH-UNIT-RELATED-1] `diff` (run_pre_merge_gates' — a direct call passes none and runs the whole suite, exactly
+    as before): the branch leg runs the related files (_unit_scope) or the full suite and says why; with related
+    files the baseline is _unit_baseline_related's, and the rule below is the same rule.
     """
     started = time.time()
     test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
@@ -4393,7 +4647,27 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         return UnitGateOutcome(passed=False, signal="baseline-unresolvable", detail=detail, env=True, ran=True)
 
     label = branch_name or "HEAD"
-    log.info(f"🧪 Unit baseline gate [{ACTIVE_REPO_NAME}]: {test_cmd} — branch {label} vs merge-base {base_sha[:7]}")
+    archive = archive_path or SIT_ARCHIVE_DIR
+    # [ORCH-UNIT-RELATED-1] what the branch leg runs: one 🎯 line, always, when a diff was handed over
+    scope = _unit_scope(repo_path, test_cmd, diff) if diff is not None else None
+    if scope is not None and not scope.capable:
+        log.info(f"🎯 Unit gate: full suite: {scope.reason}")
+        scope = None
+    branch_cmd, scope_label = test_cmd, None
+    if scope is not None and scope.files == ():
+        log.info(f"🎯 Unit gate: related 0/{scope.total} files — {scope.reason}; nothing run, PASS for this leg")
+        return _unit_done(UnitGateOutcome(passed=True, signal="not-applicable", detail=scope.reason, scope="none",
+                                          scope_reason=scope.reason), started, repo_path, archive_path)
+    if scope is not None and scope.files:
+        branch_cmd = _unit_confirm_cmd(test_cmd, scope.files)
+        scope_label = f"related {len(scope.files)}/{scope.total}"
+        log.info(f"🎯 Unit gate: related {len(scope.files)}/{scope.total} files — {scope.reason} (full suite: on a "
+                 f"shared trigger, every {_unit_repo_timeout(UNIT_FULL_EVERY_KEY, UNIT_FULL_EVERY)}th route, and "
+                 f"nightly)")
+    elif scope is not None:
+        scope_label = f"full {scope.total or '?'}"
+        log.info(f"🎯 Unit gate: full suite: {scope.reason}")
+    log.info(f"🧪 Unit baseline gate [{ACTIVE_REPO_NAME}]: {branch_cmd} — branch {label} vs merge-base {base_sha[:7]}")
     # [ORCH-BASELINE-REUSE-1] R3 · R2e: is the tree the branch leg measures a commit? HEAD before == after it, and
     # nothing outside briefs_subdir uncommitted or untracked before it (git-ignored paths are not the commit's either
     # way). Recorded on the outcome for the landing's cache store; no verdict reads it.
@@ -4415,18 +4689,22 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         if dirty:
             tree_why = (f"uncommitted outside {briefs}/ before it: {', '.join(dirty[:5])}"
                         + (f", … +{len(dirty) - 5} more" if len(dirty) > 5 else ""))
-    branch_run = _run_unit_suite(test_cmd, repo_path, label)
+    branch_run = _run_unit_suite(branch_cmd, repo_path, label)
     after = _git_read("git rev-parse HEAD", repo_path)
     if tree_why is None and after != tip:
         tree_why = f"HEAD moved during it ({tip[:7]} → {after[:7] or '?'})"
     log.info(f"🧪 Unit gate branch run — {branch_run.describe}")
-    archive = archive_path or SIT_ARCHIVE_DIR
+    if scope is not None and _unit_is_measurement(branch_run):
+        _unit_full_counter_record(ACTIVE_REPO_NAME, full=scope.files is None, why=f"{label}: {scope.reason}")
     branch_run.clock = _judge_leg("unit-branch", branch_run.clocks, archive,
                                   red=branch_run.exit_code != 0 or bool(branch_run.failures),
                                   completed=branch_run.error is None)
 
     def _finish(o: UnitGateOutcome) -> UnitGateOutcome:
         o.branch_sha, o.branch_tree_why = tip or None, tree_why
+        if scope is not None:
+            o.scope, o.scope_reason, o.branch_cmd = scope_label, scope.reason, branch_cmd
+            o.related_files = tuple(scope.files or ())
         return _unit_done(o, started, repo_path, archive_path)
 
     baseline_run = None
@@ -4465,8 +4743,13 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
 
     # [ORCH-5]: measured once per merge base, then reused. The measurement is still OURS and
     # still on the merge base — it is simply not repeated for a commit that has not changed.
-    baseline_run, baseline_source, baseline_note = _unit_baseline_measure_or_reuse(
-        repo_path, base_sha, test_cmd, archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME)
+    if scope is not None and scope.files:
+        # [ORCH-UNIT-RELATED-1] the same files at the merge base: the cached full measurement restricted, or measured
+        baseline_run, baseline_source, baseline_note = _unit_baseline_related(
+            repo_path, base_sha, test_cmd, scope.files, archive, ACTIVE_REPO_NAME)
+    else:
+        baseline_run, baseline_source, baseline_note = _unit_baseline_measure_or_reuse(
+            repo_path, base_sha, test_cmd, archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME)
 
     if baseline_source == "implausible":
         # [BASELINE-TRUST-1] P-BASE: the branch has failures, so any verdict here is a comparison,
@@ -4513,7 +4796,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     # S7-CORE-9 [ORCH-6b] decision 1/2: the same tree measures 68/104/106/118 failures across
     # runs on one commit — a count delta carries no signal on its own. It is still measured,
     # logged and cached below, but it never appears in the boolean that decides the verdict.
-    worse_count = branch_run.failures > baseline_run.failures
+    worse_count = branch_run.failures > baseline_run.failures and baseline_run.count_comparable
 
     flakes, regressions, confirm_run = (), (), None
     if new_files:
@@ -4567,6 +4850,9 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     verdict = ("equal to" if branch_run.failures == baseline_run.failures else "below")
     detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
               f"{baseline_run.failures} — no new failing file (baseline {baseline_source})")
+    if not baseline_run.count_comparable:   # [ORCH-UNIT-RELATED-1] the baseline counts files: say only what holds
+        detail = (f"{branch_run.failures} failure(s) on the related files — no new failing file (baseline "
+                  f"{baseline_source}: {len(baseline_run.failing_files)} failing related file(s); counts not compared)")
     if flakes:
         # AC-O6b-01: every newly-failing file confirmed a FLAKE ⇒ PASS regardless of the
         # count delta. Flakes alone never fail the route, but they are still reported, never
@@ -4649,6 +4935,9 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
         "baseline_source": o.baseline_source,   # [ORCH-5] AC-O5-05 / decision 5
         "branch": _side(o.branch),
         "flaky_files": list(o.flaky_files),     # [ORCH-6] AC-O6-06
+        # [ORCH-UNIT-RELATED-1] optional: only when the per-route leg chose its scope
+        **({"scope": o.scope, "scope_reason": o.scope_reason, "related_files": list(o.related_files),
+            "branch_cmd": o.branch_cmd} if o.scope else {}),
     })
     log_file.write_text(json.dumps(entries, indent=2))
 
@@ -4959,7 +5248,7 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
     # from PRE_MERGE_GATES: §2.3 derives it from the repo's `test_cmd` in config/repos.yaml,
     # so a repo that declares a command is gated even when it has no entry above, and a repo
     # that declares none is reported "ungated by policy" and does not block.
-    uo = run_unit_gate(repo_path, branch_name)
+    uo = run_unit_gate(repo_path, branch_name, diff=diff)   # [ORCH-UNIT-RELATED-1] the diff, as SIT's D3 has it
     unit_collection = uo.collection
     if not uo.passed:
         if uo.env:
@@ -4985,6 +5274,8 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
         reason += f" (unit: {uo.detail})"
     if sit_na:
         reason += f"; {sit_na}"
+    if uo.scope == "none":   # [ORCH-UNIT-RELATED-1] no unit file relates: nothing ran, and the verdict says so
+        reason += f"; {uo.detail}"
     v = GateVerdict(GateOutcome.PASS, None, None, reason,
                     collection=sit_collection, unit_collection=unit_collection, unit=uo)
     log.info(f"✅ Pre-merge gate{where}: {v.label}")
@@ -5277,6 +5568,8 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
         return {**out, "outcome": "BLOCKED", "signal": "unmeasurable", "detail": f"the suite did not measure ({why})",
                 "failing_files": None}
     out["failing_files"] = list(run.failing_files)
+    _unit_full_counter_record(ACTIVE_REPO_NAME, full=True, why=f"{label}: the full gate's unit leg "
+                                                               f"({'reused' if reused is not None else 'measured'})")
     # a reused leg is not its own baseline: the chain starts at the nearest measured ancestor of another tree
     hit = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck) if ck and reused is None \
         else None

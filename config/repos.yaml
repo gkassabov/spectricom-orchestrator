@@ -101,6 +101,21 @@ repos:
     # first full gate (2026-10-16, a4f0e18) lost 31 SIT files at setup without this one: probe-identity.ts reads
     # it when ADMIN_PASSWORD is unset. A listed file this checkout lacks ⇒ SIT BLOCKED before any batch, named.
     full_gate_link_files: [".medplum-admin-credentials.local"]
+    # ORCH-TEST-EFFICIENCY-1 (S7-CORE-33, D-S7CORE33-36, George 2026-10-24 "Agree").
+    # ORCH-UNIT-RELATED-1: on each route the unit gate's branch leg runs only the unit test files related to the
+    # diff (vitest's own `list --changed <merge base>` on the unit config, plus test files the branch changes). It
+    # runs the FULL suite, and logs why, in these cases: the diff touches one of these globs (a pattern with no `/`
+    # matches that file name in any directory; every sit_core_files path counts too); this is route N since the
+    # last full unit run, where N is unit_full_every (the counter is state/unit-full-counter-clinical-mp.json); the
+    # related set cannot be computed; or ORCH_UNIT_RELATED=off. Setting unit_full_every to 1 runs the full suite on
+    # every route, as before.
+    unit_full_triggers: ["package.json", "package-lock.json", "vitest*.config.*", "vite.config.*", "tsconfig*.json",
+                         "src/test/**", "**/setupTests.*", "src/lib/**", "server/**", "src/types/**"]
+    unit_full_every: 5
+    # ORCH-FULLGATE-CACHE-1: the nightly full gate uses a judged full-suite measurement of its own tree, no older
+    # than this many hours, as its unit leg, and does not run the suite again. Set ORCH_FULLGATE_REUSE=off to
+    # always run it.
+    full_gate_reuse_max_h: 24
 
   orchestrator:
     project_dir: /home/gkassa/spectricom-orchestrator

@@ -130,6 +130,27 @@ appears in the gate verdict's collection, or in the full gate's state file.
   nearest measured ancestor, or else the previous full gate. It is never written back to the cache. In every
   other case the suite runs as before, and the log line says why. The SIT leg always runs. Kill switch:
   `ORCH_FULLGATE_REUSE=off`.
+- **The unit gate runs the related files on each route** (ORCH-UNIT-RELATED-1). The branch leg runs vitest's
+  own related set: `npx vitest list --changed <merge base> --filesOnly` on the unit config, which lists files
+  without running them, plus the unit test files the branch changes. It runs them as
+  `npm test -- <files>`. Log line: `🎯 Unit gate: related <n>/<total> files — …`. The full suite runs instead,
+  and the log line `🎯 Unit gate: full suite: <reason>` says why, in these cases:
+  - (a) the diff touches a `unit_full_triggers` glob or a `sit_core_files` path;
+  - (b) this is route N since the last full unit run, where N is `unit_full_every` (default 5). The count is
+    kept in `state/unit-full-counter-<repo>.json`. Any full run resets it, whether on a route or in the nightly
+    full gate. An unreadable counter means a full run;
+  - (c) the related set cannot be computed, or it is empty while non-test source changed;
+  - (d) `ORCH_UNIT_RELATED=off`.
+
+  When the diff changes only docs or test files that relate to no unit file, nothing runs, and the verdict says
+  so. The regression rule is unchanged. The baseline is the cached full-suite measurement of the merge base,
+  restricted to the related files. If there is no cache entry, the merge base is measured on the same files. A
+  related-only run is cached only as `scope: "related"`, never as a full baseline, and the landing store and the
+  full gate never read it. A repo whose `test_cmd` is not a plain vitest run (`npm test` →
+  `vitest run [--config X]`) keeps the full suite on every route and logs one line saying so.
+  `unit_full_every: 1` also restores the full suite on every route. The scope also appears in the verdict
+  (`| unit scope: …`) and in `orchestrator-unit-log.json` (`scope`, `scope_reason`, `related_files`,
+  `branch_cmd`).
 - **On-demand full gates are George's.** `orchestrator.py full-gate --trigger on-demand` (the default trigger)
   is refused unless `--requested-by <name>` is given. The name is recorded as `requested_by` in the state
   file. `--dry-run` and the daemon's `--trigger nightly` do not need it.
