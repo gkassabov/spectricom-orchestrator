@@ -691,6 +691,7 @@ class FullGate:
                                                                                            total_files=1), set(), set()
         self._batches = 0
         monkeypatch.setattr(subprocess, "run", self)
+        monkeypatch.setenv("ORCH_FULLGATE_REUSE", "off")   # these tests measure the unit leg (ORCH-FULLGATE-CACHE-1)
 
     def __call__(self, cmd, *a, **kw):
         if not (isinstance(cmd, str) and cmd.startswith(("npm ", "npx "))):

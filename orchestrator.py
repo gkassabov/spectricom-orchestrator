@@ -2217,6 +2217,9 @@ class SitOutcome:
     scope: Optional[str] = None
     # D3: the sentence of a leg declared not applicable (no SIT file relates to the diff); nothing ran.
     not_applicable: Optional[str] = None
+    # [ORCH-SIT-ENUM-PARALLEL-1] 1a: how the enumeration was had — "beside the build, 12.3s saved" or "serial — <why
+    # the worker's result was not used>"; None when no worker was started (today's serial path, said nowhere).
+    enumeration: Optional[str] = None
 
     @property
     def files_failed(self) -> Optional[int]:
@@ -2230,7 +2233,11 @@ class SitOutcome:
         """`7 files/18 tests, 6.6s` for FINAL STATUS / batch summary; None when nothing parsed.
         [SIT-RATE-1] `19 files/60 tests in 2 batches, 110.2s` when the gate ran batched.
         [ORCH-GATE-COST-1] D3: `sit[related 2/113 files] 2 files/5 tests in 1 batches, 21.0s` when the per-merge
-        leg selected its files, and the not-applicable sentence when it ran none."""
+        leg selected its files, and the not-applicable sentence when it ran none.
+        [ORCH-SIT-ENUM-PARALLEL-1] ` | enumeration: beside the build, 12.3s saved` (or `serial — why`) at the end."""
+        if self.enumeration:
+            s = replace(self, enumeration=None).collection
+            return f"{s} | enumeration: {self.enumeration}" if s else f"enumeration: {self.enumeration}"
         if self.not_applicable:
             return self.not_applicable
         mode = f"sit[{self.scope} files]" if self.scope else None
@@ -2480,6 +2487,104 @@ def _sit_related_files(repo_path: Path, plan: SitPlan, diff: "BranchDiff") -> tu
                    f"{len([f for f in core if f in suite])} core ({SIT_CORE_FILES_KEY})")
 
 
+# ── [ORCH-SIT-ENUM-PARALLEL-1] 1a · the SIT enumeration beside the build (D-S7CORE33-36 fix #4) ──────────────────
+# `_sit_plan` + `_sit_related_files` read the tree and nothing the build writes, yet ran only after the build
+# returned (31 min/day on clinical-mp). A worker runs the same two calls on the same diff while the build runs; the
+# SIT leg takes its result only if the tree it saw is still the tree, else enumerates serially as before and says why.
+SIT_ENUM_PARALLEL_VAR = "ORCH_SIT_ENUM_PARALLEL"   # `off` ⇒ the serial enumeration after the build, as before
+
+
+def _sit_tree_state(repo_path: Path) -> Optional[str]:
+    """HEAD plus `git status` (untracked included): what `vitest list --changed` reads. None when git cannot say."""
+    try:
+        h = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"], capture_output=True, text=True,
+                           timeout=60)
+        st = subprocess.run(["git", "-C", str(repo_path), "--no-optional-locks", "status", "--porcelain",
+                             "--untracked-files=all", "-z"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if h.returncode != 0 or st.returncode != 0:
+        return None
+    return f"{h.stdout.strip()}:{hashlib.sha256((st.stdout or '').encode()).hexdigest()[:16]}"
+
+
+@dataclass
+class _SitEnumJob:
+    """One enumeration run beside the build: exactly the serial path's `_sit_plan` and `_sit_related_files` calls."""
+    repo_path: Path
+    diff: Optional["BranchDiff"]
+    tree: Optional[str] = None
+    plan: Optional[SitPlan] = None
+    related: Optional[list] = None
+    how: Optional[str] = None
+    error: Optional[str] = None      # the exception the worker raised, as text
+    started: float = 0.0
+    finished: Optional[float] = None
+    future: object = None
+
+    def _run(self):
+        self.started = time.time()
+        try:
+            self.tree = _sit_tree_state(self.repo_path)
+            self.plan = _sit_plan(self.repo_path)
+            if self.plan is not None and not self.plan.error and self.diff is not None:
+                self.related, self.how = _sit_related_files(self.repo_path, self.plan, self.diff)
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+        finally:
+            self.finished = time.time()
+
+    def wait(self) -> float:
+        """Block until the worker is done; the seconds this call waited."""
+        t0 = time.time()
+        if self.future is not None:
+            self.future.result()
+        return max(0.0, time.time() - t0)
+
+    def discard(self, why: str):
+        self.wait()   # never leave a `vitest list` running into the next route's checkout
+        log.info(f"⏩ SIT enumeration discarded — {why}; nothing of it is used")
+
+    def take(self, repo_path: Path) -> tuple:
+        """(self, note) when the SIT leg may use this result; (None, note) when it must enumerate serially."""
+        waited = self.wait()
+        why = None
+        if self.error:
+            why = f"the worker raised {self.error}"
+        elif self.plan is None:
+            why = "the worker produced no plan"
+        elif self.plan.error:
+            why = f"the worker's enumeration failed ({self.plan.error})"
+        elif self.tree is None:
+            why = "the tree it enumerated could not be read"
+        else:
+            now = _sit_tree_state(repo_path)
+            if now != self.tree:
+                why = (f"the tree moved under it (HEAD/status {str(self.tree)[:7]}… → "
+                       f"{str(now)[:7] if now else '?'}…)")
+        if why:
+            note = f"serial — {why}"
+            log.warning(f"⏩ SIT enumeration re-run serially — {why}; the serial enumeration decides, as before")
+            return None, note
+        saved = max(0.0, (self.finished or self.started) - self.started - waited)
+        log.info(f"⏩ SIT enumeration ran beside the build ({saved:.1f} s saved)")
+        return self, f"beside the build, {saved:.1f}s saved"
+
+
+def _sit_enum_start(repo_path: Path, diff: Optional["BranchDiff"]) -> Optional[_SitEnumJob]:
+    """Start the worker, or None when the serial path is the one: no sit_list_cmd, --skip-sit, or the kill switch."""
+    if SKIP_SIT or not (ACTIVE_REPO_CONFIG.get(SIT_LIST_CMD_KEY) or "").strip():
+        return None
+    if os.environ.get(SIT_ENUM_PARALLEL_VAR, "").strip().lower() == "off":
+        log.info(f"⏩ SIT enumeration: {SIT_ENUM_PARALLEL_VAR}=off — serial, after the build, as before")
+        return None
+    job = _SitEnumJob(repo_path=repo_path, diff=diff)
+    ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sit-enum")
+    job.future = ex.submit(job._run)
+    ex.shutdown(wait=False)
+    return job
+
+
 @dataclass
 class _SitBatchedRun:
     """[SIT-RATE-1] The aggregate of every batch — one gate result, never a partial one."""
@@ -2688,7 +2793,8 @@ def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list,
 
 
 def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
-                       diff: Optional["BranchDiff"] = None) -> SitOutcome:
+                       diff: Optional["BranchDiff"] = None,
+                       enumerated: Optional[_SitEnumJob] = None) -> SitOutcome:
     """Run SIT smoke tests, then apply the MANY-or-SEVERE halt rule.
 
     [ORCH-1] Name retained for its call sites (tests import it by name); since S7-CORE-4 this
@@ -2703,8 +2809,14 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
     files RELATED to it (_sit_related_files) — batching, pauses, isolation and GATE-SIT-2 unchanged on that set —
     or the full suite when the set cannot be computed, or declares the leg not applicable when it is empty.
     None (a direct call, full-gate) ⇒ the whole suite, exactly as before.
+
+    [ORCH-SIT-ENUM-PARALLEL-1] 1a: `enumerated` — the worker run_pre_merge_gates started beside the build. Its plan and
+    related set are used iff it finished cleanly on the tree this leg runs on (_SitEnumJob.take); else the serial
+    `_sit_plan` / `_sit_related_files` below run as before, and the outcome's `enumeration` says which.
     """
     if SKIP_SIT:
+        if enumerated is not None:
+            enumerated.discard("--skip-sit")
         log.info("⏭️  SIT skipped (--skip-sit)")
         return SitOutcome(passed=True, exit_code=0, error="skipped")
 
@@ -2716,16 +2828,20 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
     sit_cmd = "npm run sit:gate"  # S6S78: deterministic headless T1 (vitest); exit-code = pass/fail
     # [SIT-RATE-1] None ⇒ one invocation, exactly as before. A plan ⇒ batches of `batch_files`
     # with `pause_s` between, added up and reconciled against the enumeration.
-    plan = _sit_plan(repo_path)
+    pre, enum_note = enumerated.take(repo_path) if enumerated is not None else (None, None)
+    plan = pre.plan if pre is not None else _sit_plan(repo_path)
     if plan is not None and plan.error:
         log.error(f"⛔ SIT gate: could not enumerate the suite for batching — {plan.error} ({plan.detail}) "
                   f"— BLOCKED(environment), not run unbatched into the rate limit")
-        _log_sit_outcome(archive, repo_path, False, -1, 0.0, None, error=plan.error, error_excerpt=plan.detail)
-        return SitOutcome(passed=False, exit_code=-1, error=plan.error, detail=plan.detail, output=plan.detail or "")
+        _log_sit_outcome(archive, repo_path, False, -1, 0.0, None, error=plan.error, error_excerpt=plan.detail,
+                         enumeration=enum_note)
+        return SitOutcome(passed=False, exit_code=-1, error=plan.error, detail=plan.detail, output=plan.detail or "",
+                          enumeration=enum_note)
     # [ORCH-GATE-COST-1] D3: the per-merge leg runs the related set, or the full suite and says why.
     scope, suite_n, leg = None, (len(plan.files) if plan is not None else 0), SIT_BATCH_LEG
     if plan is not None and diff is not None:
-        related, how = _sit_related_files(repo_path, plan, diff)
+        related, how = ((pre.related, pre.how) if pre is not None and pre.diff is diff
+                        else _sit_related_files(repo_path, plan, diff))
         if related is None:
             scope = f"full {suite_n}"
             log.warning(f"🧪 SIT gate: related set not computed — {how} — running the FULL suite "
@@ -2734,8 +2850,9 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
             said = f"sit: no SIT file relates to this diff ({len(diff.paths)} changed files)"
             log.info(f"🧪 SIT gate: not applicable — {said} — {how}; nothing run, PASS for this leg "
                      f"(not zero-collection: no file was asked to run)")
-            _log_sit_outcome(archive, repo_path, True, 0, 0.0, None, scope="none", not_applicable=said)
-            return SitOutcome(passed=True, exit_code=0, not_applicable=said)
+            _log_sit_outcome(archive, repo_path, True, 0, 0.0, None, scope="none", not_applicable=said,
+                             enumeration=enum_note)
+            return SitOutcome(passed=True, exit_code=0, not_applicable=said, enumeration=enum_note)
         else:
             plan = replace(plan, files=related,
                            tests_expected=(sum(plan.tests_per_file.get(f, 0) for f in related) or None
@@ -2866,9 +2983,10 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
         _log_sit_outcome(archive, repo_path, passed, r.returncode, duration, report_path,
                          error=error, error_excerpt=error_excerpt, tests_failed=tests_failed,
                          batches=batches, isolation=None if isolation is None else isolation.as_log(),
-                         scope=scope, **counts)
+                         scope=scope, enumeration=enum_note, **counts)
 
         return SitOutcome(passed=passed, exit_code=r.returncode, report_path=report_path, duration_s=duration,
+                          enumeration=enum_note,
                           error=error, detail=detail, output="" if passed else raw[-20000:],
                           tests_failed=tests_failed, tests_skipped=tallies.get("skipped"),
                           batches=batches, isolation=isolation, clock=clock, scope=scope, **counts)
@@ -2876,13 +2994,17 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
     except subprocess.TimeoutExpired:
         duration = time.time() - started
         log.error(f"🟠 SIT TIMEOUT after {duration:.1f}s — ADVISORY (not blocking); surfacing for review.")
-        _log_sit_outcome(archive, repo_path, True, -1, duration, None, error="timeout-advisory", scope=scope)
-        return SitOutcome(passed=True, exit_code=-1, error="timeout-advisory", duration_s=duration, scope=scope)
+        _log_sit_outcome(archive, repo_path, True, -1, duration, None, error="timeout-advisory", scope=scope,
+                         enumeration=enum_note)
+        return SitOutcome(passed=True, exit_code=-1, error="timeout-advisory", duration_s=duration, scope=scope,
+                          enumeration=enum_note)
     except Exception as e:
         duration = time.time() - started
         log.warning(f"⚠️  SIT ERROR: {e} — advisory only")
-        _log_sit_outcome(archive, repo_path, False, -1, duration, None, error=str(e), scope=scope)
+        _log_sit_outcome(archive, repo_path, False, -1, duration, None, error=str(e), scope=scope,
+                         enumeration=enum_note)
         return SitOutcome(passed=False, exit_code=-1, error=str(e), duration_s=duration, output=str(e),
+                          enumeration=enum_note,
                           clock=getattr(e, "gate_clock", None), scope=scope)
 
 
@@ -4070,7 +4192,7 @@ def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
 
 
 def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sha: str,
-                         cmd: str) -> Optional[dict]:
+                         cmd: str, exclude_ck: Optional[str] = None) -> Optional[dict]:
     """[ORCH-5] decision 3 — the LAST resort, used only after a fresh measurement has already
     failed. The nearest ANCESTOR of the merge base that we have a real measurement for.
 
@@ -4080,10 +4202,15 @@ def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sh
     and nothing here reads main's tip.
 
     [CONFIG-TRUTH-1] an entry whose clock was never judged is not a candidate — and it cannot be
-    re-measured here, since the measurement at the base has just failed."""
+    re-measured here, since the measurement at the base has just failed.
+
+    [ORCH-FULLGATE-CACHE-1] `exclude_ck`: a full gate whose unit leg IS the entry for that content key never takes
+    the same measurement (at a content twin) as its own baseline."""
     best, best_distance, unjudged = None, None, 0
     for e in _unit_cache_load(archive).values():
         if not isinstance(e, dict) or e.get("repo") != repo_name or e.get("test_cmd") != cmd:
+            continue
+        if exclude_ck and e.get("content_key") == exclude_ck:
             continue
         sha = e.get("sha")
         if not sha or sha == base_sha:
@@ -4775,10 +4902,15 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
 
     sit_collection: Optional[str] = None  # [ORCH-2]
     sit_na: Optional[str] = None          # [ORCH-GATE-COST-1] D3: the SIT leg was not applicable, and why
-    for gate in gates:
+    sit_enum: Optional[_SitEnumJob] = None  # [ORCH-SIT-ENUM-PARALLEL-1] 1a: the enumeration beside the build
+    for i, gate in enumerate(gates):
         if gate == "build":
+            if "sit" in gates[i + 1:]:
+                sit_enum = _sit_enum_start(repo_path, diff)
             bg = run_build_gate(repo_path)
             if not bg.passed:
+                if sit_enum is not None:
+                    sit_enum.discard("the build is red")   # the build verdict decides first
                 v = _classify_gate_failure("build", bg.output or bg.error or "", repo_path, bg.exit_code,
                                            clock=bg.clock)
                 died = _gate_fast_death(bg.exit_code, bg.duration_s, bg.stderr_head, elide=env_name)
@@ -4787,7 +4919,8 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                 log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                 return v
         elif gate == "sit":
-            so = run_sit_post_merge(repo_path, diff=diff)
+            # only a started worker is handed over: callers that stub run_sit_post_merge keep its old signature
+            so = run_sit_post_merge(repo_path, diff=diff, **({"enumerated": sit_enum} if sit_enum else {}))
             sit_collection = so.collection
             sit_na = so.not_applicable
             if not so.passed:
@@ -4865,7 +4998,7 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
                      tests_total: Optional[int] = None, tests_passed: Optional[int] = None,
                      tests_failed: Optional[int] = None, batches: Optional[int] = None,
                      isolation: Optional[dict] = None, scope: Optional[str] = None,
-                     not_applicable: Optional[str] = None):
+                     not_applicable: Optional[str] = None, enumeration: Optional[str] = None):
     """Append SIT outcome to orchestrator-sit-log.json. [ORCH-2] carries the four collection
     counts (null when the summary did not parse) so "was the gate ever thin?" is answerable
     historically. Old-shape entries without them still load.
@@ -4904,6 +5037,8 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
         entry["scope"] = scope
     if not_applicable is not None:
         entry["not_applicable"] = not_applicable
+    if enumeration is not None:   # [ORCH-SIT-ENUM-PARALLEL-1] only when a worker was started
+        entry["enumeration"] = enumeration
     entries.append(entry)
     log_file.write_text(json.dumps(entries, indent=2))
 
@@ -5105,32 +5240,53 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
     tree (D2); else the nearest measured ancestor, said approximate; else the previous full-gate's unit
     failures; else nothing, and every failing file is new. A new failing file is confirmed alone ([ORCH-6]) —
     one that passes alone is a flake, named, not new. A plausible measurement with no content hit is cached as
-    this tree's baseline: the next route off it reuses it."""
+    this tree's baseline: the next route off it reuses it.
+
+    [ORCH-FULLGATE-CACHE-1] 1b: when the cache already holds a judged, fresh, full-suite measurement of this tree
+    (_full_gate_reusable), that measurement is the leg — no suite run, `reused` in the state — judged as above
+    against the chain from its second link (it is never its own baseline), and never stored back."""
     test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
     if not test_cmd or ACTIVE_REPO_NAME not in _unit_gate_eligible_repos():
         return {"ran": False, "outcome": "not gated", "detail": f"{ACTIVE_REPO_NAME}: no test_cmd in repos.yaml",
                 "failing_files": None, "new": []}
     label = f"full-gate {ref}@{sha[:7]}"
-    log.info(f"🧪 full-gate unit: {test_cmd} — {label}, the full suite")
-    run = _run_unit_suite(test_cmd, wt, label,
-                          timeout=_unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT))
-    log.info(f"🧪 full-gate unit run — {run.describe}")
-    run.clock = _judge_leg("unit-baseline", run.clocks, archive, red=run.exit_code != 0 or bool(run.failures),
-                           completed=run.error is None)
+    reused, why_not = _full_gate_reusable(archive, sha, ck, test_cmd)
+    if reused is not None:
+        # [ORCH-FULLGATE-CACHE-1] 1b: this tree's judged full-suite measurement IS the unit leg — no suite run
+        at, age = str(reused.get("sha") or "?"), _full_gate_age(reused)
+        run = _unit_run_from_cache(reused, f"{label} (reused: measured at {at[:7]})")
+        log.info(f"♻️ full-gate unit: reused measured run {at[:7]} ({age}) — {run.collection}; the suite is not run "
+                 f"again on a tree measured {age} (≤ {_full_gate_reuse_max_h()} h, {FULL_GATE_REUSE_MAX_H_KEY}; "
+                 f"{FULL_GATE_REUSE_VAR}=off runs it)")
+    else:
+        log.info(f"🧪 full-gate unit: {test_cmd} — {label}, the full suite (no measured run to reuse: {why_not})")
+        run = _run_unit_suite(test_cmd, wt, label,
+                              timeout=_unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT))
+        log.info(f"🧪 full-gate unit run — {run.describe}")
+        run.clock = _judge_leg("unit-baseline", run.clocks, archive, red=run.exit_code != 0 or bool(run.failures),
+                               completed=run.error is None)
     out = {"ran": True, "command": test_cmd, "collection": run.collection, "duration_s": round(run.duration_s, 2),
            "clock": "plausible" if run.clock is None else str(run.clock), "new": [], "flaky": []}
+    if reused is not None:
+        out.update(ran=False, clock="plausible (judged when measured)",
+                   reused={"sha": reused.get("sha"), "measured_at": reused.get("measured_at"), "age": age,
+                           "measured_as": reused.get("measured_as") or "baseline",
+                           "note": f"reused measured run {at[:7]}, {age}"})
     if run.error or not _unit_is_measurement(run) or run.failures is None:
         why = run.error or run.collection or "no parseable summary"
         return {**out, "outcome": "BLOCKED", "signal": "unmeasurable", "detail": f"the suite did not measure ({why})",
                 "failing_files": None}
     out["failing_files"] = list(run.failing_files)
-    hit = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck) if ck else None
+    # a reused leg is not its own baseline: the chain starts at the nearest measured ancestor of another tree
+    hit = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck) if ck and reused is None \
+        else None
     hit = hit if hit and _unit_cache_judged(hit) else None
     if hit:
         ref_files = set(hit.get("failing_files") or ())
         base = {"source": "cache", "sha": hit.get("sha"),
                 "note": f"cache hit by content: measured at {str(hit.get('sha'))[:7]}, this tree {sha[:7]}"}
-    elif (anc := _unit_cache_ancestor(PROJECT_ROOT, archive, ACTIVE_REPO_NAME, sha, test_cmd)) is not None:
+    elif (anc := _unit_cache_ancestor(PROJECT_ROOT, archive, ACTIVE_REPO_NAME, sha, test_cmd,
+                                      exclude_ck=ck if reused is not None else None)) is not None:
         ref_files = set(anc.get("failing_files") or ())
         base = {"source": "ancestor-cache", "sha": anc.get("sha"),
                 "note": f"nearest measured ANCESTOR {str(anc.get('sha'))[:7]}, {anc.get('ancestor_distance', '?')} "
@@ -5145,12 +5301,13 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
         base = {"source": "none", "sha": None, "note": "nothing measured to compare against — every failing file is new"}
     out["baseline"] = base
     suspects = tuple(sorted(set(run.failing_files) - ref_files))
-    if run.clock is None and hit is None and ck and _unit_is_cacheable(run):
+    if run.clock is None and hit is None and reused is None and ck and _unit_is_cacheable(run):
         _unit_cache_store(archive, ACTIVE_REPO_NAME, sha, test_cmd, run, repo_path=PROJECT_ROOT, content_key=ck)
         out["cached"] = True
+    said = f"{out['reused']['note']}; " if reused is not None else ""
     if not suspects:
-        return {**out, "outcome": "PASS", "detail": f"{run.failures} failure(s), no failing file outside the baseline "
-                                                    f"({base['source']})"}
+        return {**out, "outcome": "PASS", "detail": f"{said}{run.failures} failure(s), no failing file outside the "
+                                                    f"baseline ({base['source']})"}
     if run.clock is not None:
         return {**out, "outcome": "BLOCKED", "signal": "clock-implausible",
                 "detail": f"{run.clock} — failing file(s) {', '.join(suspects)} measured on that clock"}
@@ -5168,9 +5325,56 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
                 "detail": f"{confirm.clock} — {', '.join(regressions)} confirmed on that clock"}
     if regressions:
         return {**out, "outcome": "FAIL(product)", "new": list(regressions),
-                "detail": f"failing alone, not in the baseline ({base['source']}): {', '.join(regressions)}"}
-    return {**out, "outcome": "PASS", "detail": f"failing file(s) outside the baseline passed alone (flaky, not new): "
-                                                f"{', '.join(flakes)}"}
+                "detail": f"{said}failing alone, not in the baseline ({base['source']}): {', '.join(regressions)}"}
+    return {**out, "outcome": "PASS", "detail": f"{said}failing file(s) outside the baseline passed alone (flaky, not "
+                                                f"new): {', '.join(flakes)}"}
+
+
+# ── [ORCH-FULLGATE-CACHE-1] 1b · the nightly reuses a measured unit run (D-S7CORE33-36 fix #4) ────────────────────
+FULL_GATE_REUSE_VAR = "ORCH_FULLGATE_REUSE"          # `off` ⇒ the full gate always runs the unit suite, as before
+FULL_GATE_REUSE_MAX_H_KEY = "full_gate_reuse_max_h"  # repos.yaml: the oldest measurement a full gate reuses, hours
+FULL_GATE_REUSE_MAX_H = 24
+
+
+def _full_gate_reuse_max_h() -> int:
+    return _unit_repo_timeout(FULL_GATE_REUSE_MAX_H_KEY, FULL_GATE_REUSE_MAX_H)
+
+
+def _full_gate_age(e: dict) -> str:
+    try:
+        h = (datetime.now() - datetime.fromisoformat(str(e.get("measured_at")))).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return "age unknown"
+    return f"{h * 60:.0f} min old" if h < 1 else f"{h:.1f} h old"
+
+
+def _full_gate_reusable(archive: Path, sha: str, ck: Optional[str], test_cmd: str, persist: bool = True) -> tuple:
+    """(entry, None) when the content-keyed cache holds a measurement of this tree a full gate may use as its unit
+    leg: judged plausible, a FULL-suite run of this very test_cmd, measured no more than full_gate_reuse_max_h ago
+    (and not in the future); else (None, why not). Fails toward running the suite: anything unread is a no."""
+    if os.environ.get(FULL_GATE_REUSE_VAR, "").strip().lower() == "off":
+        return None, f"{FULL_GATE_REUSE_VAR}=off"
+    if not ck:
+        return None, "this tree's content key could not be read"
+    e = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck, persist=persist)
+    if not e:
+        return None, f"no cached measurement of this tree for `{test_cmd}`"
+    if not _unit_cache_judged(e):
+        return None, f"the cached measurement at {str(e.get('sha'))[:7]} was never clock-judged"
+    if (e.get("scope") or "full") != "full":
+        return None, f"the cached measurement at {str(e.get('sha'))[:7]} is a {e.get('scope')}-only run, not the suite"
+    if e.get("failures") is None:
+        return None, f"the cached measurement at {str(e.get('sha'))[:7]} carries no failure count"
+    try:
+        age_h = (datetime.now() - datetime.fromisoformat(str(e.get("measured_at")))).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return None, f"the cached measurement at {str(e.get('sha'))[:7]} has no readable measured_at"
+    if age_h < 0:
+        return None, f"the cached measurement at {str(e.get('sha'))[:7]} is dated in the future ({e.get('measured_at')})"
+    if age_h > _full_gate_reuse_max_h():
+        return None, (f"the cached measurement at {str(e.get('sha'))[:7]} is {age_h:.1f} h old (> "
+                      f"{FULL_GATE_REUSE_MAX_H_KEY} {_full_gate_reuse_max_h()} h)")
+    return e, None
 
 
 def _full_gate_previous(state: dict, leg: str) -> Optional[dict]:
@@ -5245,8 +5449,13 @@ def _full_gate_dry_run(ref: str, sha: str, ck: Optional[str], refusal: Optional[
                if ck else None)
         base = (f"cache hit by content (measured at {str(hit.get('sha'))[:7]})" if hit and _unit_cache_judged(hit)
                 else "no content-keyed entry — the nearest measured ancestor, else the previous full-gate")
-        print(f"  unit: `{test_cmd}` — the full suite, budget "
-              f"{_unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT)}s; baseline: {base}")
+        reuse, why_not = (_full_gate_reusable(SIT_ARCHIVE_DIR, sha, ck, test_cmd, persist=False) if hit else (None, "no entry"))
+        if reuse is not None:   # [ORCH-FULLGATE-CACHE-1] 1b
+            print(f"  unit: `{test_cmd}` — NOT run: reused measured run {str(reuse.get('sha'))[:7]} "
+                  f"({_full_gate_age(reuse)}); baseline: the nearest measured ancestor, else the previous full-gate")
+        else:
+            print(f"  unit: `{test_cmd}` — the full suite, budget "
+                  f"{_unit_repo_timeout(UNIT_BASELINE_TIMEOUT_KEY, UNIT_BASELINE_TIMEOUT)}s; baseline: {base}")
     else:
         print(f"  unit: not gated for {ACTIVE_REPO_NAME} (no test_cmd)")
     print(f"  writes: {LOG_DIR / LOG_SUBDIR}/{FULL_GATE_PREFIX}<ts>.log, {full_gate_state_file(ACTIVE_REPO_NAME)} "
@@ -5255,11 +5464,13 @@ def _full_gate_dry_run(ref: str, sha: str, ck: Optional[str], refusal: Optional[
 
 
 def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = None,
-              trigger: str = "on-demand") -> int:
+              trigger: str = "on-demand", requested_by: Optional[str] = None) -> int:
     """[ORCH-GATE-COST-1] D4: the `full-gate` subcommand for the active repo. Exit 0 only when nothing is new
     (PASS); 1 for NEW FAILURES or BLOCKED; 2 when refused — a fire lock for the repo held, the daemon reporting a
     route live, or a ref that is not a commit — with nothing run. Writes `log_path` (else
-    logs/<log_subdir>/full-gate-<ts>.log) and state/full-gate-<repo>.json."""
+    logs/<log_subdir>/full-gate-<ts>.log) and state/full-gate-<repo>.json.
+    [ORCH-FULLGATE-CACHE-1] 1c: `requested_by` — who asked for an on-demand run (main() refuses one without it);
+    recorded in the state file."""
     repo, ref = ACTIVE_REPO_NAME, ref or MERGE_TARGET
     sha = _git_read(f"git rev-parse --verify -q {shlex.quote(ref + '^{commit}')}", PROJECT_ROOT)
     if not sha:
@@ -5295,7 +5506,8 @@ def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = No
             print(f"⛔ full-gate {repo}: refused — {late}; nothing run", file=sys.stderr)
             log.error(f"⛔ full-gate {repo}: refused — {late} (taken between the check and the lock); nothing run")
             return 2
-        log.info(f"🌙 full-gate {repo} @ {ref} = {sha[:7]} ({trigger}) — the full SIT and unit suites in a detached "
+        log.info(f"🌙 full-gate {repo} @ {ref} = {sha[:7]} ({trigger}"
+                 f"{f', requested by {requested_by}' if requested_by else ''}) — the full SIT and unit suites in a detached "
                  f"worktree {wt}; content key {ck or 'unreadable'}; log {log_path}")
         add = subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "add", "--detach", str(wt), sha],
                              capture_output=True, text=True)
@@ -5327,6 +5539,7 @@ def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = No
                    else "BLOCKED" if any(l.get("outcome") == "BLOCKED" for l in legs) else "PASS")
         finished = datetime.now()
         state = {"repo": repo, "ref": ref, "sha": sha, "content_key": ck, "trigger": trigger,
+                 **({"requested_by": requested_by} if requested_by else {}),
                  "started_at": started.isoformat(), "finished_at": finished.isoformat(),
                  "duration_s": round((finished - started).total_seconds(), 1), "outcome": outcome,
                  "exit_code": 0 if outcome == "PASS" else 1, "log": log_path, "sit": sit, "unit": unit,
@@ -5349,7 +5562,8 @@ def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = No
         def _leg(name: str, l: dict) -> str:
             new = f"; NEW: {', '.join(l['new'])}" if l.get("new") else ""
             files = f"; {_describe_local_files(l['local_files'])}" if l.get("local_files") else ""
-            return f"{name} {l.get('outcome')} ({l.get('collection') or l.get('detail') or '-'}){files}{new}"
+            reused = f"; {l['reused']['note']}" if l.get("reused") else ""   # [ORCH-FULLGATE-CACHE-1]
+            return f"{name} {l.get('outcome')} ({l.get('collection') or l.get('detail') or '-'}){reused}{files}{new}"
         line = (f"🌙 full-gate {repo} @ {sha[:7]} ({ref}): {outcome} — {_leg('sit', sit)} | {_leg('unit', unit)} "
                 f"| {state['duration_s']:.0f}s → {full_gate_state_file(repo)}")
         (log.info if outcome == "PASS" else log.error)(line)
@@ -6438,6 +6652,9 @@ def main():
     fgp.add_argument("--dry-run", action="store_true", help="enumerate and print the plan; run nothing, take no lock")
     fgp.add_argument("--log-file", default=None, help=argparse.SUPPRESS)   # the queue daemon's: it holds the stdout
     fgp.add_argument("--trigger", default="on-demand", choices=("on-demand", "nightly"), help=argparse.SUPPRESS)
+    # [ORCH-FULLGATE-CACHE-1] 1c (D-S7CORE33-36): an on-demand full gate is George's — who asked is required
+    fgp.add_argument("--requested-by", default="", help="who asked for this on-demand run (required unless "
+                                                          "--trigger nightly or --dry-run); recorded in the state file")
 
     a = ap.parse_args()
 
@@ -6553,7 +6770,15 @@ def main():
         sys.exit(verify_route(a.stem, a.commit))
 
     elif a.cmd == "full-gate":
-        sys.exit(full_gate(a.ref, a.dry_run, a.log_file, a.trigger))
+        who = (a.requested_by or "").strip()
+        if a.trigger == "on-demand" and not who and not a.dry_run:
+            # [ORCH-FULLGATE-CACHE-1] 1c: the nightly is the daemon's; an on-demand run is George's to ask for
+            print(f"⛔ full-gate {ACTIVE_REPO_NAME}: refused — an on-demand full gate needs --requested-by <name> "
+                  f"(D-S7CORE33-36: on-demand full gates are George's; the nightly is the queue daemon's); "
+                  f"nothing run", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(full_gate(a.ref, a.dry_run, a.log_file, a.trigger,
+                           **({"requested_by": who} if who and a.trigger == "on-demand" else {})))
 
     else:
         ap.print_help()

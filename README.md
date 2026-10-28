@@ -111,6 +111,29 @@ python3 orchestrator.py sit:report --since 2026-05-01
 - 5-minute timeout per SIT run
 - Does NOT block queue progression in v1
 
+## Gate efficiency (ORCH-TEST-EFFICIENCY-1, D-S7CORE33-36)
+
+Each item below writes a log line that names what was not run, why, and what was used instead. The same text
+appears in the gate verdict's collection, or in the full gate's state file.
+
+- **SIT enumeration runs during the build** (ORCH-SIT-ENUM-PARALLEL-1). For a repo with `sit_list_cmd`, the
+  `vitest list` calls for the SIT plan and related set start in a worker thread when the build gate starts. Log
+  line: `⏩ SIT enumeration ran beside the build (… s saved)`. A red build discards the worker's result. The SIT
+  leg enumerates again serially, and says why (`⏩ SIT enumeration re-run serially — …`), when the worker raised,
+  when its enumeration failed, or when HEAD or `git status` changed while it ran. Kill switch:
+  `ORCH_SIT_ENUM_PARALLEL=off`.
+- **The nightly full gate reuses a measured unit run** (ORCH-FULLGATE-CACHE-1). Before it runs the unit suite,
+  the full gate looks up its tree in the content-keyed baseline cache. It uses the entry as its unit leg when the
+  entry is clock-judged, is a full-suite run of the same `test_cmd`, and is at most `full_gate_reuse_max_h` hours
+  old (repos.yaml, default 24). Log line: `♻️ full-gate unit: reused measured run <sha7> (<age>)`. The state
+  file's `unit.reused` field records the same. The reused leg is not compared with itself: its baseline is the
+  nearest measured ancestor, or else the previous full gate. It is never written back to the cache. In every
+  other case the suite runs as before, and the log line says why. The SIT leg always runs. Kill switch:
+  `ORCH_FULLGATE_REUSE=off`.
+- **On-demand full gates are George's.** `orchestrator.py full-gate --trigger on-demand` (the default trigger)
+  is refused unless `--requested-by <name>` is given. The name is recorded as `requested_by` in the state
+  file. `--dry-run` and the daemon's `--trigger nightly` do not need it.
+
 ## Pre-fire assertions (prefire.py)
 
 `run_batch` runs `prefire.report(brief)` before anything fires; any failure refuses the brief (the daemon moves it to
