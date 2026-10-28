@@ -2382,12 +2382,24 @@ class SitPlan:
         return [self.files[i:i + n] for i in range(0, len(self.files), n)]
 
 
+_LISTING_PROJECT_RE = re.compile(r"^\[[^\]\s]+\] ")
+
+
+def _strip_listing_project(line: str) -> tuple:
+    """[ORCH-UNIT-LISTING-PREFIX-1] (line, stripped): a vitest workspace prints each listing line as
+    `[project] file > test` — the leading `[project] ` is removed, nothing else."""
+    out = _LISTING_PROJECT_RE.sub("", line, count=1)
+    return out, out != line
+
+
 def _parse_sit_listing(text: str) -> tuple:
     """([file, ...] in listing order, {file: tests listed}) from a list command's stdout — `file > test` per
-    line, or `file` alone (files only). Banners and blank lines are never a path."""
-    files, per_file = [], {}
+    line, or `file` alone (files only), either behind a workspace's `[project] `. Banners and blank lines are never
+    a path."""
+    files, per_file, prefixed = [], {}, 0
     for line in _ANSI_RE.sub("", text or "").splitlines():
-        line = line.strip()
+        line, stripped = _strip_listing_project(line.strip())
+        prefixed += stripped
         if not line or " " in line.split(" > ", 1)[0]:
             continue  # banners / blank lines are never a path
         f = line.split(" > ", 1)[0]
@@ -2396,6 +2408,8 @@ def _parse_sit_listing(text: str) -> tuple:
             per_file[f] = 0
         if " > " in line:
             per_file[f] += 1
+    if prefixed:
+        log.debug(f"listing: {prefixed} workspace-prefixed line(s) read past their `[project] `")
     return files, per_file
 
 
@@ -5570,7 +5584,7 @@ def gate_prelist(brief: Path, proj: Path) -> Optional[str]:
         sit = [f for f in reach.sit or () if not named(f)]
         unit = [f for f in dict.fromkeys(reach.unit or ()) if not named(f) and f not in sit]
         rows = [f"- `{f}` (SIT)" for f in sit] + [f"- `{f}` (unit)" for f in unit]
-        gaps = [f"- {leg} leg: {w}; the executor's preflight runs it" for leg, w in missing]
+        gaps = [f"- {leg} leg: {w}; the gate runs the full suite at merge" for leg, w in missing]
         block = "\n".join([PRELIST_HEADING.format(sha7=sha[:7]),
                            *(rows or ["- (none beyond the test files this brief already names)"]), *gaps,
                            PRELIST_RULE]) + "\n"

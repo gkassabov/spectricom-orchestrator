@@ -196,7 +196,7 @@ class TestPL4OffAndUncomputable:
 
 
 def _leg_line(leg: str, why: str) -> str:
-    return f"- {leg} leg: {why}; the executor's preflight runs it"
+    return f"- {leg} leg: {why}; the gate runs the full suite at merge"
 
 
 def _generated(caplog) -> list:
@@ -216,7 +216,7 @@ class TestPP1UnitLegUnavailable:
         lines = [l for l in text.splitlines() if l.startswith("- unit leg: ")]
         assert len(lines) == 1, text
         assert lines[0].startswith("- unit leg: the gate runs the FULL unit suite — (c) the related set could not "
-                                   "be computed") and lines[0].endswith("; the executor's preflight runs it")
+                                   "be computed") and lines[0].endswith("; the gate runs the full suite at merge")
         assert "(unit)" not in text and b.read_text().rstrip().endswith(orchestrator.PRELIST_RULE)
         msgs = _generated(caplog)
         assert len(msgs) == 1 and msgs[0].startswith(
@@ -231,11 +231,11 @@ class TestPP1UnitLegUnavailable:
         with caplog.at_level(logging.INFO, logger="orch"):
             orchestrator.gate_prelist(b, rig.repo)
         text = _block(b.read_text())
-        why = (f"the gate runs the FULL unit suite — (a) the diff touches a shared trigger (unit_full_triggers): "
-               f"{PAGE} (src/**)")
-        assert f"- `{SEARCH_SIT}` (SIT)" in text and _leg_line("unit", why) in text.splitlines(), text
+        # [ORCH-UNIT-LISTING-PREFIX-1] rule #8: the `[app] ` listing is read as its paths — the unit leg is named
+        why = f"(a) the diff touches a shared trigger (unit_full_triggers): {PAGE} (src/**)"
+        assert f"- `{SEARCH_SIT}` (SIT)" in text and "- unit leg: " not in text, text
         assert _generated(caplog) == [f"📋 Gate pre-list generated: 1 SIT + 0 unit files for 1 allowed files at "
-                                      f"{rig.sha[:7]} (unit: {why})"]
+                                      f"{rig.sha[:7]} (the gate's unit leg runs the full suite here: {why})"]
 
 
 class TestPP2SitLegUnavailable:
@@ -250,7 +250,7 @@ class TestPP2SitLegUnavailable:
         assert block and f"- `{MOCKED}` (unit)" in text, text
         lines = [l for l in text.splitlines() if l.startswith("- SIT leg: ")]
         assert len(lines) == 1 and lines[0].startswith("- SIT leg: the gate runs the FULL SIT suite — ") \
-            and lines[0].endswith("; the executor's preflight runs it"), text
+            and lines[0].endswith("; the gate runs the full suite at merge"), text
         assert "(SIT)" not in text
         msgs = _generated(caplog)
         assert len(msgs) == 1 and msgs[0].startswith(
