@@ -401,6 +401,7 @@ _DEPENDS_ON_LINE = re.compile(r'^##\s*Depends[- ]on\s*:(?P<text>.*)$', re.MULTIL
 _DEPENDENCY = re.compile(r'(?P<stem>[A-Za-z0-9][A-Za-z0-9_-]*)(?:@(?P<repo>[A-Za-z0-9][A-Za-z0-9_-]*))?')
 A11_GRAMMAR = "'## Depends-on: <brief-stem>[@<repo>][, …]' (a queue filename without .md)"
 QUEUED = "queue/"
+DEPENDS_PRODUCT_ENV = "ORCH_DEPENDS_PRODUCT"   # =off ⇒ merged is route_merged alone (a handback-only merge meets it)
 
 
 @dataclass(frozen=True)
@@ -410,13 +411,18 @@ class Dependency:
     target: str                  # '<repo>/<merge target>'
     merged: Optional[str]        # '<sha8> [<evidence>]' when its route is on the merge target, else None
     where: tuple = ()            # the trays holding <stem>.md, when not merged: 'queue/', 'queue/failed/', …
+    # [ORCH-RELIABILITY-1] F3.2: the route IS on the merge target but is not met — `merged handback only (briefs/)`,
+    # or what it brought cannot be read. Never queued: the queue will not merge that route again.
+    landed_unmet: Optional[str] = None
 
     @property
     def queued(self) -> bool:
         """Still in queue/ itself — the queue may yet merge it."""
-        return QUEUED in self.where
+        return QUEUED in self.where and not self.landed_unmet
 
     def __str__(self) -> str:
+        if self.landed_unmet:
+            return f"{self.stem}: {self.landed_unmet} — not met on {self.target}"
         if self.merged:
             return f"{self.stem} merged on {self.target} ({self.merged})"
         where = " + ".join(self.where) or "nowhere — not in queue/, queue/failed/, queue/held/ or queue/done/"
@@ -489,10 +495,16 @@ def dependency_status(filepath: Path, queue_dir: Path,
         repo = resolve(named or own)
         if repo is None:
             return [], "'%s' is looked for on repo '%s', which config/repos.yaml does not name" % (stem, named or own)
-        landed = canon_assert.route_merged(repo, stem)
+        why: list = []
+        if os.environ.get(DEPENDS_PRODUCT_ENV, "").strip().lower() == "off":
+            landed = canon_assert.route_merged(repo, stem)
+        else:   # [ORCH-RELIABILITY-1] F3.2: merged = merged product files, judged in canon_assert (A13)
+            repos = _config_value("repos")
+            cfg = repos.get(repo.name) if isinstance(repos, dict) and isinstance(repos.get(repo.name), dict) else {}
+            landed = canon_assert.route_landed_product(repo, stem, cfg.get("briefs_subdir") or "briefs", why)
         judged.append(Dependency(stem, f"{repo.name}/{repo.merge_target}",
                                  f"{landed[0][:8]} [{landed[2]}]" if landed else None,
-                                 () if landed else dependency_trays(queue_dir, stem)))
+                                 () if landed else dependency_trays(queue_dir, stem), why[0] if why else None))
     return judged, None
 
 
@@ -867,6 +879,9 @@ def check(filepath: Path) -> list[str]:
         failures.append("A11 DEPENDS-ON — the '## Depends-on:' line cannot be read: %s. Write %s, or no line "
                         "when the brief depends on no route" % (why, A11_GRAMMAR))
     unmet = [d for d in deps if not d.merged]
+    for d in unmet:
+        if d.landed_unmet:
+            print("⛔ Depends-on %s: %s — not met" % (d.stem, d.landed_unmet))
     if unmet:
         failures.append("A11 DEPENDS-ON — not merged, so not fired: %s. A brief fires only once every route it "
                         "depends on is on its repo's merge target (F-289)" % "; ".join(map(str, unmet)))

@@ -56,6 +56,9 @@ from canon_assert import (BG_WAIT_CEILING_VAR, CLOCK_HISTORY_MIN, DEFAULT_EXECUT
                           check_clock_plausibility, check_foreground_invariants,
                           check_handback_invariants, check_route_landed_invariants, clock_slow_note,
                           executor_default, load_outstanding_work_rules, queue_header)
+# [ORCH-GATE-COST-1] D1/D2 briefs-only predicate — moved to canon_assert so a Depends-on judges a merge by the same
+# rule ([ORCH-RELIABILITY-1] Brief 3, A13); every call site here keeps its name
+from canon_assert import under_subdir as _under_subdir
 
 # HOOK-1: set from --force in main(); --force already means 'ALL safety checks bypassed'.
 PREFIRE_BYPASS = False
@@ -3610,14 +3613,6 @@ def _unit_is_cacheable(run: UnitSuiteRun) -> bool:
 
 def _unit_cache_file(archive: Path) -> Path:
     return archive / UNIT_BASELINE_CACHE_FILE
-
-
-def _under_subdir(path: str, subdir: str) -> bool:
-    """[ORCH-GATE-COST-1] D1/D2: `path` (repo-relative) is `subdir` or lies under it. An empty subdir holds
-    nothing."""
-    sub = str(subdir or "").strip().strip("/")
-    p = str(path or "").strip()
-    return bool(sub) and (p == sub or p.startswith(sub + "/"))
 
 
 def _active_briefs_subdir() -> str:

@@ -553,6 +553,61 @@ def route_merged(repo: QueueRepo, brief: str) -> Optional[tuple[str, str, str]]:
     return _landed(repo, repo.branch_for(brief))
 
 
+def under_subdir(path: str, subdir: str) -> bool:
+    """[ORCH-GATE-COST-1] D1/D2: `path` (repo-relative) is `subdir` or lies under it. An empty subdir holds
+    nothing. The gate's briefs-only predicate (orchestrator imports it as _under_subdir) and route_landed_product's."""
+    sub = str(subdir or "").strip().strip("/")
+    p = str(path or "").strip()
+    return bool(sub) and (p == sub or p.startswith(sub + "/"))
+
+
+def _landed_paths(repo: QueueRepo, branch: str, landed: tuple[str, str, str]) -> Optional[tuple[str, ...]]:
+    """The paths `branch` brought to the merge target, by the detector that found it: a merge commit ⇒ its diff
+    against its first parent; the target's reflog ⇒ merge-base(the target before that entry, tip)..tip; the branch
+    ref ⇒ the same from the commit the branch was created at (its own reflog). None when git cannot say."""
+    sha, _, evidence = landed
+    if evidence == "merge commit":
+        frm, tip = f"{sha}^1", sha
+    else:
+        if evidence.startswith("reflog merge"):
+            shas = (git(repo.path, "reflog", "show", "--format=%H\x1f%gs", repo.merge_target) or "").splitlines()
+            at = next((i for i, l in enumerate(shas) if l.startswith(sha + "\x1f")
+                       and l.split("\x1f", 1)[1].startswith(f"merge {branch}:")), None)
+            before = shas[at + 1].split("\x1f", 1)[0] if at is not None and at + 1 < len(shas) else None
+        else:
+            created = (git(repo.path, "reflog", "show", "--format=%H", f"refs/heads/{branch}") or "").splitlines()
+            before = created[-1] if created else None
+        frm = git(repo.path, "merge-base", before, sha) if before else None
+        tip = sha
+    if not frm:
+        return None
+    r = subprocess.run(["git", "-C", str(repo.path), "diff", "--name-only", "--no-renames", "-z", frm, tip],
+                       capture_output=True, text=True)
+    return tuple(p for p in r.stdout.split("\0") if p) if r.returncode == 0 else None
+
+
+def route_landed_product(repo: QueueRepo, brief: str, briefs_subdir: str = "briefs",
+                         why: Optional[list] = None) -> Optional[tuple[str, str, str]]:
+    """[ORCH-RELIABILITY-1] Brief 3 · F3.1: route_merged's answer only when the route brought at least one path
+    outside `briefs_subdir` to the merge target — a STOPPED route merges its brief and handback alone, and that is
+    not the work a Depends-on waits for (the gate's own briefs-only rule, D-S7CORE29-02: under_subdir). None when
+    not landed, landed handback-only, or what it brought cannot be read; `why`, when given, gets the reason for a
+    landed route's None. B6 does not ask here (route_merged, unchanged)."""
+    landed = route_merged(repo, brief)
+    if landed is None:
+        return None
+    paths = _landed_paths(repo, repo.branch_for(brief), landed)
+    if paths is None:
+        if why is not None:
+            why.append(f"merged ({landed[0][:8]} [{landed[2]}]), but what it brought cannot be read")
+        return None
+    if not paths or all(under_subdir(p, briefs_subdir) for p in paths):
+        if why is not None:
+            why.append(f"merged handback only ({str(briefs_subdir).strip('/')}/)")
+        return None
+    return landed
+
+
 def queue_header(path: Path) -> dict[str, str]:
     """`#!queue model=… effort=… repo=…` on line 1 → {key: value}; no header ⇒ {}.
 

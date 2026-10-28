@@ -406,7 +406,7 @@ class TestP5OnePredicate:
         assert "route_merged(" in body and "_landed(" not in body
         assert ca.count("_landed(") == 2, "the definition and route_merged's call"
         pf = (ROOT / "prefire.py").read_text()
-        assert "canon_assert.route_merged(" in pf and "subprocess" not in pf and "_landed" not in pf
+        assert "canon_assert.route_merged(" in pf and "subprocess" not in pf and "_landed(" not in pf   # ORCH-RELIABILITY-1: route_landed_product
         qd = (ROOT / "queue_daemon.py").read_text()
         sel = qd.split("    def _next_brief(")[1].split("\n    def ")[0]
         assert "prefire.dependency_status(" in sel and "subprocess" not in sel and "git(" not in sel
