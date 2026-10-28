@@ -49,12 +49,18 @@ DROPPED = ["SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "GROQ_API_KEY", "AWS_ACC
 PROMPT_TAIL = (" and execute all briefs in order. Run every command in the foreground and wait for it to finish; "
                "never use run_in_background — background tasks are killed when your turn ends and no follow-up "
                "turn will come.")
+# [ORCH-RELIABILITY-1] rule #8 (George 2026-10-28 11:13): the preflight sentence F1.2 appends to the prompt
+PREFLIGHT = (" Before you write the handback's final status, run `python3 ~/spectricom-orchestrator/orchestrator.py "
+             "preflight --repo {repo}` and paste its summary; a red there is handled by your brief's rule #8 and STOP "
+             "rules like any other red.")
 
 
-def head_cmd(project, brief_rel, model, effort) -> str:
-    """fire_toni's command at 886014c (HEAD before this route), character for character."""
+def head_cmd(project, brief_rel, model, effort, repo="clinical-mp") -> str:
+    """fire_toni's command at 886014c (HEAD before this route), character for character, plus the preflight
+    sentence (backticks escaped inside the double-quoted prompt)."""
+    ask = PREFLIGHT.format(repo=repo).replace("`", "\\`")
     return (f"cd {project} && stdbuf -oL claude --dangerously-skip-permissions --model {model} --effort {effort} "
-            f'"Read {brief_rel}{PROMPT_TAIL}"')
+            f'"Read {brief_rel}{PROMPT_TAIL}{ask}"')
 
 
 def _settings(repo: str) -> dict:
@@ -251,7 +257,8 @@ def test_P1_end_to_end_the_child_gets_the_flag_and_not_the_socket(tmp_path, monk
     assert ec == 0
     i = got["argv"].index("--settings")
     assert got["argv"][i + 1] == str(ROOT / "executor" / "settings" / "orchestrator.json")
-    assert got["argv"][0] == "--dangerously-skip-permissions" and got["argv"][-1] == "Read briefs/394-x.md" + PROMPT_TAIL
+    assert got["argv"][0] == "--dangerously-skip-permissions" and got["argv"][-1] == ("Read briefs/394-x.md" + PROMPT_TAIL
+                                                                               + PREFLIGHT.format(repo="orchestrator"))
     assert not set(DROPPED) & set(got["env"]) and "KEEP_ME" in got["env"]
     assert got["npm"] == "true"
 

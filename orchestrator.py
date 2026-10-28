@@ -19,6 +19,8 @@ Usage:
   python3 orchestrator.py verify <brief-stem> [--commit <sha>]   ← one route's evidence (read-only)
   python3 orchestrator.py full-gate --repo <name> [--ref main] [--dry-run]
                                                          ← the FULL SIT + unit suites on <ref>; never merges
+  python3 orchestrator.py preflight --repo <name> [--json <path>]
+                                                         ← in a route checkout: the gate's related SIT + unit set
 
 Batch-level dependencies:
   Add to batch file header:  # depends_on_batches: [toni-batch-31.md, toni-batch-30.md]
@@ -1044,6 +1046,11 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         brief_rel = batch_file.name
     guards = toni_guards(ACTIVE_REPO_NAME)   # [ORCH-TONI-GUARDS-1] None when TONI_GUARDS=off
     settings_flag = f"--settings {shlex.quote(str(guards.settings))} " if guards and not guards.refusal else ""
+    # [ORCH-RELIABILITY-1] F1.2: the executor runs the gate's related set before its handback. Backticks are escaped:
+    # the prompt is a double-quoted bash word, and an unescaped one would run the preflight at fire time.
+    pf_repo = parse_repo_from_brief(batch_file) or ACTIVE_REPO_NAME
+    preflight_ask = ("" if os.environ.get(PREFLIGHT_VAR, "").strip().lower() == "off" or not pf_repo
+                     else " " + PREFLIGHT_SENTENCE.format(repo=pf_repo).replace("`", "\\`"))
     cmd = (
         f"cd {project} && "
         f"stdbuf -oL "
@@ -1052,7 +1059,7 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
         f"--model {TONI_MODEL} --effort {TONI_EFFORT} "
         f'"Read {brief_rel} and execute all briefs in order. Run every command in the foreground and '
         f'wait for it to finish; never use run_in_background — background tasks are killed when your '
-        f'turn ends and no follow-up turn will come."'
+        f'turn ends and no follow-up turn will come.{preflight_ask}"'
     )
     # Update running.json with log file path
     try:
@@ -4536,32 +4543,41 @@ def _unit_scope(repo_path: Path, test_cmd: str, diff: "BranchDiff") -> UnitScope
     if since >= every - 1:
         return UnitScope(capable=True, reason=f"(b) route {since + 1} since the last full unit run "
                                               f"({UNIT_FULL_EVERY_KEY} {every})")
-    suite, why = _unit_listing(repo_path, f"{list_cmd} --filesOnly")
-    if suite is None or not suite:
-        return UnitScope(capable=True, reason=f"(c) the unit suite could not be enumerated — {why or 'no file listed'}")
-    affected, why = _unit_listing(repo_path, f"{list_cmd} {UNIT_RELATED_ARGS.format(base=shlex.quote(diff.base))}")
-    if affected is None:
-        return UnitScope(capable=True, total=len(suite), reason=f"(c) the related set could not be computed — {why}")
-    member = set(suite)
-    changed = set(paths)
-    chosen = (set(affected) | changed) & member
-    files = tuple(f for f in suite if f in chosen)
-    how = (f"{len(set(affected) & member)} affected by the diff against merge-base {diff.base[:7]} (--changed), "
-           f"{len(changed & member)} changed by the branch")
+    files, total, how = _unit_related_files(repo_path, list_cmd, diff)
+    if files is None:
+        return UnitScope(capable=True, total=total, reason=f"(c) {how}")
     if files:
-        return UnitScope(capable=True, files=files, total=len(suite), reason=how)
+        return UnitScope(capable=True, files=files, total=total, reason=how)
     briefs = _active_briefs_subdir()
     source = [p for p in paths if not (_UNIT_TEST_FILE_RE.search(p) or _UNIT_DOC_FILE_RE.search(p)
                                        or _under_subdir(p, briefs))]
     if source:
-        return UnitScope(capable=True, total=len(suite),
+        return UnitScope(capable=True, total=total,
                          reason=(f"(c) the related set is empty while non-test source changed: "
                                  f"{', '.join(source[:BRIEFS_ONLY_NAMED_FILES])}"
                                  + (f", … +{len(source) - BRIEFS_ONLY_NAMED_FILES} more"
                                     if len(source) > BRIEFS_ONLY_NAMED_FILES else "")))
-    return UnitScope(capable=True, files=(), total=len(suite),
+    return UnitScope(capable=True, files=(), total=total,
                      reason=f"unit: no unit test file relates to this diff ({len(paths)} changed files, no non-test "
                             f"source) — {how}")
+
+
+def _unit_related_files(repo_path: Path, list_cmd: str, diff: "BranchDiff") -> tuple:
+    """[ORCH-UNIT-RELATED-1] (files, suite size, how): vitest's related set for the diff (`list --changed <merge
+    base>`, enumerated, never run) plus the suite files the diff changes, in the suite's listing order; (None, suite
+    size or None, why) when it cannot be computed. _unit_scope's set, and [ORCH-RELIABILITY-1]'s (tests_reaching)."""
+    suite, why = _unit_listing(repo_path, f"{list_cmd} --filesOnly")
+    if suite is None or not suite:
+        return None, None, f"the unit suite could not be enumerated — {why or 'no file listed'}"
+    affected, why = _unit_listing(repo_path, f"{list_cmd} {UNIT_RELATED_ARGS.format(base=shlex.quote(diff.base))}")
+    if affected is None:
+        return None, len(suite), f"the related set could not be computed — {why}"
+    member = set(suite)
+    changed = {_norm_test_path(p) for p in diff.paths}
+    chosen = (set(affected) | changed) & member
+    files = tuple(f for f in suite if f in chosen)
+    return files, len(suite), (f"{len(set(affected) & member)} affected by the diff against merge-base "
+                               f"{diff.base[:7]} (--changed), {len(changed & member)} changed by the branch")
 
 
 def _unit_baseline_related(repo_path: Path, base_sha: str, test_cmd: str, files: tuple, archive: Path,
@@ -5146,6 +5162,26 @@ def _branch_diff(repo_path: Path, branch_name: Optional[str]) -> BranchDiff:
     return BranchDiff(base=base, tip=tip, paths=paths)
 
 
+def _sit_gate_verdict(so: SitOutcome, repo_path: Path) -> GateVerdict:
+    """The verdict on a red SIT leg (so.passed False) — run_pre_merge_gates' and [ORCH-RELIABILITY-1]'s preflight's."""
+    if so.error == "zero-collection":
+        # [ORCH-2] §4.5: exit 0 over an empty collection — nothing was tested.
+        # Environment (F-20 / §23.9d handling), never product, never a pass.
+        return GateVerdict(GateOutcome.BLOCKED_ENV, "sit", "zero-collection",
+                           f"exit 0 over an empty collection ({so.collection}) — nothing was tested",
+                           collection=so.collection)
+    if so.error in SIT_GATE_ENV_ERRORS:
+        # [SIT-RATE-1] the gate's own batching machinery could not produce a whole-suite
+        # result (enumeration failed / batches do not sum). Not a product verdict.
+        return GateVerdict(GateOutcome.BLOCKED_ENV, "sit", so.error, so.detail, collection=so.collection)
+    # [ORCH-11] the tallies travel with the output: rule 1 is decided here.
+    v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code,
+                               tests_failed=so.tests_failed, files_failed=so.files_failed,
+                               isolation=so.isolation, clock=so.clock)
+    v.collection = so.collection
+    return v
+
+
 def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> GateVerdict:
     """Run the repo's PRE_MERGE_GATES on the route branch checked out at repo_path, BEFORE any
     merge, then the S7-CORE-8 [ORCH-3] unit baseline gate. Returns a three-way GateVerdict:
@@ -5216,23 +5252,7 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
             sit_na = so.not_applicable
             if not so.passed:
                 if SIT_BLOCKING:
-                    if so.error == "zero-collection":
-                        # [ORCH-2] §4.5: exit 0 over an empty collection — nothing was tested.
-                        # Environment (F-20 / §23.9d handling), never product, never a pass.
-                        v = GateVerdict(GateOutcome.BLOCKED_ENV, "sit", "zero-collection",
-                                        f"exit 0 over an empty collection ({so.collection}) — nothing was tested",
-                                        collection=sit_collection)
-                    elif so.error in SIT_GATE_ENV_ERRORS:
-                        # [SIT-RATE-1] the gate's own batching machinery could not produce a whole-suite
-                        # result (enumeration failed / batches do not sum). Not a product verdict.
-                        v = GateVerdict(GateOutcome.BLOCKED_ENV, "sit", so.error, so.detail,
-                                        collection=sit_collection)
-                    else:
-                        # [ORCH-11] the tallies travel with the output: rule 1 is decided here.
-                        v = _classify_gate_failure("sit", so.output or so.error or "", repo_path, so.exit_code,
-                                                   tests_failed=so.tests_failed, files_failed=so.files_failed,
-                                                   isolation=so.isolation, clock=so.clock)
-                        v.collection = sit_collection
+                    v = _sit_gate_verdict(so, repo_path)
                     # [GATE-SIT-2] the invariant is an oracle, not a fourth rule: it never changes v.
                     for msg in sit_verdict_violations(so, v):
                         log.error(f"⛔ GATE-SIT-2 invariant: {msg}")
@@ -5282,6 +5302,196 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                     collection=sit_collection, unit_collection=unit_collection, unit=uo)
     log.info(f"✅ Pre-merge gate{where}: {v.label}")
     return v
+
+
+# ── [ORCH-RELIABILITY-1] A13 · the tests that reach a path set (D-S7CORE36-03) ──────────────────────────────────────
+# Routes built clean and went red at the gate 1–2 h later on tests the executor never ran. One function names the
+# SIT and unit files the gate's own per-route legs relate to a diff — the same _sit_plan / _sit_related_files calls
+# (a _SitEnumJob, run in place) and the same _unit_scope / _unit_related_files — for the executor's `preflight`
+# (Brief 1) and the brief's generated pre-list (Brief 2). Neither replaces, skips or feeds a gate leg.
+PREFLIGHT_VAR = "ORCH_EXEC_PREFLIGHT"   # `off` ⇒ the executor prompt carries no preflight sentence
+PREFLIGHT_DIR = "preflight"             # state/preflight/<branch>.json (and its SIT archive)
+PREFLIGHT_SENTENCE = ("Before you write the handback's final status, run `python3 ~/spectricom-orchestrator/"
+                      "orchestrator.py preflight --repo {repo}` and paste its summary; a red there is handled by your "
+                      "brief's rule #8 and STOP rules like any other red.")
+PREFLIGHT_EXIT = {"pass": 0, "fail": 1, "environment": 2, "not computed": 3}
+
+
+@dataclass
+class PathReach:
+    """What the gate's per-route legs relate to one diff. `sit` / `unit` None ⇒ not computed (`*_why` says why —
+    the gate then runs that FULL suite); () ⇒ nothing relates. `unit_full`: the gate's unit leg runs the full suite
+    on this diff anyway (a shared trigger, the N-th route, ORCH_UNIT_RELATED=off) — `unit` is still the related set."""
+    sit: Optional[tuple] = None
+    sit_why: str = ""
+    sit_job: Optional[_SitEnumJob] = None   # the enumeration itself, for run_sit_post_merge to take
+    unit: Optional[tuple] = None
+    unit_why: str = ""
+    unit_full: Optional[str] = None
+
+
+def tests_reaching(repo_path: Path, diff: BranchDiff) -> PathReach:
+    """[ORCH-RELIABILITY-1] A13: the SIT and unit test files the gate relates to `diff` in `repo_path`."""
+    out = PathReach()
+    gates = tuple((PRE_MERGE_GATES.get(ACTIVE_REPO_NAME) or {}).get("gates") or ())
+    if "sit" not in gates:
+        out.sit, out.sit_why = (), f"{ACTIVE_REPO_NAME or 'this repo'}'s gate has no SIT leg"
+    else:
+        job = _SitEnumJob(repo_path=repo_path, diff=diff)
+        job._run()   # the worker's own body, in place: exactly the serial path's two calls
+        if job.error:
+            out.sit_why = f"the SIT enumeration raised {job.error}"
+        elif job.plan is None:
+            out.sit_why = f"no {SIT_LIST_CMD_KEY} for {ACTIVE_REPO_NAME}: the gate runs the whole SIT suite"
+        elif job.plan.error:
+            out.sit_why = f"{job.plan.error} ({job.plan.detail})"
+        elif job.related is None:
+            out.sit_why = f"the gate runs the FULL SIT suite — {job.how}"
+        else:
+            out.sit, out.sit_why, out.sit_job = tuple(job.related), job.how, job
+    test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
+    if not test_cmd or ACTIVE_REPO_NAME not in _unit_gate_eligible_repos():
+        out.unit, out.unit_why = (), f"{ACTIVE_REPO_NAME or 'this repo'} declares no test_cmd — no unit leg"
+        return out
+    scope = _unit_scope(repo_path, test_cmd, diff)
+    if not scope.capable or (scope.files is None and scope.reason.startswith("(c)")):
+        out.unit_why = f"the gate runs the FULL unit suite — {scope.reason}"
+    elif scope.files is not None:
+        out.unit, out.unit_why = scope.files, scope.reason
+    elif diff is None or diff.paths is None or not diff.base:
+        out.unit_why = f"the branch's diff is unknown ({diff.error if diff is not None else 'not computed'})"
+    else:   # (a) / (b) / (d): the gate runs the full suite; the related set is still what reaches the diff
+        out.unit_full = scope.reason
+        files, _, how = _unit_related_files(repo_path, _unit_list_cmd(repo_path, test_cmd)[0], diff)
+        out.unit, out.unit_why = files, how
+    return out
+
+
+def _preflight_failures(text: str) -> list:
+    """`file > test` for each FAIL line the runner printed (each once), else the failing files alone."""
+    out = []
+    for m in re.finditer(r"^\s*(?:❯\s+)?FAIL\s+(\S+\s+>\s+[^\n]+?)\s*$", _ANSI_RE.sub("", text or ""), re.MULTILINE):
+        if m.group(1) not in out:
+            out.append(m.group(1))
+    return out or _sit_failing_files(text)
+
+
+def _preflight_sit(repo_path: Path, diff: BranchDiff, reach: PathReach, archive: Path) -> dict:
+    if reach.sit is None:
+        return {"status": "not computed", "files": None, "why": reach.sit_why, "failed": []}
+    leg = {"status": "pass", "files": list(reach.sit), "why": reach.sit_why, "failed": []}
+    if not reach.sit:
+        return leg
+    so = run_sit_post_merge(repo_path, archive, diff=diff, enumerated=reach.sit_job)   # the gate's own runner
+    if so.passed and so.error == "timeout-advisory":
+        leg.update(status="environment", why=f"timeout — exceeded {SIT_TIMEOUT}s; nothing was measured")
+    elif not so.passed:
+        v = _sit_gate_verdict(so, repo_path)
+        if v.outcome is GateOutcome.FAIL_PRODUCT:
+            leg.update(status="fail", failed=_preflight_failures(so.output), verdict=v.label)
+        elif v.outcome is GateOutcome.BLOCKED_ENV:
+            leg.update(status="environment", failed=_preflight_failures(so.output), verdict=v.label)
+        else:
+            leg["verdict"] = v.label   # green after isolation, as the gate would read it
+    return leg
+
+
+def _preflight_unit(repo_path: Path, reach: PathReach, label: str) -> dict:
+    if reach.unit is None:
+        return {"status": "not computed", "files": None, "why": reach.unit_why, "failed": []}
+    leg = {"status": "pass", "files": list(reach.unit), "why": reach.unit_why, "failed": [],
+           "gate_runs_full": reach.unit_full}
+    if not reach.unit:
+        return leg
+    test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
+    run = _run_unit_suite(_unit_confirm_cmd(test_cmd, reach.unit), repo_path, label)   # the gate's branch leg
+    log.info(f"🧪 Preflight unit run — {run.describe}")
+    if run.error or run.tests_total == 0 or run.test_files_total == 0:
+        return {**leg, "status": "environment", "why": f"{run.error or 'nothing collected'} ({run.collection})"}
+    if run.exit_code == 0 and not run.failing_files and (run.failures or 0) == 0:
+        return leg
+    if not run.failing_files:
+        v = _classify_gate_failure("unit", run.output, repo_path, run.exit_code, clock=run.clock)
+        return {**leg, "status": "fail" if v.outcome is GateOutcome.FAIL_PRODUCT else "environment",
+                "why": f"exit {run.exit_code}, no failing file named — {v.label}", "failed": _preflight_failures(run.output)}
+    # the gate's isolation rule: a file that passes alone was its run's; one that fails alone is the branch's
+    flakes, confirmed, confirm = _unit_confirm_new_files(repo_path, test_cmd, label, tuple(run.failing_files))
+    if flakes is None:
+        return {**leg, "status": "environment", "failed": list(run.failing_files),
+                "why": f"the failing file(s) could not be re-run alone ({(confirm.error if confirm else None) or 'no measurement'})"}
+    named = [t for t in _preflight_failures(run.output) if t.split(" > ", 1)[0] in confirmed] or list(confirmed)
+    leg.update(failed=named, flaky=list(flakes))
+    if confirmed:
+        leg.update(status="fail", why=f"{leg['why']}; failing alone: {', '.join(confirmed)} (the gate calls a file a "
+                                      f"regression only if it is not failing at the merge base — not measured here)")
+    return leg
+
+
+def preflight(repo_path: Path, json_path: Optional[Path] = None) -> int:
+    """[ORCH-RELIABILITY-1] Brief 1: `orchestrator.py preflight --repo <name>`, run by the executor in its route
+    checkout before its handback. The gate's diff (_branch_diff), its related sets (tests_reaching) and its runners
+    (run_sit_post_merge with the gate's batching and isolation; the unit branch leg and its isolation re-run) — on
+    the related files only, never a full suite. Advice to the executor: the gate still runs every leg itself.
+    Exit 0 both legs green (or briefs-only); 1 a failure; 2 environment; 3 a set that cannot be computed."""
+    branch = _git_read("git rev-parse --abbrev-ref HEAD", repo_path) or "HEAD"
+    label = branch if branch != "HEAD" else (_git_read("git rev-parse --short HEAD", repo_path) or "HEAD")
+    diff = _branch_diff(repo_path, None if branch == "HEAD" else branch)
+    briefs = _active_briefs_subdir()
+    rec = {"repo": ACTIVE_REPO_NAME, "branch": branch, "at": datetime.now().isoformat(), "base": diff.base,
+           "tip": _git_read("git rev-parse HEAD", repo_path) or None,
+           "diff": list(diff.paths) if diff.paths is not None else None}
+    lines = []
+    st = subprocess.run(["git", "-C", str(repo_path), "status", "--porcelain", "--untracked-files=all"],
+                        capture_output=True, text=True)
+    dirty = [l[3:] for l in (st.stdout or "").splitlines() if l[3:] and not _under_subdir(l[3:], briefs)]
+    if dirty:
+        lines.append(f"⚠️  uncommitted outside {briefs}/: {', '.join(dirty[:BRIEFS_ONLY_NAMED_FILES])}"
+                     f"{' …' if len(dirty) > BRIEFS_ONLY_NAMED_FILES else ''} — the gate runs on commits; commit, "
+                     f"then run the preflight again")
+    if diff.paths and all(_under_subdir(p, briefs) for p in diff.paths):
+        rec.update(briefs_only=True, sit=None, unit=None, result="pass")
+        lines.append(f"briefs-only — nothing to run ({len(diff.paths)} file(s) under {briefs}/; the gate runs no leg)")
+        summary, code = "🧪 Preflight (executor): 0 SIT files / 0 unit files — pass", 0
+    elif diff.paths is None:
+        rec.update(sit=None, unit=None, result="not computed", why=diff.error)
+        lines.append(f"the branch's diff cannot be computed: {diff.error}")
+        summary = "🧪 Preflight (executor): ? SIT files / ? unit files — fail (not computed)"
+        code = PREFLIGHT_EXIT["not computed"]
+    else:
+        reach = tests_reaching(repo_path, diff)
+        state = _running_marker_dir() / PREFLIGHT_DIR
+        sit = _preflight_sit(repo_path, diff, reach, state / "sit-archive")
+        unit = _preflight_unit(repo_path, reach, label)
+        worst = min((sit["status"], unit["status"]), key=("fail", "environment", "not computed", "pass").index)
+        code = PREFLIGHT_EXIT[worst]
+        rec.update(briefs_only=False, sit=sit, unit=unit, result=worst)
+        for name, leg in (("SIT", sit), ("unit", unit)):
+            n = "?" if leg["files"] is None else len(leg["files"])
+            s = f"  {name}: {n} file(s) — {leg['status']} — {leg['why']}"
+            if leg.get("gate_runs_full"):
+                s += f" (the gate runs the FULL unit suite on this diff: {leg['gate_runs_full']})"
+            if leg["failed"]:
+                s += f"; failed: {', '.join(leg['failed'])}"
+            if leg.get("flaky"):
+                s += f"; passed alone (flaky, not blocking): {', '.join(leg['flaky'])}"
+            lines.append(s)
+        sn, un = (len(sit["files"]) if sit["files"] is not None else "?",
+                  len(unit["files"]) if unit["files"] is not None else "?")
+        summary = (f"🧪 Preflight (executor): {sn} SIT files / {un} unit files — "
+                   + ("pass" if code == 0 else f"fail ({worst})"))
+    rec.update(exit=code, summary=summary)
+    lines.append(summary)
+    out = json_path or (_running_marker_dir() / PREFLIGHT_DIR / f"{_marker_repo_slug(branch)}.json")
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(rec, indent=2))
+        lines.append(f"   JSON: {out}")
+    except OSError as e:
+        lines.append(f"   JSON not written ({out}): {e}")
+    for l in lines:
+        print(l, flush=True)
+    log.info(summary)
+    return code
 
 
 def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: int,
@@ -6959,7 +7169,7 @@ EXECUTOR_CMDS = ("run", "queue", "parallel", "watch")   # the subcommands that f
 # the brief's own header — or refused: there is no default to fall back to. The rest (deps, sit:report,
 # flaky, handback-scan) read orchestrator state only and run without one.
 # [ORCH-GATE-COST-1] D4: `full-gate` runs one repo's suites — named with --repo, or refused.
-REPO_CMDS = EXECUTOR_CMDS + ("status", "branches", "full-gate")
+REPO_CMDS = EXECUTOR_CMDS + ("status", "branches", "full-gate", "preflight")
 
 
 def _named_repo(a) -> tuple[str, Optional[str]]:
@@ -7069,6 +7279,13 @@ def main():
     # [ORCH-FULLGATE-CACHE-1] 1c (D-S7CORE33-36): an on-demand full gate is George's — who asked is required
     fgp.add_argument("--requested-by", default="", help="who asked for this on-demand run (required unless "
                                                           "--trigger nightly or --dry-run); recorded in the state file")
+
+    # [ORCH-RELIABILITY-1] Brief 1: the executor's own run of the gate's related SIT + unit set, in its checkout
+    pfp = sp.add_parser("preflight", help="Run the SIT and unit files the gate relates to this checkout's branch "
+                                          "diff; exit 0 only when both are green (1 fail, 2 environment, 3 not "
+                                          "computed); never a full suite, never merges")
+    pfp.add_argument("--repo", default="", help="Target repo (from config/repos.yaml) — required")
+    pfp.add_argument("--json", default=None, help="where the JSON goes (default: state/preflight/<branch>.json)")
 
     a = ap.parse_args()
 
@@ -7193,6 +7410,14 @@ def main():
             sys.exit(2)
         sys.exit(full_gate(a.ref, a.dry_run, a.log_file, a.trigger,
                            **({"requested_by": who} if who and a.trigger == "on-demand" else {})))
+
+    elif a.cmd == "preflight":
+        top = _git_read("git rev-parse --show-toplevel", Path.cwd())
+        if not top:
+            print(f"⛔ preflight: {Path.cwd()} is not a git work tree — run it inside the route checkout",
+                  file=sys.stderr)
+            sys.exit(PREFLIGHT_EXIT["not computed"])
+        sys.exit(preflight(Path(top), Path(a.json) if a.json else None))
 
     else:
         ap.print_help()

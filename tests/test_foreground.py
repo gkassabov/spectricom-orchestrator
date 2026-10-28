@@ -183,4 +183,4 @@ def test_source_guard_the_literal_in_fire_toni():
     cmds = [t for t in texts if '"Read {}' in t]
     assert len(cmds) == 1, cmds
     assert cmds[0].startswith("cd {} && stdbuf -oL claude --dangerously-skip-permissions "), cmds[0]
-    assert cmds[0].endswith(' "Read {}' + PROMPT_TAIL + '"'), cmds[0]
+    assert cmds[0].endswith(' "Read {}' + PROMPT_TAIL + '{}"'), cmds[0]   # {}: ORCH-RELIABILITY-1's preflight ask
