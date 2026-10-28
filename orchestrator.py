@@ -5947,6 +5947,103 @@ def _executor_exit_hold(ec: int, branch: str) -> Optional[HandbackHold]:
     return HandbackHold(Status.INCOMPLETE, verdict, f"exit {ec}", error, source="EXECUTOR EXIT")
 
 
+# ═══════════════════════════════════════════════════════
+# [ORCH-REGATE-GATE-ONLY-1] A RE-GATE RUNS THE GATES, NOT THE EXECUTOR (D-S7CORE33-36 fix #3)
+# ═══════════════════════════════════════════════════════
+# An environment-blocked route was re-gated by firing Toni on a brief that only cherry-picked the preserved commit
+# (112r, 115r, 279, 281r, …). A queue file with `## Re-gate of: <route branch> <sha>` now builds no executor command:
+# the branch must be at <sha>, and the verdict the route lane recorded on that tip (its `PRE-MERGE GATE:` git note)
+# must be BLOCKED(environment) — a leg timeout or an implausible clock is one; FAIL(product), an executor hold
+# (timeout, STOP, incomplete) and a refused prefire are not, and a tip with no note was never gated. The route lane
+# then cuts the re-gate's branch from MERGE_TARGET, merges <sha> into it as a landing merges, appends a note to the
+# route's handback, and from there everything — gates, landing, cache store, notify — is the normal route's.
+REGATE_VAR = "ORCH_REGATE_GATES_ONLY"      # `off` ⇒ a `## Re-gate of:` file is refused, not fired
+REGATE_REFUSED = "RE-GATE REFUSED"
+_REGATE_NOTE_RE = re.compile(r"^PRE-MERGE GATE: (\S+) — (.*)$")
+REGATE: Optional["RegateSpec"] = None      # set by run_batch for the route it runs; read by _run_batch_inner
+
+
+@dataclass(frozen=True)
+class RegateSpec:
+    branch: str        # the route branch named by `## Re-gate of:`
+    sha: str           # its tip, full
+    prior: str         # the recorded verdict line (the git note)
+
+
+def _regate_check(batch_file: Path) -> tuple:
+    """(None, None) — not a re-gate; (RegateSpec, None) — cleared; (None, why) — refused, typed. Read-only."""
+    raw = prefire.regate_line(batch_file)
+    if raw is None:
+        return None, None
+    if os.environ.get(REGATE_VAR, "").strip().lower() == "off":
+        return None, f"{REGATE_VAR}=off — a `## Re-gate of:` file is refused, not fired"
+    named = prefire.parse_regate(batch_file)
+    if named is None:
+        return None, f"malformed — `## Re-gate of: {raw}` is not `<route branch> <sha>`"
+    branch, sha = named
+    if IS_META_FIRE:
+        return None, ("the meta-fire lane does not re-gate gates-only — its gate verdicts are not recorded on the "
+                      "branch tip")
+    if branch == f"{BRANCH_PREFIX}-{batch_file.stem}":
+        return None, f"the re-gate file's own branch would be {branch}, the route branch itself — rename the file"
+    tip = _git_read(f"git rev-parse --verify -q {shlex.quote('refs/heads/' + branch)}", PROJECT_ROOT)
+    if not tip:
+        return None, f"the route branch {branch} does not exist in {PROJECT_ROOT}"
+    want = _git_read(f"git rev-parse --verify -q {shlex.quote(sha + '^{commit}')}", PROJECT_ROOT)
+    if want != tip:
+        return None, (f"the route branch {branch} moved — its tip is {tip[:7]}, the file names "
+                      f"{sha[:7]}{'' if want else ' (not a commit here)'}")
+    note = _git_read(f"git notes show {tip}", PROJECT_ROOT).strip().splitlines()
+    gate = next((l for l in note if _REGATE_NOTE_RE.match(l)), None)
+    if gate is None:
+        said = f" (its note: {note[0][:160]!r})" if note else ""
+        return None, (f"no recorded gate verdict on {branch}@{tip[:7]}{said} — not BLOCKED(environment), so not "
+                      f"re-gated without the executor")
+    outcome = _REGATE_NOTE_RE.match(gate).group(1)
+    if outcome != GateOutcome.BLOCKED_ENV.value:
+        return None, f"the recorded gate verdict on {branch}@{tip[:7]} is {gate[len('PRE-MERGE GATE: '):]} — " \
+                     f"not BLOCKED(environment)"
+    return RegateSpec(branch, tip, gate[len("PRE-MERGE GATE: "):]), None
+
+
+def _regate_refused(batch_file: Path, why: str) -> Result:
+    log.error(f"⛔ {REGATE_REFUSED} — {batch_file.name}: {why}; nothing fired, nothing merged")
+    log.info(f"🏁 FINAL STATUS: {Status.FAILED.value} | gate: not run ({REGATE_REFUSED} — {why})")
+    now = datetime.now().isoformat()
+    return Result(batch_file=batch_file.name, status=Status.FAILED, started=now, finished=now, duration_s=0.0,
+                  exit_code=2, briefs=0, error=f"{REGATE_REFUSED} — {why}")
+
+
+def _regate_bring(proj: Path, branch_name: Optional[str], batch_file: Path, spec: RegateSpec) -> Optional[str]:
+    """On the re-gate's freshly cut branch (from MERGE_TARGET): merge the route's tip as a landing merges, then
+    append the orchestrator's note to the route's handback and commit. None ⇒ done; else the typed refusal, with
+    the merge aborted and the tree clean."""
+    if not branch_name:
+        return "no route branch was cut for the re-gate (this lane runs on the current branch)"
+    r = subprocess.run(["git", "-C", str(proj), "merge", "--no-edit", spec.sha], capture_output=True, text=True)
+    if r.returncode != 0:
+        unmerged = _git_read("git diff --name-only --diff-filter=U", proj).split()
+        subprocess.run(["git", "-C", str(proj), "merge", "--abort"], capture_output=True)
+        return (f"conflict bringing {spec.branch}@{spec.sha[:7]} onto {MERGE_TARGET} "
+                f"({', '.join(unmerged) or (r.stderr or r.stdout).strip()[-200:]})")
+    briefs = ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
+    stem = spec.branch[len(BRANCH_PREFIX) + 1:] if spec.branch.startswith(BRANCH_PREFIX + "-") else spec.branch
+    hb = proj / briefs / f"{stem}.handback.md"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    with hb.open("a") as f:
+        f.write(f"\n\n## Re-gate (orchestrator, gates only — ORCH-REGATE-GATE-ONLY-1)\n\n"
+                f"- {datetime.now().isoformat(timespec='seconds')}: `{batch_file.stem}` re-ran the pre-merge gates on "
+                f"`{spec.branch}` @ `{spec.sha[:12]}`, brought onto {MERGE_TARGET} as a landing merges. No executor "
+                f"ran and no product code changed.\n- Prior recorded verdict: {spec.prior}\n")
+    subprocess.run(["git", "-C", str(proj), "add", "-A"], capture_output=True)
+    c = subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m",
+                        f"regate: {batch_file.stem} — gates only for {spec.branch}@{spec.sha[:7]} "
+                        f"(ORCH-REGATE-GATE-ONLY-1)"], capture_output=True, text=True)
+    if c.returncode != 0:
+        return f"the handback note could not be committed: {(c.stderr or c.stdout).strip()[-200:]}"
+    return None
+
+
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     # HOOK-1 / D-S7CORE4-02 — assertions checked at the moment of action.
     if not PREFIRE_BYPASS and not prefire.report(batch_file, timeout=prefire_timeout(batch_file)):
@@ -5956,6 +6053,14 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
                       started=_now, finished=_now, duration_s=0.0,
                       exit_code=2, briefs=0,
                       error='pre-fire assertions failed (A1/A2/A8) — HOOK-1')
+    # [ORCH-REGATE-GATE-ONLY-1] a `## Re-gate of:` file: cleared here (gates only) or refused, before anything is cut
+    global REGATE
+    REGATE, why = _regate_check(batch_file)
+    if why:
+        return _regate_refused(batch_file, why)
+    if REGATE is not None:
+        log.info(f"🔁 Re-gate (gates only): {REGATE.branch}@{REGATE.sha[:7]} — prior verdict {REGATE.prior}; no "
+                 f"executor runs ({REGATE_VAR}=off refuses such a file)")
     # [ORCH-PREFIRE-RUNTIME-1] D3: read once per route; _create_route_worktree and _run_unit_baseline use it.
     global ISOLATED_DEPS
     ISOLATED_DEPS = parse_isolated_deps(batch_file)
@@ -6027,6 +6132,7 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
         result = _run_batch_inner(batch_file, proj, started, worktree,
                                   **({"route_wt": route_wt} if route_wt is not None else {}))
     finally:
+        REGATE = None   # [ORCH-REGATE-GATE-ONLY-1] this route's only: never seen by the next one
         clear_running()
         # [ORCH-4]: release THIS repo's lock. Another repo's concurrent fire keeps its own.
         _clear_running_marker(ACTIVE_REPO_NAME)
@@ -6133,8 +6239,21 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # [ORCH-10] S1: record the route's expected state at the hand-off point — the branch
     # name, its SHA, and the repo's HEAD ref — at the moment control passes to the executor.
     # Meta-fire lane excluded on purpose: S5 is report-only for this route.
-    handoff = capture_handoff(proj, branch_name) if worktree is None else None
-    ec, out_log = fire_toni(target, proj)
+    regate = REGATE if worktree is None else None   # [ORCH-REGATE-GATE-ONLY-1]
+    if regate is not None:
+        why = _regate_bring(proj, branch_name, batch_file, regate)
+        if why:
+            _leave_route_branch(proj, route_wt, detach=True)
+            if branch_name:
+                subprocess.run(["git", "-C", str(proj), "branch", "-D", branch_name], capture_output=True)
+            if not batch_file.is_relative_to(proj) and not _git_read(f"git ls-files -- {shlex.quote(str(target))}",
+                                                                     proj):
+                target.unlink(missing_ok=True)   # the copy this run made; nothing of the re-gate stays behind
+            return _regate_refused(batch_file, why)
+        handoff, ec, out_log = None, 0, ""     # no executor was handed anything
+    else:
+        handoff = capture_handoff(proj, branch_name) if worktree is None else None
+        ec, out_log = fire_toni(target, proj)
     finished = datetime.now()
     dur = (finished - started).total_seconds()
     # [ORCH-10] S2: re-check all three BEFORE the no-changes decision is made. `has_changes`
@@ -6172,7 +6291,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # [ORCH-TIMEOUT-HOLD-1] a non-zero exit is held on the exit code alone: the closing words of an
     # executor that was killed, or that failed, are not asked (the guard is not engaged).
     hold = None
-    if tamper is None and status == Status.PASSED:
+    if tamper is None and status == Status.PASSED and regate is None:   # a re-gate has no executor to judge
         hold = (_executor_exit_hold(ec, branch_name or f"{BRANCH_PREFIX}-{batch_file.stem}")
                 or _handback_hold(out_log))
     if tamper is not None:

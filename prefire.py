@@ -47,6 +47,10 @@ ENFORCED:
                       '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying George … go / agreed.
                       OPX-2/-3 refuse a brief on row >= 393 with no ALLOWED FILES section (fail closed).
 
+  Re-gate          — a brief whose header has '## Re-gate of: <route branch> <sha>' is a gates-only route
+                      (orchestrator ORCH-REGATE-GATE-ONLY-1: no executor runs): A2's sizing floor is waived and the
+                      pass line says so; a malformed line is a refusal. Every other check, OPX lines included, holds.
+
 NOT enforced here: A3-A7, nor SESSION-BOOT's own A9 (System Prompt v5-38) — this A9 is not that one.
 OPX-1/-2/-3 were labelled A12-A14 until ORCH-PREFIRE-RENAME-1: SESSION-BOOT's A12 and A13 are other checks.
 
@@ -150,6 +154,25 @@ def runtime_timeout(filepath: Path) -> Optional[int]:
     header or Fire mechanism override comes first."""
     runtime = parse_declared_runtime(filepath)
     return int(runtime[1] * RUNTIME_TIMEOUT_FACTOR) if runtime else None
+
+
+# [ORCH-REGATE-GATE-ONLY-1] `## Re-gate of: <route branch> <sha>` — the orchestrator re-runs the gates on that
+# branch and fires no executor. Read here and by orchestrator.py (one parser).
+_REGATE_LINE = re.compile(r'^##[ \t]*Re-gate of:[ \t]*(.*?)[ \t]*$', re.MULTILINE)
+_REGATE_VALUE = re.compile(r'^`?(\S+?)`?\s+`?([0-9a-fA-F]{7,40})`?$')
+
+
+def regate_line(filepath: Path) -> Optional[str]:
+    """The `## Re-gate of:` value as written, or None when the brief has no such line."""
+    m = _REGATE_LINE.search(_read(filepath)[:_HEADER_CHARS])
+    return m.group(1) if m else None
+
+
+def parse_regate(filepath: Path) -> Optional[tuple[str, str]]:
+    """(route branch, sha) from a well-formed `## Re-gate of:` line; None when absent or malformed."""
+    raw = regate_line(filepath)
+    m = _REGATE_VALUE.match(raw.strip()) if raw is not None else None
+    return (m.group(1), m.group(2).lower()) if m else None
 
 
 def parse_microfire_trigger(filepath: Path) -> Optional[str]:
@@ -787,8 +810,15 @@ def check(filepath: Path) -> list[str]:
     line = _runtime_line(filepath)
     estimate = parse_declared_estimate(filepath)
     trigger = parse_microfire_trigger(filepath)
+    regate_raw = regate_line(filepath)
+    regate = parse_regate(filepath)
 
-    if line and estimate is None:
+    if regate_raw is not None and regate is None:
+        failures.append("A2 RE-GATE — '## Re-gate of: %s' is not '<route branch> <sha>' (ORCH-REGATE-GATE-ONLY-1)"
+                        % regate_raw)
+    elif regate is not None:
+        pass  # [ORCH-REGATE-GATE-ONLY-1] gates only, no executor: the sizing floor is waived (report says so)
+    elif line and estimate is None:
         # [ORCH-PREFIRE-RUNTIME-1] D2: declared, but no route timeout can be read off it. A micro-fire
         # trigger waives the floor, not the timeout.
         failures.append("A2 RUNTIME — '%s' gives no route timeout; write '<n>-<m> min'"
@@ -873,7 +903,11 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
         _, row = check_kanban(filepath)
         est = parse_declared_estimate(filepath)
         trig = parse_microfire_trigger(filepath)
-        if est is not None:
+        regate = parse_regate(filepath)
+        if regate is not None:
+            detail = ("gates-only re-gate of %s %s: A2 sizing floor waived — no executor runs "
+                      "(ORCH-REGATE-GATE-ONLY-1)" % regate)
+        elif est is not None:
             detail = "declared %dm (floor %dm)" % (est, SIZING_FLOOR_MIN)
         else:
             detail = "micro-fire: %s" % trig

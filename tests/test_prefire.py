@@ -291,3 +291,48 @@ def test_D3_the_fire_refuses_a_brief_with_no_test_scope(tmp_path, monkeypatch, c
     r = orchestrator.run_batch(scoped(tmp_path, ""))
     assert (r.status, r.exit_code, r.briefs) == (orchestrator.Status.FAILED, 2, 0)
     assert "  • " + prefire.A9_REFUSAL in capsys.readouterr().out
+
+
+# ── ORCH-REGATE-GATE-ONLY-1 (S7-CORE-33, D-S7CORE33-36 fix #3): a `## Re-gate of:` file is gates-only ────────────
+REGATE = "## Re-gate of: orch-mp-300-x 0123abcd\n"
+
+
+def test_regate_header_is_parsed(tmp_path):
+    p = w(tmp_path, REGATE)
+    assert prefire.regate_line(p) == "orch-mp-300-x 0123abcd"
+    assert prefire.parse_regate(p) == ("orch-mp-300-x", "0123abcd")
+    assert prefire.parse_regate(w(tmp_path, "## Re-gate of: `orch-mp-300-x` `0123ABCD`\n")) == \
+        ("orch-mp-300-x", "0123abcd")
+    assert prefire.parse_regate(w(tmp_path, "## Repo: x\n")) is None
+
+
+def test_regate_waives_the_a2_sizing_floor_and_says_so(tmp_path, capsys):
+    p = w(tmp_path, REGATE + "## Estimated runtime: 10-20 min\n")
+    assert prefire.check(p) == []
+    assert prefire.check(w(tmp_path, REGATE)) == [], "no runtime line at all: still waived"
+    assert prefire.report(w(tmp_path, REGATE)) is True
+    assert "gates-only re-gate of orch-mp-300-x 0123abcd: A2 sizing floor waived" in capsys.readouterr().out
+
+
+def test_negative_control_without_regate_the_floor_holds(tmp_path):
+    assert any(f.startswith("A2 SIZING") for f in prefire.check(w(tmp_path, "## Estimated runtime: 10-20 min\n")))
+
+
+def test_a_malformed_regate_line_is_refused(tmp_path):
+    fails = prefire.check(w(tmp_path, "## Re-gate of: orch-mp-300-x\n"))
+    assert any(f.startswith("A2 RE-GATE") for f in fails), fails
+
+
+def test_regate_still_needs_the_opx_lines(tmp_path, monkeypatch):
+    canon = tmp_path / "canon403"
+    canon.mkdir()
+    (canon / "SCP_Kanban_v0-1.md").write_text("| # | Item | State |\n|---|---|---|\n| 403 | x | **`READY`** |\n")
+    cfg = tmp_path / "repos403.yaml"
+    cfg.write_text(yaml.safe_dump({"kanban_dir": str(canon), "repos": {}}))
+    monkeypatch.setattr(prefire, "REPOS_CONFIG", cfg)
+    monkeypatch.delenv("PREFIRE_OPEX", raising=False)
+    p = tmp_path / "r.md"
+    p.write_text("## Kanban: SCP_Kanban row 403\n" + SCOPE_LINE + REGATE)
+    fails = prefire.check(p)
+    assert any(f.startswith("OPX-1") for f in fails), fails
+    assert not any(f.startswith("A2") for f in fails)

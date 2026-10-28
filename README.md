@@ -151,6 +151,22 @@ appears in the gate verdict's collection, or in the full gate's state file.
   `unit_full_every: 1` also restores the full suite on every route. The scope also appears in the verdict
   (`| unit scope: …`) and in `orchestrator-unit-log.json` (`scope`, `scope_reason`, `related_files`,
   `branch_cmd`).
+- **A re-gate runs only the gates** (ORCH-REGATE-GATE-ONLY-1). A queue file whose header has
+  `## Re-gate of: <route branch> <sha>`, plus its Kanban, George-go and Operability lines, builds no executor
+  command. `run_batch` checks three things first:
+  - the branch exists;
+  - its tip is `<sha>`;
+  - the verdict the route lane recorded on that tip, as its `PRE-MERGE GATE:` git note, is
+    `BLOCKED(environment)`. This includes a leg timeout and an implausible clock.
+
+  A note saying `FAIL(product)`, an executor hold (timeout, STOP, incomplete), or no note at all (a refused
+  prefire, or the meta-fire lane) means the file is refused. If the checks pass, the route lane cuts the
+  re-gate's own branch from the merge target and merges `<sha>` into it the way a landing merges. It appends a
+  `## Re-gate (orchestrator, gates only …)` section to the route's handback. From there, gates, landing, cache
+  store and notify run as for any route. A conflict is refused, typed, with the merge aborted. Log lines:
+  `🔁 Re-gate (gates only): <branch>@<sha7> — prior verdict <label>`, or `⛔ RE-GATE REFUSED — <why>` together
+  with a `FINAL STATUS` line. Prefire waives the A2 sizing floor for such a file and says so on the pass line.
+  The OPX lines are still required. Kill switch: `ORCH_REGATE_GATES_ONLY=off` refuses the file.
 - **On-demand full gates are George's.** `orchestrator.py full-gate --trigger on-demand` (the default trigger)
   is refused unless `--requested-by <name>` is given. The name is recorded as `requested_by` in the state
   file. `--dry-run` and the daemon's `--trigger nightly` do not need it.
