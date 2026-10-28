@@ -2495,7 +2495,8 @@ SIT_ENUM_PARALLEL_VAR = "ORCH_SIT_ENUM_PARALLEL"   # `off` ⇒ the serial enumer
 
 
 def _sit_tree_state(repo_path: Path) -> Optional[str]:
-    """HEAD plus `git status` (untracked included): what `vitest list --changed` reads. None when git cannot say."""
+    """HEAD plus `git status` (untracked included): what the repo's `sit_list_cmd` reads with `--changed`. None
+    when git cannot say."""
     try:
         h = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"], capture_output=True, text=True,
                            timeout=60)
@@ -2542,7 +2543,7 @@ class _SitEnumJob:
         return max(0.0, time.time() - t0)
 
     def discard(self, why: str):
-        self.wait()   # never leave a `vitest list` running into the next route's checkout
+        self.wait()   # never leave a `sit_list_cmd` listing running into the next route's checkout
         log.info(f"⏩ SIT enumeration discarded — {why}; nothing of it is used")
 
     def take(self, repo_path: Path) -> tuple:
@@ -4468,8 +4469,9 @@ def _unit_pkg_test_script(repo_path: Path) -> Optional[str]:
 
 
 def _unit_list_cmd(repo_path: Path, test_cmd: str) -> tuple:
-    """(`npx vitest list <config args>`, None) when test_cmd is a plain vitest run — `npm test` whose package.json
-    script is `vitest [run] [--config X]`, or that command itself; else (None, why). Nothing else is guessed."""
+    """(the vitest `list` command with the run's config args, None) when test_cmd is a plain vitest run — `npm test`
+    whose package.json script is `vitest [run] [--config X]`, or that command itself; else (None, why). Nothing else
+    is guessed."""
     try:
         toks = shlex.split(test_cmd)
         if toks in (["npm", "test"], ["npm", "run", "test"]):
@@ -4491,7 +4493,7 @@ def _unit_list_cmd(repo_path: Path, test_cmd: str) -> tuple:
 
 
 def _unit_listing(repo_path: Path, cmd: str) -> tuple:
-    """([file, ...], None) from a `vitest list --filesOnly` run, or (None, why)."""
+    """([file, ...], None) from a vitest `list --filesOnly` run, or (None, why)."""
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError) as e:

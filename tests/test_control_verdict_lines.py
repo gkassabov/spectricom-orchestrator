@@ -46,7 +46,8 @@ C = {
     # ORCH-TIMEOUT-HOLD-1 (brief 2): a sixth control, found by this guard as `_*_hold` with no line
     "executor-exit": "_executor_exit_hold",
     # BASELINE-TRUST-1 (route 67): a seventh, one line per baseline the unit gate needs
-    "baseline-trust": "_unit_baseline_measure_or_reuse",
+    # ORCH-UNIT-RELATED-1 (route 341a1): a second speaker, the related-files baseline's restricted cache hit
+    "baseline-trust": ("_unit_baseline_measure_or_reuse", "_unit_baseline_related"),
     # ORCH-TONI-GUARDS-1 (route 394): an eighth, one line per fire: ON, OFF (TONI_GUARDS=off) or BLOCKED
     "guards": "_toni_guards_apply",
 }
@@ -337,7 +338,7 @@ def _control_violations(src: str) -> list:
         if calls & C_PREDICATES and name not in REPORT_ONLY and not spoken[name]:
             out.append(f"{name}: calls {sorted(calls & C_PREDICATES)}, emits no 🛡 line")
     speakers = {name: s for name, s in spoken.items() if s}
-    expected = {fn: {c} for c, fn in C.items()}
+    expected = {fn: {c} for c, fns in C.items() for fn in ((fns,) if isinstance(fns, str) else fns)}
     if speakers != expected:
         out.append(f"🛡 speakers {speakers} != C {expected}")
     return out
