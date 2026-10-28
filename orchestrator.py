@@ -5561,22 +5561,26 @@ def gate_prelist(brief: Path, proj: Path) -> Optional[str]:
         reach, why = _prelist_reach(proj, sha, paths)
         if reach is None:
             return _not(why)
-        if reach.sit is None or reach.unit is None:
-            return _not("; ".join(f"{leg}: {w}" for leg, s, w in (("SIT", reach.sit, reach.sit_why),
-                                                                    ("unit", reach.unit, reach.unit_why)) if s is None))
+        # [ORCH-PRELIST-PARTIAL-1] one leg is enough: a leg that cannot be named is one line, never silently omitted
+        missing = [(leg, w) for leg, s, w in (("SIT", reach.sit, reach.sit_why),
+                                              ("unit", reach.unit, reach.unit_why)) if s is None]
+        if len(missing) == 2:
+            return _not("; ".join(f"{leg}: {w}" for leg, w in missing))
         named = lambda f: f in text or f.rsplit("/", 1)[-1] in text   # noqa: E731
-        sit = [f for f in reach.sit if not named(f)]
-        unit = [f for f in dict.fromkeys(reach.unit) if not named(f) and f not in sit]
+        sit = [f for f in reach.sit or () if not named(f)]
+        unit = [f for f in dict.fromkeys(reach.unit or ()) if not named(f) and f not in sit]
         rows = [f"- `{f}` (SIT)" for f in sit] + [f"- `{f}` (unit)" for f in unit]
+        gaps = [f"- {leg} leg: {w}; the executor's preflight runs it" for leg, w in missing]
         block = "\n".join([PRELIST_HEADING.format(sha7=sha[:7]),
-                           *(rows or ["- (none beyond the test files this brief already names)"]), PRELIST_RULE]) + "\n"
+                           *(rows or ["- (none beyond the test files this brief already names)"]), *gaps,
+                           PRELIST_RULE]) + "\n"
         with open(brief, "a", encoding="utf-8") as f:
             f.write(("" if text.endswith("\n") else "\n") + "\n" + block)
     except Exception as e:
         return _not(f"{type(e).__name__}: {e}")
     log.info(f"📋 Gate pre-list generated: {len(sit)} SIT + {len(unit)} unit files for {len(paths)} allowed files "
              f"at {sha[:7]}" + (f" (the gate's unit leg runs the full suite here: {reach.unit_full})"
-                                if reach.unit_full else ""))
+                                if reach.unit_full else "") + "".join(f" ({leg}: {w})" for leg, w in missing))
     return block
 
 
