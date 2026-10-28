@@ -5354,16 +5354,16 @@ def tests_reaching(repo_path: Path, diff: BranchDiff) -> PathReach:
         out.unit, out.unit_why = (), f"{ACTIVE_REPO_NAME or 'this repo'} declares no test_cmd — no unit leg"
         return out
     scope = _unit_scope(repo_path, test_cmd, diff)
-    if not scope.capable or (scope.files is None and scope.reason.startswith("(c)")):
-        out.unit_why = f"the gate runs the FULL unit suite — {scope.reason}"
-    elif scope.files is not None:
+    if scope.files is not None:
         out.unit, out.unit_why = scope.files, scope.reason
-    elif diff is None or diff.paths is None or not diff.base:
-        out.unit_why = f"the branch's diff is unknown ({diff.error if diff is not None else 'not computed'})"
-    else:   # (a) / (b) / (d): the gate runs the full suite; the related set is still what reaches the diff
-        out.unit_full = scope.reason
+    elif not scope.capable or diff is None or diff.paths is None or not diff.base:
+        out.unit_why = f"the gate runs the FULL unit suite — {scope.reason}"
+    else:   # (a)-(d): the gate runs the full suite; the related set, when it can be computed, still names what reaches
         files, _, how = _unit_related_files(repo_path, _unit_list_cmd(repo_path, test_cmd)[0], diff)
-        out.unit, out.unit_why = files, how
+        if files is None:
+            out.unit_why = f"the gate runs the FULL unit suite — {scope.reason}"
+        else:
+            out.unit, out.unit_why, out.unit_full = files, how, scope.reason
     return out
 
 
@@ -5492,6 +5492,97 @@ def preflight(repo_path: Path, json_path: Optional[Path] = None) -> int:
         print(l, flush=True)
     log.info(summary)
     return code
+
+
+# ── [ORCH-RELIABILITY-1] Brief 2 · ORCH-PRELIST-1: the gate's pre-list, in the brief Toni reads ─────────────────────
+# Four STOPs came from tests a hand-grepped pre-list missed (an index re-export, `vi.mock` factories). At fire, the
+# brief's ALLOWED FILES become a synthetic diff — each path touched, uncommitted, in a detached worktree at the
+# route's base, which `list --changed <base>` reads as changed — and tests_reaching names what the gate would run.
+PRELIST_VAR = "ORCH_PRELIST"   # `off` ⇒ the brief is left byte-identical
+PRELIST_HEADING = "## GATE PRE-LIST (generated at fire, {sha7}; D-S7CORE36-03)"
+PRELIST_RULE = ("Each stays green unedited except under the brief's rule #8 lines (incl. D-S7CORE36-01 class (iii)); "
+                "a red here is STOP (a) like any other.")
+PRELIST_WORKTREE_PREFIX = "orch-prelist-"
+_ALLOWED_HEAD_RE = re.compile(r"^##\s+(?:[^\n·]*·\s*)?ALLOWED FILES\b[^\n]*$", re.MULTILINE)
+_SECTION_END_RE = re.compile(r"^#{1,2}\s", re.MULTILINE)
+
+
+def brief_allowed_paths(text: str, repo_path: Path) -> list:
+    """Every backticked path in the brief's ALLOWED FILES sections (`## ALLOWED FILES`, `## B2 · ALLOWED FILES…`)
+    that is an existing non-test file in `repo_path` — a `:line` suffix dropped, first-seen order, each once."""
+    briefs, out = _active_briefs_subdir(), []
+    for m in _ALLOWED_HEAD_RE.finditer(text or ""):
+        end = _SECTION_END_RE.search(text, m.end() + 1)
+        for tok in re.findall(r"`([^`\n]+)`", text[m.end(): end.start() if end else len(text)]):
+            p = re.sub(r":\d+(?:-\d+)?$", "", tok.strip()).removeprefix("./")
+            if (not p or " " in p or p in out or _UNIT_TEST_FILE_RE.search(p) or _under_subdir(p, briefs)
+                    or not (repo_path / p).is_file()):
+                continue
+            out.append(p)
+    return out
+
+
+def _prelist_reach(proj: Path, sha: str, paths: list) -> tuple:
+    """(PathReach, None) for `paths` changed at `sha` — a detached worktree at `sha`, each path touched and left
+    uncommitted, the dependency trees linked from `proj` (a listing runs nothing); (None, why) when it cannot be
+    made. The worktree is removed after, its links first."""
+    with tempfile.TemporaryDirectory(prefix=PRELIST_WORKTREE_PREFIX) as td:
+        wt = Path(td) / "wt"
+        add = subprocess.run(["git", "-C", str(proj), "worktree", "add", "--detach", str(wt), sha],
+                             capture_output=True, text=True)
+        if add.returncode != 0:
+            return None, f"a detached worktree at {sha[:7]} could not be made: {(add.stderr or '').strip()[-200:]}"
+        links = []
+        try:
+            links = _link_unit_deps(proj, wt)
+            for p in paths:
+                with open(wt / p, "a") as f:
+                    f.write("\n")
+            return tests_reaching(wt, BranchDiff(base=sha, tip="HEAD", paths=tuple(paths))), None
+        finally:
+            for d in links:
+                d.unlink(missing_ok=True)
+            subprocess.run(["git", "-C", str(proj), "worktree", "remove", "--force", str(wt)], capture_output=True)
+            subprocess.run(["git", "-C", str(proj), "worktree", "prune"], capture_output=True)
+
+
+def gate_prelist(brief: Path, proj: Path) -> Optional[str]:
+    """[ORCH-RELIABILITY-1] F2.1: append the GATE PRE-LIST block to the route's copy of the brief — every test file
+    the gate relates to its ALLOWED FILES that the brief does not already name. Returns the block, or None (the brief
+    unchanged, the fire logging why). Never raises: a pre-list that cannot be made never stops a fire."""
+    def _not(why: str):
+        log.info(f"📋 Gate pre-list not generated: {why}")
+        return None
+    if os.environ.get(PRELIST_VAR, "").strip().lower() == "off":
+        return _not(f"{PRELIST_VAR}=off")
+    try:
+        text = brief.read_text(encoding="utf-8")
+        paths = brief_allowed_paths(text, proj)
+        if not paths:
+            return _not("the brief's ALLOWED FILES name no existing non-test file")
+        sha = _git_read("git rev-parse HEAD", proj)
+        if not sha:
+            return _not(f"HEAD of {proj} is unreadable")
+        reach, why = _prelist_reach(proj, sha, paths)
+        if reach is None:
+            return _not(why)
+        if reach.sit is None or reach.unit is None:
+            return _not("; ".join(f"{leg}: {w}" for leg, s, w in (("SIT", reach.sit, reach.sit_why),
+                                                                    ("unit", reach.unit, reach.unit_why)) if s is None))
+        named = lambda f: f in text or f.rsplit("/", 1)[-1] in text   # noqa: E731
+        sit = [f for f in reach.sit if not named(f)]
+        unit = [f for f in dict.fromkeys(reach.unit) if not named(f) and f not in sit]
+        rows = [f"- `{f}` (SIT)" for f in sit] + [f"- `{f}` (unit)" for f in unit]
+        block = "\n".join([PRELIST_HEADING.format(sha7=sha[:7]),
+                           *(rows or ["- (none beyond the test files this brief already names)"]), PRELIST_RULE]) + "\n"
+        with open(brief, "a", encoding="utf-8") as f:
+            f.write(("" if text.endswith("\n") else "\n") + "\n" + block)
+    except Exception as e:
+        return _not(f"{type(e).__name__}: {e}")
+    log.info(f"📋 Gate pre-list generated: {len(sit)} SIT + {len(unit)} unit files for {len(paths)} allowed files "
+             f"at {sha[:7]}" + (f" (the gate's unit leg runs the full suite here: {reach.unit_full})"
+                                if reach.unit_full else ""))
+    return block
 
 
 def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: int,
@@ -6464,6 +6555,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             return _regate_refused(batch_file, why)
         handoff, ec, out_log = None, 0, ""     # no executor was handed anything
     else:
+        if target.resolve() != batch_file.resolve():   # [ORCH-RELIABILITY-1] F2.1: the route's copy, never the queue's
+            gate_prelist(target, proj)
+        else:
+            log.info(f"📋 Gate pre-list not generated: {target} is the queued brief itself, not a route copy")
         handoff = capture_handoff(proj, branch_name) if worktree is None else None
         ec, out_log = fire_toni(target, proj)
     finished = datetime.now()
