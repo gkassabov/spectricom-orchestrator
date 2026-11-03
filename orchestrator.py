@@ -3069,6 +3069,9 @@ class UnitSuiteRun:
     # A reader of the log must never have to guess which of the two produced the number.
     failures_source: Optional[str] = None
     failing_files: tuple = ()      # sorted, repo-relative; the SET half of the §2.1 comparison
+    # [ORCH-UNIT-FAIL-LABEL-1] F2: `<path> > <suite> > <test>` (vitest) / `<path>::<test>` (pytest), sorted; None ⇒ not
+    # named at all (a cache entry written before F2, or no runner parsed).
+    failing_tests: Optional[tuple] = None
     output: str = ""               # combined stdout+stderr tail, for F-20 classification
     error: Optional[str] = None    # "timeout" | subprocess error text
     # [GATE-CLOCK-1] (start, end) LegClocks of THIS execution; None ⇒ not measured now (cache, stub).
@@ -3223,8 +3226,13 @@ class UnitGateOutcome:
 # ── suite-output parsing ───────────────────────────────────────────────────────────────
 # vitest/jest failing FILES: ` FAIL  src/lib/synth/seed.test.ts > wipe > keeps Patients`
 # and the per-file listing ` ❯ src/lib/synth/seed.test.ts (3 tests | 2 failed)`.
-_UNIT_VITEST_FAIL_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(\S+)", re.MULTILINE)
-_UNIT_VITEST_FILE_FAILED_RE = re.compile(r"^\s*❯\s+(\S+)\s+\(\d+\s+tests?\s*\|\s*\d+\s+failed", re.MULTILINE)
+# [ORCH-UNIT-FAIL-LABEL-1] F1: both capture what follows, label and all — _unit_strip_project drops it.
+_UNIT_VITEST_FAIL_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(.+?)\s*$", re.MULTILINE)
+_UNIT_VITEST_FILE_FAILED_RE = re.compile(r"^\s*❯\s+(.+?)\s+\(\d+\s+tests?\s*\|\s*\d+\s+failed", re.MULTILINE)
+# [ORCH-UNIT-FAIL-LABEL-1] F1: a vitest workspace prints the project before the path — `|app| ` without colour,
+# ` app ` on a coloured background with it (the ANSI strip leaves the bare token: the 219 `['app']` cache entries),
+# `[app] ` in a listing. A bare token is a label only when it holds no `/` and a path, not `>` or `[`, follows it.
+_UNIT_PROJECT_LABEL_RE = re.compile(r"^(?:\|[^|\s]+\||\[[^\]\s]+\]|[^\s/|\[\]>]+(?=\s+[^\s>\[]))\s+")
 # pytest tallies: `2 failed, 1 passed in 0.01s` (-q) or `==== 2 failed, 1 passed in 0.01s ====`.
 _UNIT_PYTEST_SUMMARY_RE = re.compile(
     r"^[=\s]*((?:\d+\s+(?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)"
@@ -3234,6 +3242,8 @@ _UNIT_PYTEST_NO_TESTS_RE = re.compile(r"^[=\s]*no tests ran in [\d.]+s", re.MULT
 _UNIT_PYTEST_COLLECTED_RE = re.compile(r"^\s*collected (\d+) items?", re.MULTILINE)
 # `FAILED tests/test_x.py::TestY::test_z - AssertionError` / `ERROR tests/test_x.py`
 _UNIT_PYTEST_FAILED_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?\.py)(?:::|\s|$)", re.MULTILINE)
+# [ORCH-UNIT-FAIL-LABEL-1] F2: the failing test itself — `tests/test_x.py::TestY::test_z`
+_UNIT_PYTEST_FAILED_TEST_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?\.py(?:::\S+)?)(?:\s|$)", re.MULTILINE)
 # traceback tail `tests/test_x.py:2: AssertionError` — fallback when the short summary is off
 _UNIT_PYTEST_TRACEBACK_RE = re.compile(r"^(\S+\.py):\d+:\s+\w", re.MULTILINE)
 # non-quiet per-file progress `tests/test_x.py .FF   [100%]` — the only source of a FILE count
@@ -3248,6 +3258,27 @@ def _norm_test_path(p: str) -> str:
     return p
 
 
+def _unit_strip_project(s: str) -> str:
+    """[ORCH-UNIT-FAIL-LABEL-1] F1: `s` without a leading vitest project label (`|app| `, `[app] `, `app `)."""
+    return _UNIT_PROJECT_LABEL_RE.sub("", s.strip(), count=1)
+
+
+def _unit_test_file(test: str) -> str:
+    """[ORCH-UNIT-FAIL-LABEL-1] F4: the file a failing test id names — `<path> > …` or `<path>::…`."""
+    return _norm_test_path(test.split(" > ", 1)[0].split("::", 1)[0].split()[0] if test.strip() else "")
+
+
+def _unit_is_test_path(p: str) -> bool:
+    """[ORCH-UNIT-FAIL-LABEL-1] F3: a repo-relative test path — a `/` in it, and a vitest/jest test suffix or `.py`."""
+    return "/" in p and bool(_UNIT_TEST_FILE_RE.search(p) or p.endswith(".py"))
+
+
+def _unit_is_blind(failures: Optional[int], failing_files) -> bool:
+    """[ORCH-UNIT-FAIL-LABEL-1] F3: failures, and a failing set that names no test path or holds a token that is not
+    one (`app`, `|app|`) — UNKNOWN: it vouches for nothing."""
+    return bool(failures) and (not failing_files or not all(_unit_is_test_path(f) for f in failing_files))
+
+
 def _parse_unit_summary(raw: str) -> dict:
     """Collection counts + the failing-FILE set from a unit-suite run. Understands the two
     runners this fleet declares in repos.yaml (vitest/jest and pytest). An unrecognised
@@ -3256,7 +3287,7 @@ def _parse_unit_summary(raw: str) -> dict:
     out = {"runner": None, "test_files_total": None, "tests_total": None,
            "tests_passed": None, "failures": None, "tests_skipped": None,
            "tests_todo": None, "tests_expected_fail": None, "tests_xfailed": None,
-           "tests_xpassed": None, "failures_source": None, "failing_files": ()}
+           "tests_xpassed": None, "failures_source": None, "failing_files": (), "failing_tests": None}
 
     v = _parse_vitest_summary(text)
     if v["tests_total"] is not None or v["test_files_total"] is not None:
@@ -3280,9 +3311,12 @@ def _parse_unit_summary(raw: str) -> dict:
             out["failures"] = max(0, v["tests_total"] - v["tests_passed"] - (t["expected_fail"] or 0)
                                   - (t["skipped"] or 0) - (t["todo"] or 0))
             out["failures_source"] = "derived"
-        files = {_norm_test_path(m) for m in _UNIT_VITEST_FAIL_RE.findall(text)}
-        files |= {_norm_test_path(m) for m in _UNIT_VITEST_FILE_FAILED_RE.findall(text)}
+        fails = [_unit_strip_project(m) for m in _UNIT_VITEST_FAIL_RE.findall(text)]
+        files = {_unit_test_file(m) for m in fails}
+        files |= {_unit_test_file(_unit_strip_project(m)) for m in _UNIT_VITEST_FILE_FAILED_RE.findall(text)}
         out["failing_files"] = tuple(sorted(f for f in files if f))
+        out["failing_tests"] = tuple(sorted({f"{_unit_test_file(m)} > {m.split(' > ', 1)[1]}"
+                                             for m in fails if " > " in m}))
         return out
 
     m = _UNIT_PYTEST_SUMMARY_RE.search(text)
@@ -3316,6 +3350,7 @@ def _parse_unit_summary(raw: str) -> dict:
         if not files and failed:
             files = {_norm_test_path(f) for f in _UNIT_PYTEST_TRACEBACK_RE.findall(text)}
         out["failing_files"] = tuple(sorted(f for f in files if f))
+        out["failing_tests"] = tuple(sorted({_norm_test_path(t) for t in _UNIT_PYTEST_FAILED_TEST_RE.findall(text)}))
         return out
 
     return out
@@ -3568,14 +3603,17 @@ def _unit_confirm_cmd(test_cmd: str, files: tuple) -> str:
 
 
 def _unit_confirm_new_files(repo_path: Path, test_cmd: str, ref_label: str,
-                            new_files: tuple) -> tuple:
+                            new_files: tuple, tests: Optional[tuple] = None) -> tuple:
     """[ORCH-6] decisions 2 & 4 — re-run exactly `new_files`, alone, on the branch checkout.
 
     Returns (flakes, regressions, confirm_run). `flakes` is None iff the confirmation pass
     itself could not be performed (timeout, runner error, no parseable summary) — that is
     BLOCKED(environment), never a verdict about the files; the caller tells the two apart by
     checking `flakes is None`, not by inspecting `confirm_run`.
-    """
+
+    [ORCH-UNIT-FAIL-LABEL-1] F4: `tests` given ⇒ the verdict is over those TESTS (their files are `new_files`): a
+    test still failing alone is a regression, one passing alone a flake. A run that fails but names no test cannot
+    say which — None, as unmeasurable."""
     cmd = _unit_confirm_cmd(test_cmd, new_files)
     ref = f"{UNIT_CONFIRM_REF_PREFIX} {ref_label}"
     run = _run_unit_suite(cmd, repo_path, ref)
@@ -3584,6 +3622,19 @@ def _unit_confirm_new_files(repo_path: Path, test_cmd: str, ref_label: str,
         log.error(f"🛡 unit-confirm: BLOCKED — confirmation-unmeasurable: "
                   f"{run.error or run.collection or 'no parseable summary'} ({', '.join(new_files)})")
         return None, None, run
+    if tests is not None:
+        if run.failures and not run.failing_tests:
+            log.error(f"🛡 unit-confirm: BLOCKED — confirmation-unmeasurable: {run.failures} failure(s) alone, no "
+                      f"failing test named ({', '.join(new_files)})")
+            return None, None, run
+        still = set(run.failing_tests or ()) & set(tests)
+        flakes, regressions = tuple(sorted(set(tests) - still)), tuple(sorted(still))
+        if regressions:
+            log.error(f"🛡 unit-confirm: FAIL — test(s) still failing alone: {'; '.join(regressions)}; "
+                      f"flaky: {'; '.join(flakes) or '(none)'}")
+        else:
+            log.info(f"🛡 unit-confirm: CLEAN — every extra failing test passed alone (flaky): {'; '.join(flakes)}")
+        return flakes, regressions, run
     still_failing = set(run.failing_files) & set(new_files)
     flakes = tuple(sorted(set(new_files) - still_failing))
     regressions = tuple(sorted(still_failing))
@@ -3768,8 +3819,17 @@ def _unit_cache_lookup(archive: Path, repo_name: str, sha: str, cmd: str, repo_p
     ck = content_key or _unit_content_key(repo_path or _unit_cache_repo(), sha)
     if not ck:
         return None
-    e = _unit_cache_load(archive, persist=persist).get(_unit_cache_key(repo_name, ck, cmd))
-    return e if _unit_cache_entry_matches(e, repo_name, ck, cmd) else None
+    key = _unit_cache_key(repo_name, ck, cmd)
+    e = _unit_cache_load(archive, persist=persist).get(key)
+    if not _unit_cache_entry_matches(e, repo_name, ck, cmd):
+        return None
+    if _unit_is_blind(e.get("failures"), e.get("failing_files")):
+        # [ORCH-UNIT-FAIL-LABEL-1] F3: a blind entry is no baseline — not read, not edited; the caller measures
+        log.info(f"♻️  Unit baseline: cached entry {key} rejected as BLIND — {e.get('failures')} failure(s), failing "
+                 f"set {list(e.get('failing_files') or [])} names no test path (measured at {str(e.get('sha'))[:7]}); "
+                 f"not read")
+        return None
+    return e
 
 
 def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: UnitSuiteRun,
@@ -3812,6 +3872,8 @@ def _unit_cache_store(archive: Path, repo_name: str, sha: str, cmd: str, run: Un
         "runner": run.runner, "test_files_total": run.test_files_total,
         "tests_total": run.tests_total, "tests_passed": run.tests_passed,
         "failures": run.failures, "failing_files": list(run.failing_files),
+        # [ORCH-UNIT-FAIL-LABEL-1] F2 additive: an entry without it names no test (F4 cannot diff it)
+        "failing_tests": None if run.failing_tests is None else list(run.failing_tests),
         # [ORCH-8] ADDITIVE: a reused baseline must reconcile the same way a measured one
         # does. Entries written before this existed simply lack these keys and read as None.
         "tests_skipped": run.tests_skipped, "tests_todo": run.tests_todo,
@@ -4237,7 +4299,8 @@ def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:
                         tests_expected_fail=e.get("tests_expected_fail"),
                         tests_xfailed=e.get("tests_xfailed"), tests_xpassed=e.get("tests_xpassed"),
                         failures_source=e.get("failures_source"),
-                        failing_files=tuple(e.get("failing_files") or ()))
+                        failing_files=tuple(e.get("failing_files") or ()),
+                        failing_tests=None if e.get("failing_tests") is None else tuple(e["failing_tests"]))
 
 
 def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sha: str,
@@ -4255,7 +4318,7 @@ def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sh
 
     [ORCH-FULLGATE-CACHE-1] `exclude_ck`: a full gate whose unit leg IS the entry for that content key never takes
     the same measurement (at a content twin) as its own baseline."""
-    best, best_distance, unjudged = None, None, 0
+    best, best_distance, unjudged, blind = None, None, 0, 0
     for e in _unit_cache_load(archive).values():
         if not isinstance(e, dict) or e.get("repo") != repo_name or e.get("test_cmd") != cmd:
             continue
@@ -4266,6 +4329,9 @@ def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sh
             continue
         if not _unit_cache_judged(e):
             unjudged += 1
+            continue
+        if _unit_is_blind(e.get("failures"), e.get("failing_files")):   # [ORCH-UNIT-FAIL-LABEL-1] F3
+            blind += 1
             continue
         anc = subprocess.run(
             f"git -C {shlex.quote(str(repo_path))} merge-base --is-ancestor "
@@ -4287,6 +4353,9 @@ def _unit_cache_ancestor(repo_path: Path, archive: Path, repo_name: str, base_sh
         log.info(f"♻️  Unit baseline: {unjudged} cached {repo_name} "
                  f"{'entry predates' if unjudged == 1 else 'entries predate'} GATE-CLOCK-1 (clock never judged) "
                  f"— not considered as an ancestor baseline")
+    if blind:
+        log.info(f"♻️  Unit baseline: {blind} cached {repo_name} entr{'y' if blind == 1 else 'ies'} BLIND (failures "
+                 f"with no test path named) — not considered as an ancestor baseline")
     if best is not None:
         best = dict(best, ancestor_distance=best_distance)
     return best
@@ -4888,10 +4957,53 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                   f"{baseline_run.failures} — newly-failing file(s) confirmed FLAKY in isolation "
                   f"(passed alone, not blocking): {', '.join(flakes)} (baseline {baseline_source})")
     elif worse_count:
-        # AC-O6b-03: the count rose with no newly-failing file — logged as an explicit, named
-        # observation so the noise stays visible without blocking.
-        detail = (f"count rose from {baseline_run.failures} to {branch_run.failures} with no "
-                  f"newly-failing file — not blocking (baseline {baseline_source})")
+        # [ORCH-UNIT-FAIL-LABEL-1] F4 (supersedes AC-O6b-03, D-S7CORE42-02): the count rose with no newly-failing
+        # file — the extra failing TESTS are named and re-run alone; a rise nobody can name blocks.
+        rise = branch_run.failures - baseline_run.failures
+        named = bool(branch_run.failing_tests) and baseline_run.failing_tests is not None \
+            and (bool(baseline_run.failing_tests) or not baseline_run.failures)
+        extras = tuple(sorted(set(branch_run.failing_tests or ()) - set(baseline_run.failing_tests or ())))
+        rose = f"count rose from {baseline_run.failures} to {branch_run.failures} with no newly-failing file"
+        if not named or len(extras) < rise:
+            side = ("branch" if not branch_run.failing_tests else "baseline") if not named else None
+            why = (f"the {side} run names no failing test" if side else
+                   f"{len(extras)} extra failing test(s) named for a rise of {rise}: {'; '.join(extras) or '(none)'}")
+            detail = (f"{rose} — count rose by {rise} and the new failures cannot be named ({why}; baseline "
+                      f"{baseline_source})")
+            log.error(f"⛔ Unit gate: {detail} — BLOCKED, never PASS. BLOCKING: branch stays unmerged.")
+            return _finish(UnitGateOutcome(passed=False, signal="count-rise-unnamed", detail=detail, env=True,
+                                           ran=True, branch=branch_run, baseline=baseline_run,
+                                           baseline_note=baseline_note, baseline_source=baseline_source))
+        files = tuple(sorted({_unit_test_file(t) for t in extras}))
+        log.info(f"🔬 Unit gate: {rose} — {len(extras)} extra failing test(s): {'; '.join(extras)}; confirming "
+                 f"their file(s) in isolation: {', '.join(files)}")
+        flaky_t, regressions, confirm_run = _unit_confirm_new_files(repo_path, test_cmd, label, files, tests=extras)
+        if confirm_run is not None:
+            confirm_run.clock = _judge_leg("unit-confirm", confirm_run.clocks, archive,
+                                           red=flaky_t is None or bool(regressions),
+                                           completed=confirm_run.error is None, files=len(files))
+        if flaky_t is None:
+            why = (confirm_run.error if confirm_run else None) or \
+                (confirm_run.collection if confirm_run else None) or "no measurement"
+            detail = (f"{rose}; the extra failing test(s) {'; '.join(extras)} could not be confirmed in isolation "
+                      f"({why}) — the flake/regression distinction cannot be made")
+            log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not FAIL(product)")
+            return _finish(UnitGateOutcome(passed=False, signal="confirmation-unmeasurable", detail=detail,
+                                           env=True, ran=True, branch=branch_run, baseline=baseline_run,
+                                           baseline_note=baseline_note, baseline_source=baseline_source,
+                                           confirm=confirm_run))
+        if regressions:
+            detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — {rose}; still failing alone: "
+                      f"{'; '.join(regressions)}" + (f"; flaky in isolation, not blocking: {'; '.join(flaky_t)}"
+                                                     if flaky_t else "") + f" (baseline {baseline_source})")
+            log.error(f"⛔ UNIT BASELINE GATE FAILED — {detail}. BLOCKING: branch stays unmerged.")
+            return _finish(UnitGateOutcome(passed=False, signal="regression", detail=detail,
+                                           ran=True, branch=branch_run, baseline=baseline_run,
+                                           baseline_note=baseline_note, baseline_source=baseline_source,
+                                           confirm=confirm_run))
+        # flaky TESTS in files that fail at the base too: named in the verdict, not in flaky_files (which are files)
+        detail = (f"{rose} — the {len(flaky_t)} extra failing test(s) passed alone (flaky, not blocking): "
+                  f"{'; '.join(flaky_t)} (baseline {baseline_source})")
     log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}; baseline {baseline_note}")
     return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run, baseline=baseline_run,
                                    baseline_note=baseline_note, baseline_source=baseline_source,
@@ -5419,16 +5531,20 @@ def _preflight_unit(repo_path: Path, reach: PathReach, label: str) -> dict:
         return {**leg, "status": "environment", "why": f"{run.error or 'nothing collected'} ({run.collection})"}
     if run.exit_code == 0 and not run.failing_files and (run.failures or 0) == 0:
         return leg
-    if not run.failing_files:
+    # [ORCH-UNIT-FAIL-LABEL-1] F5: the parse names paths (F1) and tests (F2); a token that is not a test path is
+    # never re-run alone, so a still-red file cannot read as flaky because its label matched nothing
+    paths = tuple(f for f in run.failing_files if _unit_is_test_path(f))
+    tests = list(run.failing_tests or ()) or _preflight_failures(run.output)
+    if not paths:
         v = _classify_gate_failure("unit", run.output, repo_path, run.exit_code, clock=run.clock)
         return {**leg, "status": "fail" if v.outcome is GateOutcome.FAIL_PRODUCT else "environment",
-                "why": f"exit {run.exit_code}, no failing file named — {v.label}", "failed": _preflight_failures(run.output)}
+                "why": f"exit {run.exit_code}, no failing file named — {v.label}", "failed": tests}
     # the gate's isolation rule: a file that passes alone was its run's; one that fails alone is the branch's
-    flakes, confirmed, confirm = _unit_confirm_new_files(repo_path, test_cmd, label, tuple(run.failing_files))
+    flakes, confirmed, confirm = _unit_confirm_new_files(repo_path, test_cmd, label, paths)
     if flakes is None:
-        return {**leg, "status": "environment", "failed": list(run.failing_files),
+        return {**leg, "status": "environment", "failed": list(paths),
                 "why": f"the failing file(s) could not be re-run alone ({(confirm.error if confirm else None) or 'no measurement'})"}
-    named = [t for t in _preflight_failures(run.output) if t.split(" > ", 1)[0] in confirmed] or list(confirmed)
+    named = [t for t in tests if _unit_test_file(t) in confirmed] or list(confirmed)
     leg.update(failed=named, flaky=list(flakes))
     if confirmed:
         leg.update(status="fail", why=f"{leg['why']}; failing alone: {', '.join(confirmed)} (the gate calls a file a "

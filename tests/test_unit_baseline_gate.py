@@ -200,14 +200,15 @@ class TestBaselineComparison:
     failing-FILE set decides the verdict; the count is evidence only (see
     TestFlakeVsRegressionConfirmation and TestCountIsEvidenceNotAVerdict below)."""
 
-    def test_more_failures_with_no_newly_failing_file_passes_and_logs_the_delta(self, repo, tmp_path):
-        """AC-O6b-03: current > baseline but the same file set on both sides ⇒ PASS; the
-        count rise is logged as a named observation, not a verdict."""
+    def test_more_failures_with_no_newly_failing_file_names_the_extra_test(self, repo, tmp_path):
+        """[ORCH-UNIT-FAIL-LABEL-1] F4 (supersedes AC-O6b-03): current > baseline, the same file set on both
+        sides ⇒ the extra failing test is named and re-run alone; still failing ⇒ FAIL(product)."""
         o, _ = run_gate(repo, tmp_path,
                         branch_out=vitest([A, A, A], failed=3),
                         baseline_out=vitest([A, A], failed=2))
-        assert o.passed is True and o.signal is None
+        assert o.passed is False and o.signal == "regression"
         assert "count rose from 2 to 3 with no newly-failing file" in o.detail
+        assert f"still failing alone: {A} > suite > case 2" in o.detail
 
     def test_equal_failures_passes(self, repo, tmp_path):
         """AC-O3-03: current == baseline ⇒ pass. A zero gate would block here; this is not one."""
@@ -1260,13 +1261,14 @@ class TestCountIsEvidenceNotAVerdict:
         assert f"newly-failing file(s): {B}" in o.detail
         assert "failures vs baseline" not in o.detail, "the count fell — it must not appear as a reason"
 
-    def test_ac_o6b_03_count_rose_with_no_newly_failing_file_passes_and_names_the_delta(self, repo, tmp_path):
-        """AC-O6b-03: no newly-failing file, count rose ⇒ PASS, with the delta logged as an
-        explicit, named observation so the noise stays visible without blocking."""
+    def test_f4_count_rose_with_no_newly_failing_file_names_the_test_that_fails_alone(self, repo, tmp_path):
+        """[ORCH-UNIT-FAIL-LABEL-1] F4 (supersedes AC-O6b-03, D-S7CORE42-02): no newly-failing file, count
+        rose ⇒ the extra failing test is re-run alone; still failing ⇒ FAIL(product) naming it."""
         o, _ = run_gate(repo, tmp_path,
                         branch_out=vitest([A, A, A], failed=3), baseline_out=vitest([A, A], failed=2))
-        assert o.passed is True and o.signal is None
+        assert o.passed is False and o.signal == "regression"
         assert "count rose from 2 to 3 with no newly-failing file" in o.detail
+        assert f"still failing alone: {A} > suite > case 2" in o.detail
 
     def test_ac_o6b_04_count_fell_with_no_newly_failing_file_passes_as_today(self, repo, tmp_path):
         """AC-O6b-04: no newly-failing file, count fell ⇒ PASS, unchanged from before."""
@@ -1420,6 +1422,12 @@ class TestFlakyReport:
 CMP_TESTS_LINE = "      Tests  9 failed | 7267 passed | 8 skipped | 4 todo (7288)"
 CMP_FIXTURE = (" Test Files  9 failed | 780 passed (789)\n"
                + CMP_TESTS_LINE + "\n   Duration  307.10s\n")
+# [ORCH-UNIT-FAIL-LABEL-1] F3: a cached baseline must name its failing tests — these lines name n of them and
+# change no tally (the summary lines alone carry the counts).
+def cmp_named(out, n):
+    return "".join(f" FAIL  src/cmp/f{i}.test.ts > suite > t{i}\n" for i in range(n)) + out
+
+
 # The same repo with nothing genuinely failing — the shape the green fast path needs.
 CMP_GREEN = (" Test Files  789 passed (789)\n"
              "      Tests  7276 passed | 8 skipped | 4 todo (7288)\n"
@@ -1531,7 +1539,7 @@ class TestTheGateLineReconciles:
         for _ in range(2):
             with active(archive=archive), patch.object(
                     orchestrator, "_run_unit_suite",
-                    fake_suite(vitest([B, B], failed=2), CMP_FIXTURE)):
+                    fake_suite(vitest([B, B], failed=2), cmp_named(CMP_FIXTURE, 9))):
                 o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
         assert o.baseline_source == "cache"
         assert "9 failed, 7267 passed, 8 skipped, 4 todo" in o.baseline.collection
@@ -1601,13 +1609,14 @@ class TestOrch8ChangedNoVerdictSemantics:
                      "TIMEOUT =", "TIMEOUT="):
             assert not [l for l in touched if knob in l], f"{knob} moved — §4 is a report, not a fix"
 
-    def test_ac_o8_09_the_verdict_still_keys_on_confirmed_files_not_on_the_count(self, repo, tmp_path):
-        """[ORCH-6b]: a count that rose with no newly-failing file is reported, not blocking —
-        and that stays true with the corrected count."""
+    def test_ac_o8_09_a_count_rise_with_no_new_file_is_decided_by_the_named_tests(self, repo, tmp_path):
+        """[ORCH-UNIT-FAIL-LABEL-1] F4 (supersedes [ORCH-6b]'s "reported, not blocking"): with the corrected
+        count, the extra failing tests are named and confirmed alone — still failing ⇒ FAIL(product)."""
         o, _ = run_gate(repo, tmp_path,
                         branch_out=vitest([A, A, A], failed=3), baseline_out=vitest([A], failed=1))
-        assert o.passed is True
+        assert o.passed is False and o.signal == "regression"
         assert "count rose from 1 to 3 with no newly-failing file" in o.detail
+        assert f"still failing alone: {A} > suite > case 1; {A} > suite > case 2" in o.detail
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -1680,7 +1689,7 @@ class TestTheGateReconcilesItsOwnNumber:
         archive = tmp_path / "archive"
         for _ in range(2):
             with active(archive=archive), patch.object(
-                    orchestrator, "_run_unit_suite", fake_suite(CMP_FIXTURE, CMP_SHORT)):
+                    orchestrator, "_run_unit_suite", fake_suite(CMP_FIXTURE, cmp_named(CMP_SHORT, 9))):
                 o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
         assert o.baseline_source == "cache"
         assert "TALLY MISMATCH on merge-base" in o.detail
@@ -1785,10 +1794,11 @@ class TestOrch9ChangedNoVerdictSemantics:
         o, _ = run_gate(repo, tmp_path, branch_out=CMP_GREEN, branch_code=0)
         assert o.passed is True and o.baseline_source == "not-needed" and o.baseline is None
 
-    def test_orch6_and_6b_the_verdict_still_keys_on_confirmed_files(self, repo, tmp_path):
+    def test_orch6_and_6b_the_verdict_keys_on_confirmed_files_and_named_tests(self, repo, tmp_path):
         o, _ = run_gate(repo, tmp_path, branch_out=vitest([A, A, A], failed=3),
                         baseline_out=vitest([A], failed=1))
-        assert o.passed is True, "[ORCH-6b]: a count delta alone is not a regression"
+        assert o.passed is False and o.signal == "regression", \
+            "[ORCH-UNIT-FAIL-LABEL-1] F4: a count rise is decided by the extra tests, confirmed alone"
         assert "count rose from 1 to 3 with no newly-failing file" in o.detail
 
     def test_orch7_the_flaky_tail_still_accumulates_on_the_cache_entry(self, repo, tmp_path):
@@ -1974,7 +1984,7 @@ class TestTheDate7RunReconciles:
         archive = tmp_path / "archive"
         for _ in range(2):
             with active(archive=archive), patch.object(
-                    orchestrator, "_run_unit_suite", fake_suite(CMP_EXPECTED_FAIL, CMP_EXPECTED_FAIL)):
+                    orchestrator, "_run_unit_suite", fake_suite(CMP_EXPECTED_FAIL, cmp_named(CMP_EXPECTED_FAIL, 4))):
                 o = orchestrator.run_unit_gate(repo, "route", archive_path=archive)
         assert o.baseline_source == "cache"
         assert o.baseline.tests_expected_fail == 1
