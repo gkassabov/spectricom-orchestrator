@@ -4703,6 +4703,17 @@ def _unit_baseline_related(repo_path: Path, base_sha: str, test_cmd: str, files:
                                            repo_name, related_files=at_base)
 
 
+def _count_word(branch: int, baseline: int) -> str:
+    """[ORCH-UNIT-GATE-WORDING-1] G-D1: how the branch's failure count stands against the baseline's."""
+    return "below" if branch < baseline else "equal to" if branch == baseline else "above"
+
+
+def _count_said(run) -> str:
+    """[ORCH-UNIT-GATE-WORDING-1] G-D3: a run's failure count as a gate detail writes it — `<n> (derived)` when it came
+    from the fallback subtraction, as `collection` writes it."""
+    return f"{run.failures} (derived)" if run.failures_source == "derived" else f"{run.failures}"
+
+
 def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                   archive_path: Optional[Path] = None, diff: Optional["BranchDiff"] = None) -> UnitGateOutcome:
     """Baseline unit-suite gate. Halts iff the branch has a confirmed regression.
@@ -4946,19 +4957,25 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                                        baseline_note=baseline_note, baseline_source=baseline_source,
                                        flaky_files=flakes, confirm=confirm_run))
 
-    verdict = ("equal to" if branch_run.failures == baseline_run.failures else "below")
-    detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
-              f"{baseline_run.failures} — no new failing file (baseline {baseline_source})")
+    # [ORCH-UNIT-GATE-WORDING-1] G-D1: the word follows the counts (never `below` for a higher one); G-D3: a derived
+    # count says so, as `collection` does.
+    verdict = _count_word(branch_run.failures, baseline_run.failures)
+    n_branch, n_base = _count_said(branch_run), _count_said(baseline_run)
+    detail = (f"{n_branch} failures, {verdict} the merge-base baseline of "
+              f"{n_base} — no new failing file (baseline {baseline_source})")
+    not_compared = (f"(baseline {baseline_source}: {len(baseline_run.failing_files)} failing related file(s); counts "
+                    f"not compared)")
     if not baseline_run.count_comparable:   # [ORCH-UNIT-RELATED-1] the baseline counts files: say only what holds
-        detail = (f"{branch_run.failures} failure(s) on the related files — no new failing file (baseline "
-                  f"{baseline_source}: {len(baseline_run.failing_files)} failing related file(s); counts not compared)")
+        detail = f"{n_branch} failure(s) on the related files — no new failing file {not_compared}"
     if flakes:
         # AC-O6b-01: every newly-failing file confirmed a FLAKE ⇒ PASS regardless of the
         # count delta. Flakes alone never fail the route, but they are still reported, never
         # silently swallowed.
-        detail = (f"{branch_run.failures} failures, {verdict} the merge-base baseline of "
-                  f"{baseline_run.failures} — newly-failing file(s) confirmed FLAKY in isolation "
-                  f"(passed alone, not blocking): {', '.join(flakes)} (baseline {baseline_source})")
+        confirmed = (f"newly-failing file(s) confirmed FLAKY in isolation (passed alone, not blocking): "
+                     f"{', '.join(flakes)}")
+        detail = (f"{n_branch} failures, {verdict} the merge-base baseline of {n_base} — {confirmed} (baseline "
+                  f"{baseline_source})" if baseline_run.count_comparable else
+                  f"{n_branch} failure(s) on the related files — {confirmed} {not_compared}")   # G-D2
     elif worse_count:
         # [ORCH-UNIT-FAIL-LABEL-1] F4 (supersedes AC-O6b-03, D-S7CORE42-02): the count rose with no newly-failing
         # file — the extra failing TESTS are named and re-run alone; a rise nobody can name blocks.
