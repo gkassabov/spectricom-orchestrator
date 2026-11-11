@@ -173,10 +173,44 @@ def test_P3_control_an_unreadable_canon_folder_fails_closed(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("path", ["src/lib/agentic-runtime/tools.ts", "src/lib/agentic-drafts/draft-queue.ts",
-                                  "server/routes/agent-runner.ts", "server/agents/x.ts", "src/daemon/**"])
+                                  "server/routes/agent-runner.ts", "server/agents/x.ts", "src/daemon/**",
+                                  "server/simulation/engine.ts"])
 def test_P3_control_every_clinical_mp_agent_path_is_named(tmp_path, canon, path):
     (canon / "SCP_Agent_Inventory_v0-1.md").write_text(INVENTORY)
     assert not opex(brief(tmp_path, allowed="`%s`" % path))["OPX-2"].ok
+
+
+# ── [ORCH-PREFIRE-SIM-PATHS-1] Kanban 652: OPX-2 treats server/simulation/** as agent-runtime code ──
+@pytest.mark.parametrize("path", ["server/simulation/engine.ts", "server/simulation/**",
+                                  "server/simulation/plan/read-current-plan.ts"])
+def test_sim_P1_a_simulation_engine_path_needs_a_policy_id(tmp_path, canon, path):
+    (canon / "SCP_Agent_Inventory_v0-1.md").write_text(INVENTORY)
+    v = opex(brief(tmp_path, allowed="`%s`" % path))["OPX-2"]
+    assert not v.ok and v.line.startswith("OPX-2 ❌")
+    assert "%s (server/simulation/**)" % path in v.line
+
+
+@pytest.mark.parametrize("listed, ok", [("AP-SIM-ENGINE", True), ("AP-TONI", False)])
+def test_sim_P2_the_cited_id_must_be_in_the_newest_inventory(tmp_path, canon, listed, ok):
+    (canon / "SCP_Agent_Inventory_v0-1.md").write_text("| Policy ID | Agent |\n|---|---|\n| `%s` | x |\n" % listed)
+    b = brief(tmp_path, allowed="`server/simulation/engine.ts`", header="## Agent policy: AP-SIM-ENGINE\n")
+    assert opex(b)["OPX-2"].ok is ok
+
+
+def test_sim_P3_control_the_path_list_gains_exactly_the_one_glob():
+    data = json.loads(prefire.OPEX_PATHS.read_text(encoding="utf-8"))
+    assert data["agent_runtime"]["clinical-mp"] == ["src/lib/agentic-runtime/**", "src/daemon/**",
+                                                    "src/lib/agentic-drafts/**", "server/**/agent*",
+                                                    "server/simulation/**"]
+
+
+@pytest.mark.parametrize("path, hits", [("server/routes/agent-runner.ts", ["server/**/agent*"]),
+                                        ("src/lib/simulation/engine/run.ts", []),
+                                        ("server/__tests__/simulation/run-writer.test.ts", []),
+                                        ("server/router.ts", [])])
+def test_sim_P4_control_the_new_glob_is_not_widened(path, hits):
+    globs = prefire.opex_paths("agent_runtime", "clinical-mp")
+    assert [g for g in globs if prefire.path_matches(path, g)] == hits
 
 
 @pytest.mark.parametrize("allowed", ["`orchestrator.py` (fire command only)", "`executor/hooks/kill_switch.sh`"])
@@ -275,7 +309,7 @@ def test_P4_control_an_unreadable_path_list_fails_closed(tmp_path, monkeypatch):
 def test_P4_control_the_path_lists_are_data_and_carry_the_briefs_paths():
     data = json.loads(prefire.OPEX_PATHS.read_text(encoding="utf-8"))
     assert {"src/lib/agentic-runtime/**", "src/daemon/**", "src/lib/agentic-drafts/**",
-            "server/**/agent*"} <= set(data["agent_runtime"]["clinical-mp"])
+            "server/**/agent*", "server/simulation/**"} <= set(data["agent_runtime"]["clinical-mp"])
     assert {"orchestrator.py", "executor/**"} <= set(data["agent_runtime"]["orchestrator"])
     assert {"src/lib/cds/**", "src/lib/clinical/**", "src/lib/fhir/**", "src/lib/pros/**",
             "scripts/migrat*"} <= set(data["protected"]["clinical-mp"])

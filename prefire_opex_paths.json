@@ -6,7 +6,8 @@
       "src/lib/agentic-runtime/**",
       "src/daemon/**",
       "src/lib/agentic-drafts/**",
-      "server/**/agent*"
+      "server/**/agent*",
+      "server/simulation/**"
     ],
     "orchestrator": [
       "orchestrator.py",
