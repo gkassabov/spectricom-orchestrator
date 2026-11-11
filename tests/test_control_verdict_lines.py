@@ -50,6 +50,8 @@ C = {
     "baseline-trust": ("_unit_baseline_measure_or_reuse", "_unit_baseline_related"),
     # ORCH-TONI-GUARDS-1 (route 394): an eighth, one line per fire: ON, OFF (TONI_GUARDS=off) or BLOCKED
     "guards": "_toni_guards_apply",
+    # ORCH-EXECUTOR-AUTH-PROBE-1: a ninth control, one line per fire
+    "executor-auth": "_executor_auth_check",
 }
 # the canon_assert predicates behind C: every call site must sit in a function that speaks
 C_PREDICATES = {"check_handback_invariants", "check_bg_ceiling_invariants", "check_clock_plausibility",

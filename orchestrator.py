@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A1/A2/A8)
 import admission  # [ORCH-CAPACITY-1] C1: whether a route may start now — the daemon's fire loop asks it too
+import executor_auth  # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C3/G-C4: is the executor logged in (called through the module)
 # ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
 # shared with the tests; canon_assert imports nothing from here.
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
@@ -1171,6 +1172,8 @@ INCOMPLETE_VERDICT = "INCOMPLETE(executor)"
 # signal, a non-zero exit). No gate ran; the work sits on its branch for a person to salvage.
 INCOMPLETE_TIMEOUT_VERDICT = "INCOMPLETE(timeout)"
 INCOMPLETE_EXECUTOR_ERROR_VERDICT = "INCOMPLETE(executor-error)"
+# [ORCH-EXECUTOR-AUTH-PROBE-1] G-C4: a non-zero exit whose short output is a sign-in failure (602a, 2026-11-11).
+INCOMPLETE_EXECUTOR_AUTH_VERDICT = "INCOMPLETE(executor-auth)"
 HANDBACK_GUARD_CONFIG = ORCH_DIR / "config" / "handback-guard.json"
 
 
@@ -6359,16 +6362,36 @@ def _handback_hold(out_log: str) -> Optional[HandbackHold]:
                         f"{GateOutcome.BLOCKED_ENV.value} — handback guard: {reason}")
 
 
-def _executor_exit_hold(ec: int, branch: str) -> Optional[HandbackHold]:
+def _executor_exit_hold(ec: int, branch: str, out_log: Optional[str] = None) -> Optional[HandbackHold]:
     """[ORCH-TIMEOUT-HOLD-1] P-MERGE: merged(r) ⇒ ec(r) == 0 ∧ handback(r) CLEAN ∧ gates(r) PASS. None
     ⇒ exit 0, and the handback guard judges next. An executor that did not exit 0 but left work on
     the tree is INCOMPLETE — exit -1 (fire_toni's timeout kill) ⇒ INCOMPLETE(timeout), any other ⇒
     INCOMPLETE(executor-error) — and is held exactly like a handback hold: the work is committed on
     its branch, no gate runs, nothing merges. Salvage stays possible and is an operator act; the
-    error names the command that starts it. One `🛡 executor-exit:` line either way (P-SAY)."""
+    error names the command that starts it. One `🛡 executor-exit:` line either way (P-SAY).
+    [ORCH-EXECUTOR-AUTH-PROBE-1] G-C4: a non-zero exit (not the timeout kill) whose short output in `out_log` is a
+    sign-in failure ⇒ INCOMPLETE(executor-auth), the line quoted."""
     if ec == 0:
         log.info("🛡 executor-exit: CLEAN — exit 0")
         return None
+    auth_line = None
+    if ec != -1 and out_log:
+        try:
+            lines = Path(out_log).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        rules = [i for i, l in enumerate(lines) if l.strip() == "=" * 60]   # fire_toni's header rule … trailer rule
+        if rules:
+            body = lines[rules[0] + 1:rules[-1] if len(rules) > 1 else len(lines)]
+            auth_line = executor_auth.auth_failure_line("\n".join(body))
+    if auth_line:
+        verdict = INCOMPLETE_EXECUTOR_AUTH_VERDICT
+        error = (f"{verdict} — the executor could not sign in (exit {ec}): \"{auth_line}\". No gate run, nothing "
+                 f"merged. {executor_auth.AUTH_FIX} Then re-enqueue the brief; inspect: cd {PROJECT_ROOT} && git log "
+                 f"--oneline {MERGE_TARGET}..{branch}")
+        log.error(f"⛔ {error}")
+        log.error(f"🛡 executor-exit: HOLD — {verdict}: exit {ec} on {branch}")
+        return HandbackHold(Status.INCOMPLETE, verdict, f"exit {ec}", error, source="EXECUTOR EXIT")
     verdict = INCOMPLETE_TIMEOUT_VERDICT if ec == -1 else INCOMPLETE_EXECUTOR_ERROR_VERDICT
     why = f"killed at the {TONI_TIMEOUT // 60}m route timeout" if ec == -1 else "the executor did not exit 0"
     error = (f"{verdict} — executor exit {ec} ({why}) with work on the tree; no gate run, nothing "
@@ -6476,6 +6499,34 @@ def _regate_bring(proj: Path, branch_name: Optional[str], batch_file: Path, spec
     return None
 
 
+def _executor_auth_check(batch_file: Path) -> Optional[Result]:
+    """[ORCH-EXECUTOR-AUTH-PROBE-1] G-C3: one `🛡 executor-auth:` line per fire. None ⇒ fire; a Result ⇒ refused before
+    any branch or worktree is cut (exit 2, Status.FAILED, no gate — a prefire refusal's shape, never FAIL(product)).
+    The queue daemon's own fresh check (EXECUTOR_AUTH_CHECKED) is not repeated: one live call per fire."""
+    if PREFIRE_BYPASS:
+        log.warning("🛡 executor-auth: SKIPPED — --force bypasses all safety checks")
+        return None
+    if executor_auth.probe_off():
+        log.warning(f"🛡 executor-auth: OFF — {executor_auth.PROBE_VAR}=off, not checked")
+        return None
+    checked = executor_auth.checked_by_daemon()
+    if checked:
+        log.info(f"🛡 executor-auth: CLEAN — checked by the queue daemon at {checked}")
+        return None
+    timeout = prefire_timeout(batch_file)
+    v = executor_auth.probe(within_s=timeout[0] * 60 if timeout else None)
+    if v.ok:
+        log.info(f"🛡 executor-auth: CLEAN — {v.detail}")
+        return None
+    fix = executor_auth.fix_for(v.kind)
+    log.error(f"🛡 executor-auth: BLOCKED — {v.detail}; not fired. {fix}")
+    error = (f"executor-auth: {v.detail} — not fired, no branch cut. {fix}" if v.kind == "auth" else
+             f"BLOCKED(environment) — executor check: {v.detail} — not fired, no branch cut. {fix}")
+    _now = datetime.now().isoformat()
+    return Result(batch_file=batch_file.name, status=Status.FAILED, started=_now, finished=_now, duration_s=0.0,
+                  exit_code=2, briefs=0, error=error)
+
+
 def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     # HOOK-1 / D-S7CORE4-02 — assertions checked at the moment of action.
     if not PREFIRE_BYPASS and not prefire.report(batch_file, timeout=prefire_timeout(batch_file)):
@@ -6493,6 +6544,11 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     if REGATE is not None:
         log.info(f"🔁 Re-gate (gates only): {REGATE.branch}@{REGATE.sha[:7]} — prior verdict {REGATE.prior}; no "
                  f"executor runs ({REGATE_VAR}=off refuses such a file)")
+    else:
+        # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C3: the executor's login, before any branch or worktree is cut
+        refused = _executor_auth_check(batch_file)
+        if refused is not None:
+            return refused
     # [ORCH-PREFIRE-RUNTIME-1] D3: read once per route; _create_route_worktree and _run_unit_baseline use it.
     global ISOLATED_DEPS
     ISOLATED_DEPS = parse_isolated_deps(batch_file)
@@ -6728,7 +6784,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # executor that was killed, or that failed, are not asked (the guard is not engaged).
     hold = None
     if tamper is None and status == Status.PASSED and regate is None:   # a re-gate has no executor to judge
-        hold = (_executor_exit_hold(ec, branch_name or f"{BRANCH_PREFIX}-{batch_file.stem}")
+        hold = (_executor_exit_hold(ec, branch_name or f"{BRANCH_PREFIX}-{batch_file.stem}", out_log)
                 or _handback_hold(out_log))
     if tamper is not None:
         # [ORCH-10] S2: not `passed`, and not `failed(product)` either — the run was handed a

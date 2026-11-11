@@ -201,8 +201,8 @@ class TestVerdict:
     def test_verdicts_are_distinct(self):
         vs = {orchestrator.INCOMPLETE_TIMEOUT_VERDICT, orchestrator.INCOMPLETE_EXECUTOR_ERROR_VERDICT,
               orchestrator.INCOMPLETE_VERDICT, orchestrator.TAMPER_VERDICT, orchestrator.MERGE_CONFLICT_VERDICT,
-              *(g.value for g in orchestrator.GateOutcome)}
-        assert len(vs) == 8
+              orchestrator.INCOMPLETE_EXECUTOR_AUTH_VERDICT, *(g.value for g in orchestrator.GateOutcome)}
+        assert len(vs) == 9
         assert (orchestrator.INCOMPLETE_TIMEOUT_VERDICT, orchestrator.INCOMPLETE_EXECUTOR_ERROR_VERDICT) == \
             ("INCOMPLETE(timeout)", "INCOMPLETE(executor-error)")
 

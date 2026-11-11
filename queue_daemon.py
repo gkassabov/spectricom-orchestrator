@@ -35,13 +35,14 @@ Can also run standalone for testing:
 
 import os, re, sys, json, time, shlex, shutil, signal, threading, subprocess
 from pathlib import Path
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone
 from typing import Optional
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import admission   # [ORCH-CAPACITY-1] C1: whether a route may start now; C4: the wall it runs under
+import executor_auth   # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C2: is the executor logged in, once per fire after admission
 import prefire     # [ORCH-DEPENDS-ON-1] D4: a brief's `## Depends-on:` routes, judged as A11 judges them
 # QUEUE-RETIRE-1: one implementation of the trunk invariant, shared by the boot path and the
 # tests. It lives with the other boot asserts; nothing here reimplements it.
@@ -133,7 +134,8 @@ def resume_command(reason: str) -> str:
 def pause_notice_text(n: dict) -> str:
     """[ORCH-LANE-1] O2: the notice as one Slack message."""
     return (f":double_vertical_bar: Spectricom queue PAUSED — {n.get('reason')} (since {n.get('at')}). "
-            f"Next brief: {n.get('next_brief') or '(queue empty)'}. Nothing fires until: `{n.get('resume')}`")
+            f"Next brief: {n.get('next_brief') or '(queue empty)'}. Nothing fires until: `{n.get('resume')}`"
+            + (f" — {n['detail']}" if n.get("detail") else ""))   # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C2
 
 
 def notify_slack(text: str) -> str:
@@ -888,18 +890,19 @@ class QueueDaemon:
         self._save_state()
         return {"ok": True, "queued": src.name, "queue_count": len(self._scan_queue())}
 
-    def _mark_paused(self, reason: str, say: bool = True):
+    def _mark_paused(self, reason: str, say: bool = True, detail: Optional[str] = None):
         """[QUEUE-PAUSE-OPAQUE] P-PAUSE: every transition into `paused` says why and since when. The
         caller saves, holding the lock where it has to — this takes none. `say=False`: the caller prints
-        its own line (a start says once which way it went)."""
+        its own line (a start says once which way it went). `detail`: the notice's `detail` key
+        ([ORCH-EXECUTOR-AUTH-PROBE-1] G-C2)."""
         self.status = "paused"
         self.paused_reason = reason
         self.paused_at = datetime.now().isoformat()
         if say:
             print(f"[QUEUE] PAUSED — {reason}. Resume without a restart: {resume_command(reason)}")
-        self._write_pause_notice()
+        self._write_pause_notice(detail)
 
-    def _write_pause_notice(self):
+    def _write_pause_notice(self, detail: Optional[str] = None):
         """[ORCH-LANE-1] O2: the notice of the pause just taken, on disk at once; Slack follows from
         run_loop's next poll (_send_pause_notice), never under the lock. Only the daemon announces: a CLI
         object's pause is not the daemon's (DAEMON_OWNED_KEYS)."""
@@ -909,6 +912,8 @@ class QueueDaemon:
         notice = {"reason": self.paused_reason, "at": self.paused_at,
                   "next_brief": queue[0].name if queue else None, "queued": len(queue),
                   "resume": resume_command(self.paused_reason), "pid": os.getpid(), "slack": None}
+        if detail:
+            notice["detail"] = detail
         try:
             pause_notice_file().parent.mkdir(parents=True, exist_ok=True)
             _write_json_atomic(pause_notice_file(), notice)
@@ -1489,6 +1494,11 @@ class QueueDaemon:
             claim = admission.claim_path(ORCH_DIR)
             self.waiting = self._waiting_said = None
             print(f"[QUEUE] 🛡 admission: {why}")
+            # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C2: once per fire, after admission's yes and the claim — never in a wait
+            # loop. A refusal releases the claim and pauses (George's resume); the brief stays first in queue/.
+            fire, auth_checked = self._executor_auth_step(next_batch, batch_name, claim)
+            if not fire:
+                continue
             # C4: this route's wall — its brief's route timeout, as orchestrator.py derives it, + its gates' budget.
             wall = admission.route_wall(next_batch, b_repo, config_path=REPOS_CONFIG)
 
@@ -1496,7 +1506,8 @@ class QueueDaemon:
 
             cmd = (
                 f"cd {ORCH_DIR} && unset ANTHROPIC_API_KEY && "
-                f"{admission.CLAIM_ENV}={shlex.quote(str(claim))} "
+                + (f"{executor_auth.CHECKED_VAR}={shlex.quote(auth_checked)} " if auth_checked else "")
+                + f"{admission.CLAIM_ENV}={shlex.quote(str(claim))} "
                 f"python3 -u orchestrator.py run {next_batch} --approve "
                 f"--repo {b_repo} --model {b_model} --effort {b_effort}"
             )
@@ -1662,6 +1673,41 @@ class QueueDaemon:
             self._save_state()
         if self.status == "running":
             time.sleep(self.config["cooldown_seconds"] or PAUSED_POLL_S)
+
+    def _executor_auth_step(self, next_batch: Path, batch_name: str, claim: Path) -> tuple[bool, Optional[str]]:
+        """[ORCH-EXECUTOR-AUTH-PROBE-1] G-C2: (fire?, the EXECUTOR_AUTH_CHECKED value for the route command). Off or a
+        gates-only re-gate ⇒ no probe. Not ok ⇒ the claim is released, nothing fires, the brief stays first in queue/,
+        and the daemon pauses — executor-auth:<brief> (only George can fix it) or executor-check:<brief>
+        (BLOCKED(environment)). Never lifted by the daemon itself: George's resume."""
+        if executor_auth.probe_off():
+            print(f"[QUEUE] 🛡 executor-auth: OFF ({executor_auth.PROBE_VAR}=off) — not checked")
+            self._auth_said = "OFF"
+            return True, None
+        if prefire.regate_line(next_batch) is not None:
+            return True, None
+        checked = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        v = executor_auth.probe()
+        if v.ok:
+            if getattr(self, "_auth_said", None) != "CLEAN":
+                print(f"[QUEUE] 🛡 executor-auth: CLEAN — {v.detail}")
+            self._auth_said = "CLEAN"
+            return True, checked
+        admission.release(claim)
+        fix = executor_auth.fix_for(v.kind)
+        if v.kind == "auth":
+            reason = (f"executor-auth:{batch_name} — Toni's login has expired or been refused; only George can fix "
+                      f"it: run claude, then /login, then resume")
+        else:
+            reason = (f"executor-check:{batch_name} — BLOCKED(environment): the executor check could not reach a "
+                      f"verdict; not a login problem — check the network and the claude CLI, then resume")
+        with self.lock:
+            self.current_batch = None
+            self._mark_paused(reason, say=False, detail=f"{v.detail} {fix}")
+            self._save_state()
+        self._auth_said = "BLOCKED"
+        print(f"[QUEUE] 🛡 executor-auth: BLOCKED — {v.detail} — {batch_name} not fired; {fix} "
+              f"Then: {resume_command(reason)}")
+        return False, None
 
     def _wait_for_unkill(self, batch_name: str, killed: dict):
         """[ORCH-TONI-GUARDS-1] KILL exists: nothing fired, the brief stays in queue/, and the loop looks again after
