@@ -45,6 +45,8 @@ ENFORCED:
                       inventory file yet ⇒ warning, pass.
   OPX-3 George go   — ALLOWED FILES naming a never-autonomous path (prefire_opex_paths.json `protected`) ⇒ a
                       '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying George … go / agreed.
+                      A go line that is a placeholder (OWED, pending, TBD, …), empty, or carries no ruling id / go word /
+                      timed quote is no go; words in quotes are George's.  [ORCH-PREFIRE-GO-TYPED-1] D-S7CORE50-27.
                       OPX-2/-3 refuse a brief on row >= 393 with no ALLOWED FILES section (fail closed).
 
   Re-gate          — a brief whose header has '## Re-gate of: <route branch> <sha>' is a gates-only route
@@ -529,9 +531,22 @@ _WORD = re.compile(r"[A-Za-z0-9][\w'’/.-]*")
 _NOT_EDITED = re.compile(r'\*{0,2}read[- ]only\*{0,2}\s*:|\*\*not\*\*', re.IGNORECASE)   # rest of the line names no edit
 _PATH_WORD = re.compile(r'`(?P<span>[^`\n]+)`|(?P<word>[^\s`,;()\[\]]+)')   # a code span, or a bare word
 _POLICY_ID = re.compile(r'(?<![A-Za-z0-9-])AP-[A-Z0-9]+(?:-[A-Z0-9]+)*')
-_GEORGE_GO_LINE = re.compile(r'^##\s*George go\s*:[ \t]*(?P<text>\S.*)$', re.MULTILINE | re.IGNORECASE)
+_GEORGE_GO_LINE = re.compile(r'^##\s*George go\s*:(?P<text>.*)$', re.MULTILINE | re.IGNORECASE)   # empty text too
 _GO_HEADERS = re.compile(r'^##\s*(?:Briefs|Spec reference)\s*:.*$', re.MULTILINE)
 _GEORGE_GO = re.compile(r'George[^\n]{0,80}\b(go|GO|agreed|Agree)\b')
+# [ORCH-PREFIRE-GO-TYPED-1] D-S7CORE50-27 "any non-go text reads as no go": what a go text may not carry outside George's
+# quoted words and cited code spans, and the evidence it must carry somewhere.
+GO_PLACEHOLDERS = ("OWED", "PENDING", "TBD", "TBC", "TODO", "AWAITING", "NOT YET", "TO BE ASKED", "TO ASK", "PLACEHOLDER")
+GO_EMPTY_ALONE = ("?", "…", "...", "n/a", "none", "-")
+GO_WORDS = ("go", "approve", "approved", "approves", "agree", "agreed", "agrees", "yes", "grant", "granted", "ok")
+_GO_PLACEHOLDER = re.compile(r'\b(?:%s)\b' % "|".join(
+    r"\s+".join(map(re.escape, w.split())) for w in sorted(GO_PLACEHOLDERS, key=len, reverse=True)), re.IGNORECASE)
+_GO_TEMPLATE = re.compile(r'<[^<>\n]*>|\{[^{}\n]*\}')
+_GO_QUOTED = re.compile(r'"[^"\n]*"|“[^”\n]*”')
+_GO_SPAN = re.compile(r'`[^`\n]*`|"[^"\n]*"|“[^”\n]*”')        # a code span or a double-quoted span
+_GO_RULING_ID = re.compile(r'\bD-[A-Z0-9]+(?:-\d+)+\b')
+_GO_WORD = re.compile(r'\b(?:%s)\b' % "|".join(GO_WORDS), re.IGNORECASE)
+_GO_TIME = re.compile(r'\b\d{1,2}:\d[\dx]\b')
 
 
 @dataclass(frozen=True)
@@ -770,18 +785,78 @@ def check_agent_policy(filepath: Path, paths: Optional[list[str]]) -> OpexVerdic
                                                          "; cited but not listed: %s" % ", ".join(cited) if cited else ""))
 
 
-def george_go(filepath: Path) -> Optional[str]:
-    """OPX-3: the brief's George go — a `## George go: …` line, else the first `## Briefs:` / `## Spec reference:` line
-    matching George[^\\n]{0,80}\\b(go|GO|agreed|Agree)\\b — as the text that says it; None when there is none."""
-    text = _read(filepath)
-    m = _GEORGE_GO_LINE.search(text)
+def _go_text_problem(text: str) -> Optional[str]:
+    """[ORCH-PREFIRE-GO-TYPED-1] G-B3: None when `text` is a go — no placeholder or template marker outside its
+    double-quoted spans (George's words) and code spans (cited paths), and a ruling id, a go word, or a time with a
+    quoted span somewhere in it. Else why not: 'empty', "placeholder '<token>'", "template marker '<marker>'", or 'no
+    ruling id, go word or timed quote'."""
+    t = text.strip()
+    if not t:
+        return "empty"
+    if t.lower() in GO_EMPTY_ALONE:
+        return "placeholder '%s'" % t
+    rest = _GO_SPAN.sub(" ", t)
+    m = _GO_PLACEHOLDER.search(rest)
     if m:
-        return m.group(0).strip()
+        return "placeholder '%s'" % m.group(0)
+    m = _GO_TEMPLATE.search(rest)
+    if m:
+        return "template marker '%s'" % m.group(0)
+    if _GO_RULING_ID.search(t) or _GO_WORD.search(t) or (_GO_TIME.search(t) and _GO_QUOTED.search(t)):
+        return None
+    return "no ruling id, go word or timed quote"
+
+
+def _go_clause(line: str, start: int, end: int) -> str:
+    """G-B2: the fallback's judged span — from the George … go match at line[start:end] to the end of its clause: the
+    first ';', '**' or '. ' after the match, outside a quoted or code span, else the line's end (')' ends nothing)."""
+    closer, i = None, start
+    while i < len(line):
+        c = line[i]
+        if closer:
+            closer = None if c == closer else closer
+        elif c in '`"“':
+            closer = {"`": "`", '"': '"', "“": "”"}[c]
+        elif i >= end and (c == ";" or line.startswith("**", i) or line.startswith(". ", i)):
+            return line[start:i]
+        i += 1
+    return line[start:]
+
+
+def _judge_george_go(filepath: Path) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """(go_text, judged_text, why_not) — G-B2: every '## George go:' line decides when there is one (all must pass; the
+    first that fails is named); else the first '## Briefs:' / '## Spec reference:' line George … go matches, judged on
+    that clause. (None, None, None) when the brief has no go text at all."""
+    text = _read(filepath)
+    lines = list(_GEORGE_GO_LINE.finditer(text))
+    if lines:
+        for m in lines:
+            why = _go_text_problem(m.group("text"))
+            if why:
+                return None, m.group(0).strip(), why
+        return lines[0].group(0).strip(), lines[0].group(0).strip(), None
     for line in _GO_HEADERS.finditer(text):
         g = _GEORGE_GO.search(line.group(0))
         if g:
-            return g.group(0)
-    return None
+            span = _go_clause(line.group(0), g.start(), g.end())
+            why = _go_text_problem(span)
+            return (None if why else g.group(0)), span, why
+    return None, None, None
+
+
+def george_go_verdict(filepath: Path) -> tuple[Optional[str], Optional[str]]:
+    """[ORCH-PREFIRE-GO-TYPED-1] OPX-3's one judge of a go text: (go_text, None) for a go; (None, why_not) for a go line
+    (or George … go fallback clause) that is not one — a placeholder, empty, or no go evidence (D-S7CORE50-27: any
+    non-go text reads as no go); (None, None) when the brief carries no go text at all."""
+    go, _judged, why = _judge_george_go(filepath)
+    return go, why
+
+
+def george_go(filepath: Path) -> Optional[str]:
+    """OPX-3: the brief's George go — a `## George go: …` line, else the first `## Briefs:` / `## Spec reference:` line
+    matching George[^\\n]{0,80}\\b(go|GO|agreed|Agree)\\b — as the text that says it; None when there is none or when
+    it is not a go (george_go_verdict)."""
+    return george_go_verdict(filepath)[0]
 
 
 def check_george_go(filepath: Path, paths: Optional[list[str]]) -> OpexVerdict:
@@ -795,9 +870,13 @@ def check_george_go(filepath: Path, paths: Optional[list[str]]) -> OpexVerdict:
         return OpexVerdict(False, "OPX-3 ❌ NEVER-AUTONOMOUS — the protected path list cannot be read: %s (fails closed)" % e)
     if not named:
         return OpexVerdict(True, "OPX-3 ✅ no never-autonomous path in ALLOWED FILES" + _bare_note(paths))
-    go = george_go(filepath)
+    go, judged, why = _judge_george_go(filepath)
     if go:
         return OpexVerdict(True, "OPX-3 ✅ never-autonomous path(s) %s — George go: '%s'" % (_list(named), go[:100]))
+    if why:
+        return OpexVerdict(False, "OPX-3 ❌ NEVER-AUTONOMOUS — ALLOWED FILES name protected path(s) %s and the brief's "
+                                  "George go is not a go: '%s' (%s) — any non-go text reads as no go (D-S7CORE50-27)"
+                                  % (_list(named), judged[:80], why))
     return OpexVerdict(False, "OPX-3 ❌ NEVER-AUTONOMOUS — ALLOWED FILES name protected path(s) %s and the brief carries "
                               "no George go: a '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying "
                               "George … go / agreed (D-S7CORE33-20)" % _list(named))
