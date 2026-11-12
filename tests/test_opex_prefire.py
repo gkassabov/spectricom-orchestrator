@@ -150,12 +150,12 @@ def test_P3_daemon_path_citing_no_listed_policy_is_refused(tmp_path, canon):
         "AP-NOT-LISTED. Cite one, e.g. '## Agent policy: AP-…' (D-S7CORE33-20)"]
 
 
-def test_P3_no_inventory_warns_and_passes(tmp_path, canon):
+def test_P3_no_inventory_refuses(tmp_path, canon):
     b = brief(tmp_path, allowed="`src/daemon/x.ts`")
-    assert prefire.check(b) == []
-    assert opex(b)["OPX-2"].line == ("OPX-2 ⚠ agent-runtime path(s) src/daemon/x.ts (src/daemon/**) — no "
-                                   "SCP_Agent_Inventory_v*.md in %s yet, so no policy id can be checked: warning, "
-                                   "pass (D-S7CORE33-20)" % canon)
+    assert prefire.check(b) == ["OPX-2 ❌ AGENT-POLICY — ALLOWED FILES name agent-runtime path(s) src/daemon/x.ts "
+                                "(src/daemon/**) and there is no SCP_Agent_Inventory_v*.md in %s, so no policy id can "
+                                "be checked (fails closed; OC-4, D-S7CORE51-20)" % canon]
+    assert not opex(b)["OPX-2"].ok
 
 
 def test_P3_control_the_newest_inventory_is_read(tmp_path, canon):
@@ -174,7 +174,7 @@ def test_P3_control_an_unreadable_canon_folder_fails_closed(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("path", ["src/lib/agentic-runtime/tools.ts", "src/lib/agentic-drafts/draft-queue.ts",
                                   "server/routes/agent-runner.ts", "server/agents/x.ts", "src/daemon/**",
-                                  "server/simulation/engine.ts"])
+                                  "server/simulation/engine.ts", "src/lib/agentic-ops/routing.ts"])
 def test_P3_control_every_clinical_mp_agent_path_is_named(tmp_path, canon, path):
     (canon / "SCP_Agent_Inventory_v0-1.md").write_text(INVENTORY)
     assert not opex(brief(tmp_path, allowed="`%s`" % path))["OPX-2"].ok
@@ -201,7 +201,7 @@ def test_sim_P3_control_the_path_list_gains_exactly_the_one_glob():
     data = json.loads(prefire.OPEX_PATHS.read_text(encoding="utf-8"))
     assert data["agent_runtime"]["clinical-mp"] == ["src/lib/agentic-runtime/**", "src/daemon/**",
                                                     "src/lib/agentic-drafts/**", "server/**/agent*",
-                                                    "server/simulation/**"]
+                                                    "server/simulation/**", "src/lib/agentic-ops/**"]
 
 
 @pytest.mark.parametrize("path, hits", [("server/routes/agent-runner.ts", ["server/**/agent*"]),
@@ -309,18 +309,19 @@ def test_P4_control_an_unreadable_path_list_fails_closed(tmp_path, monkeypatch):
 def test_P4_control_the_path_lists_are_data_and_carry_the_briefs_paths():
     data = json.loads(prefire.OPEX_PATHS.read_text(encoding="utf-8"))
     assert {"src/lib/agentic-runtime/**", "src/daemon/**", "src/lib/agentic-drafts/**",
-            "server/**/agent*", "server/simulation/**"} <= set(data["agent_runtime"]["clinical-mp"])
+            "server/**/agent*", "server/simulation/**", "src/lib/agentic-ops/**"} <= set(data["agent_runtime"]["clinical-mp"])
     assert {"orchestrator.py", "executor/**"} <= set(data["agent_runtime"]["orchestrator"])
     assert {"src/lib/cds/**", "src/lib/clinical/**", "src/lib/fhir/**", "src/lib/pros/**",
             "scripts/migrat*"} <= set(data["protected"]["clinical-mp"])
-    assert {"executor/**", "orchestrator.py"} <= set(data["protected"]["orchestrator"])
+    assert {"executor/**", "orchestrator.py", "prefire.py", "prefire_opex_paths.json", "queue_daemon.py",
+            "admission.py"} <= set(data["protected"]["orchestrator"])
     assert "*.env*" in data["protected"]["*"]
 
 
 # ── P5 · PREFIRE_OPEX=off skips OPX-1/-2/-3, loudly ─────────────────────────
 def test_P5_prefire_opex_off_skips_opx_1_to_3_with_a_loud_line(tmp_path, monkeypatch, capsys):
     b = brief(tmp_path, opex="", allowed="`src/lib/cds/x.ts`, `src/daemon/x.ts`")
-    assert len(prefire.check(b)) == 2                      # OPX-1 + OPX-3 (no inventory: OPX-2 warns)
+    assert len(prefire.check(b)) == 3                      # OPX-1 + OPX-2 + OPX-3 (no inventory: OPX-2 refuses)
     monkeypatch.setenv("PREFIRE_OPEX", "Off")
     assert prefire.check_opex(b) == [] and prefire.check(b) == []
     assert prefire.report(b) is True

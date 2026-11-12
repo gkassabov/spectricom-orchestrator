@@ -42,7 +42,7 @@ ENFORCED:
                       reason of >= 3 words); rows below are grandfathered.  [ORCH-OPEX-PREFIRE-1] D-S7CORE33-20.
   OPX-2 agent policy — ALLOWED FILES naming an agent-runtime path (prefire_opex_paths.json `agent_runtime`) ⇒ the
                       brief cites an AP-… id the newest SCP_Agent_Inventory_v*.md in the canon folder lists. No
-                      inventory file yet ⇒ warning, pass.
+                      inventory file ⇒ a refusal (fail closed; OC-4, D-S7CORE51-20).
   OPX-3 George go   — ALLOWED FILES naming a never-autonomous path (prefire_opex_paths.json `protected`) ⇒ a
                       '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying George … go / agreed.
                       A go line that is a placeholder (OWED, pending, TBD, …), empty, or carries no ruling id / go word /
@@ -751,8 +751,8 @@ def _unjudged(tag: str, filepath: Path, paths: Optional[list[str]]) -> Optional[
 
 def check_agent_policy(filepath: Path, paths: Optional[list[str]]) -> OpexVerdict:
     """OPX-2. ALLOWED FILES naming an agent-runtime path ⇒ the brief cites an Agent Policy id (AP-…) that the
-    newest SCP_Agent_Inventory_v*.md in the canon folder lists. No inventory file there yet ⇒ a warning, and a pass;
-    the canon folder or the inventory unreadable ⇒ a refusal."""
+    newest SCP_Agent_Inventory_v*.md in the canon folder lists. No inventory file ⇒ a refusal (fail closed; OC-4,
+    D-S7CORE51-20); the canon folder or the inventory unreadable ⇒ a refusal."""
     early = _unjudged("OPX-2", filepath, paths)
     if early:
         return early
@@ -768,8 +768,9 @@ def check_agent_policy(filepath: Path, paths: Optional[list[str]]) -> OpexVerdic
                                   "%s is unreadable, so no policy id can be checked (fails closed)" % (_list(named), canon))
     newest = disk_family(canon, re.escape(AGENT_INVENTORY), AGENT_INVENTORY).newest
     if newest is None:
-        return OpexVerdict(True, "OPX-2 ⚠ agent-runtime path(s) %s — no %s_v*.md in %s yet, so no policy id can be "
-                                 "checked: warning, pass (D-S7CORE33-20)" % (_list(named), AGENT_INVENTORY, canon))
+        return OpexVerdict(False, "OPX-2 ❌ AGENT-POLICY — ALLOWED FILES name agent-runtime path(s) %s and there is no "
+                                  "%s_v*.md in %s, so no policy id can be checked (fails closed; OC-4, D-S7CORE51-20)"
+                                  % (_list(named), AGENT_INVENTORY, canon))
     try:
         listed = set(_POLICY_ID.findall((canon / newest[1]).read_text(encoding="utf-8", errors="replace")))
     except OSError as e:

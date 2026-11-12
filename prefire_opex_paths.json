@@ -7,7 +7,8 @@
       "src/daemon/**",
       "src/lib/agentic-drafts/**",
       "server/**/agent*",
-      "server/simulation/**"
+      "server/simulation/**",
+      "src/lib/agentic-ops/**"
     ],
     "orchestrator": [
       "orchestrator.py",
@@ -53,8 +54,12 @@
     "_clinical-mp": "CDS rules, clinical logic, FHIR mappings, PROs scoring, auth / AccessPolicy / ClientApplication code, migrations.",
     "orchestrator": [
       "executor/**",
-      "orchestrator.py"
+      "orchestrator.py",
+      "prefire.py",
+      "prefire_opex_paths.json",
+      "queue_daemon.py",
+      "admission.py"
     ],
-    "_orchestrator": "orchestrator.py holds the merge code (merge_branch, run_batch's merge)."
+    "_orchestrator": "orchestrator.py holds the merge code (merge_branch, run_batch's merge). prefire.py, prefire_opex_paths.json, queue_daemon.py and admission.py are the guards and the fire loop: a brief changes them only on George's go (OC-4, D-S7CORE51-20)."
   }
 }
