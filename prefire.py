@@ -48,6 +48,11 @@ ENFORCED:
                       A go line that is a placeholder (OWED, pending, TBD, …), empty, or carries no ruling id / go word /
                       timed quote is no go; words in quotes are George's.  [ORCH-PREFIRE-GO-TYPED-1] D-S7CORE50-27.
                       OPX-2/-3 refuse a brief on row >= 393 with no ALLOWED FILES section (fail closed).
+  DEPCHANGE         — each '## Dependency change: <pkg>@<exact version> (dev|prod) — George go "<George's words>"'
+                      line names an npm package, an exact version (no range, tag or URL) and a go whose quoted words
+                      pass OPX-3's go grammar; a bad line, or two for one package, is a refusal. The fire hands the
+                      good entries to the executor's npm hook as TONI_DEP_CHANGES: the one install it allows.
+                      [ORCH-NPM-FROZEN-1] OC-3, D-S7CORE51-18.
 
   Re-gate          — a brief whose header has '## Re-gate of: <route branch> <sha>' is a gates-only route
                       (orchestrator ORCH-REGATE-GATE-ONLY-1: no executor runs): A2's sizing floor is waived and the
@@ -891,6 +896,73 @@ def check_opex(filepath: Path) -> list[OpexVerdict]:
     return [check_operability(filepath), check_agent_policy(filepath, paths), check_george_go(filepath, paths)]
 
 
+# ── DEPCHANGE: a George-approved exact dependency (ORCH-NPM-FROZEN-1 G-N3; OC-3, D-S7CORE51-18) ──────────────────
+# Routes install only with `npm ci`; the executor's npm hook (executor/hooks/npm_frozen.py) allows `npm install` only
+# for an entry this returns, handed over by fire_toni as TONI_DEP_CHANGES. This is the one owner of the grammar.
+DEP_CHANGE_PKG = re.compile(r'(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*')
+DEP_CHANGE_VERSION = re.compile(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?')
+DEP_CHANGE_KINDS = ("dev", "prod")
+_DEP_CHANGE_LINE = re.compile(r'^##\s*Dependency change\s*:(?P<text>.*)$', re.IGNORECASE)
+_DEP_CHANGE_SHAPE = re.compile(r'\s*(?P<spec>\S+)\s+\((?P<kind>[^()]*)\)\s*[—–-]+\s*(?P<go>George go\b.*)$')
+_DEP_CHANGE_QUOTE = re.compile(r'"(?P<words>[^"\n]*)"(?P<after>.*)$')
+
+
+def _dep_change_problem(text: str) -> tuple[Optional[dict], str, Optional[str]]:
+    """One line's text after 'Dependency change:' → (entry, George's quoted words, None) or (None, '', why not)."""
+    m = _DEP_CHANGE_SHAPE.match(text)
+    if not m:
+        return None, "", "not '<pkg>@<exact version> (dev|prod) — George go \"<George's words>\"'"
+    spec, kind = m.group("spec"), m.group("kind").strip()
+    at = spec.find("@", 1)
+    if at < 0:
+        return None, "", "no version in '%s'" % spec
+    pkg, version = spec[:at], spec[at + 1:]
+    if not DEP_CHANGE_PKG.fullmatch(pkg):
+        return None, "", "'%s' is not an npm package name" % pkg
+    if not DEP_CHANGE_VERSION.fullmatch(version):
+        return None, "", "'%s' is not an exact version (no range, tag, URL or alias)" % version
+    if kind not in DEP_CHANGE_KINDS:
+        return None, "", "the kind is '%s', not dev or prod" % kind
+    q = _DEP_CHANGE_QUOTE.search(m.group("go"))
+    if not q or not q.group("words").strip():
+        return None, "", "no George's words in quotes after 'George go'"
+    why = _go_text_problem(q.group("words") + " " + q.group("after"))
+    if why:
+        return None, "", "the go is not a go: %s" % why
+    return {"pkg": pkg, "version": version, "kind": kind}, q.group("words").strip(), None
+
+
+def _dependency_lines(filepath: Path) -> tuple[list[tuple[dict, str]], list[str]]:
+    good: list[tuple[dict, str]] = []
+    problems: list[str] = []
+    fenced = False
+    for raw in _read(filepath).splitlines():
+        if _FENCE.match(raw):
+            fenced = not fenced
+            continue
+        m = None if fenced else _DEP_CHANGE_LINE.match(raw)
+        if not m:
+            continue
+        entry, quote, why = _dep_change_problem(m.group("text"))
+        if entry and any(e["pkg"] == entry["pkg"] for e, _ in good):
+            entry, why = None, "a second line for %s" % entry["pkg"]
+        if why:
+            shown = raw.strip()
+            problems.append("DEPCHANGE ❌ — '%s' is not a George-approved exact dependency: %s (OC-3, D-S7CORE51-18)"
+                            % (shown if len(shown) <= 80 else shown[:79] + "…", why))
+        else:
+            good.append((entry, quote))
+    return good, problems
+
+
+def dependency_changes(filepath: Path) -> tuple[list[dict], list[str]]:
+    """[ORCH-NPM-FROZEN-1] G-N3: the brief's `## Dependency change:` lines as ([{"pkg", "version", "kind"}, …], the
+    DEPCHANGE ❌ refusals). ([], []) for a brief with no such line or one that cannot be read. Lines inside a code fence
+    are not read."""
+    good, problems = _dependency_lines(filepath)
+    return [e for e, _ in good], problems
+
+
 def check(filepath: Path) -> list[str]:
     """Return a list of assertion failures. Empty list == all checks pass."""
     failures: list[str] = []
@@ -967,6 +1039,7 @@ def check(filepath: Path) -> list[str]:
                         "depends on is on its repo's merge target (F-289)" % "; ".join(map(str, unmet)))
 
     failures += [v.line for v in check_opex(filepath) if not v.ok]     # OPX-1/-2/-3 [ORCH-OPEX-PREFIRE-1]
+    failures += dependency_changes(filepath)[1]                         # DEPCHANGE [ORCH-NPM-FROZEN-1]
 
     return failures
 
@@ -994,6 +1067,9 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
         print("  ⚠⚠ %s=off — OPX-1/-2/-3 (D-S7CORE33-20: Operability & safety, agent policy, George go) "
               "SKIPPED for %s. Unset it to turn the OpEx pre-checks back on." % (OPEX_ENV, filepath.name))
     opex = [v.line for v in check_opex(filepath) if v.ok]               # OPX-1/-2/-3: one line each; a ❌ is a failure
+    opex += ["DEPCHANGE ✅ %s@%s (%s) — George go: '%s'" % (e["pkg"], e["version"], e["kind"],
+                                                         q if len(q) <= 60 else q[:59] + "…")
+             for e, q in _dependency_lines(filepath)[0]]                # [ORCH-NPM-FROZEN-1] after the OPX lines
     if not failures:
         _, row = check_kanban(filepath)
         est = parse_declared_estimate(filepath)

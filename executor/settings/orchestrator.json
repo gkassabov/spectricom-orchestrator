@@ -45,6 +45,15 @@
             "command": "bash \"${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/kill_switch.sh\" || exit 2"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/npm_frozen.py\"; { [ -r \"$f\" ] && command -v python3 >/dev/null; } || { echo \"🛡 npm frozen: the hook could not run (no $f or no python3) — the Bash call is denied (fails closed). Stop and say so in the handback.\" >&2; exit 2; }; python3 \"$f\" || exit 2"
+          }
+        ]
       }
     ]
   }

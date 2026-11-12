@@ -1079,6 +1079,19 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
     env = _toni_guards_apply(guards, toni_child_env(route_timeout_s))
     if env is None:
         return -2, str(out_log)
+    if guards is not None:
+        # [ORCH-NPM-FROZEN-1] G-N4: the brief's George-approved dependency change, for executor/hooks/npm_frozen.py —
+        # the one `npm install` it allows. An inherited value never survives; a read that fails sets nothing.
+        env.pop("TONI_DEP_CHANGES", None)
+        try:
+            deps, problems = prefire.dependency_changes(batch_file)
+            if deps and not problems:
+                env["TONI_DEP_CHANGES"] = json.dumps(deps, separators=(",", ":"))
+                log.info("Dependency change approved for this fire: "
+                         + ", ".join(f"{d['pkg']}@{d['version']} ({d['kind']})" for d in deps))
+        except Exception as e:
+            env.pop("TONI_DEP_CHANGES", None)
+            log.warning(f"Dependency change not read ({type(e).__name__}): no install is allowed for this fire")
     v = check_bg_ceiling_invariants("orchestrator.fire_toni", env, route_timeout_s)
     if v:
         log.error(f"⛔ Toni NOT fired — bg-wait ceiling: {v[0]}")
