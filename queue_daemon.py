@@ -1267,12 +1267,24 @@ class QueueDaemon:
         return held
 
     def _recover_dead_route(self, name: str, branch: str, route: str) -> Optional[str]:
-        """One dead route's repo, by its repos.yaml entry (never a path the marker names). Clean ⇒
-        nothing to do. Dirty on the route's own branch ⇒ the work is the route's: stash it (untracked
-        included) under a message naming the route, rename the branch `<branch>-died-<ts>`, check out
-        the merge target, and say all three in one line. Dirty on any other branch ⇒ not attributable:
-        left exactly as it is, and the start pauses (`start:dirty-tree:<repo>`). Every step is additive
-        — a stash, a rename, a checkout of a clean tree; nothing is reset, removed or deleted."""
+        """One dead route's repo, by its repos.yaml entry (never a path the marker names). Five cases:
+          · clean on the merge target ⇒ nothing to do, nothing said;
+          · clean on the route's own branch ⇒ [ORCH-CRASH-PRIMARY-ON-ROUTE-BRANCH-1] (592, 11-13: the route
+            died mid-gate with its work committed) rename the branch `<branch>-died-<ts>` (its commits kept),
+            check out the merge target, and say both in one line; a step that fails pauses the start
+            (`start:route-branch:<repo>`). Unless an executor (a process whose argv[0] is `claude`, as
+            fire_toni starts it, under setsid so it outlives its orchestrator) still has its working
+            directory at or under the tree: then nothing moves, the line names its pid, and the start pauses
+            (`start:route-branch:<repo>`);
+          · clean on any other branch or a detached HEAD ⇒ left as it is, said in one line (a fire cuts its
+            branch from the merge target);
+          · dirty on the route's own branch ⇒ the work is the route's: stash it (untracked included) under a
+            message naming the route, rename the branch `<branch>-died-<ts>`, check out the merge target,
+            and say all three in one line;
+          · dirty on any other branch ⇒ not attributable: left exactly as it is, and the start pauses
+            (`start:dirty-tree:<repo>`).
+        Every step is additive — a stash, a rename, a checkout of a clean tree; nothing is reset, removed or
+        deleted."""
         repo = repo_route(name)
         tag = f"[QUEUE] 🛡 dead-route-recovery: {name} —"
         if repo is None:
@@ -1288,9 +1300,47 @@ class QueueDaemon:
         if status.returncode != 0:
             print(f"{tag} {path} could not be read ({status.stderr.strip()[-200:]}); not inspected")
             return None
-        if not status.stdout.strip():
-            return None
         on = git("symbolic-ref -q --short HEAD").stdout.strip() or "a detached HEAD"
+        if not status.stdout.strip():
+            if on == target:
+                return None
+            if on != branch:
+                print(f"{tag} {path} is clean on {on}, not on {route}'s branch {branch} or {target}; left as it is")
+                return None
+            held_rb = f"start:route-branch:{name}"
+
+            def executor_in_tree() -> Optional[tuple]:
+                """(pid, cmdline) of a live process whose argv[0] is `claude` and whose cwd is at or under `path`, by
+                path components (`<path>-wt` is not under it); a /proc entry that cannot be read is skipped."""
+                root = Path(path).resolve()
+                for d in sorted((x for x in os.listdir("/proc") if x.isdigit()), key=int):
+                    try:
+                        argv = [a.decode(errors="replace")
+                                for a in Path(f"/proc/{d}/cmdline").read_bytes().split(b"\0") if a]
+                        cwd = Path(os.readlink(f"/proc/{d}/cwd"))
+                    except OSError:
+                        continue
+                    if argv and os.path.basename(argv[0]) == "claude" and (cwd == root or root in cwd.parents):
+                        return int(d), " ".join(argv)
+                return None
+
+            holder = executor_in_tree()
+            if holder:
+                print(f"{tag} {path} is clean on {route}'s branch {branch}, but pid {holder[0]} ({holder[1][:80]}) "
+                      f"still works in it; left as it is — PAUSED ({held_rb})")
+                return held_rb
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            died, tip = f"{branch}-died-{ts}", git("rev-parse HEAD").stdout.strip()
+            for step, args in (("rename", f"branch -m {shlex.quote(branch)} {shlex.quote(died)}"),
+                               ("checkout", f"checkout -q {shlex.quote(target)}")):
+                r = git(args)
+                if r.returncode != 0:
+                    print(f"{tag} {path} is clean on {route}'s branch {branch}; the {step} failed "
+                          f"({r.stderr.strip()[-200:]}) — PAUSED ({held_rb})")
+                    return held_rb
+            print(f"{tag} {path} was clean on {route}'s branch {branch} (tip {tip[:12]}); branch {branch} → {died}; "
+                  f"{target} checked out in {path}")
+            return None
         if on != branch:
             print(f"{tag} {path} is dirty on {on}, not on {route}'s branch {branch}; left as it is — PAUSED ({held})")
             return held
@@ -1364,7 +1414,9 @@ class QueueDaemon:
         queued = len(self._scan_queue())
         if held:
             self._mark_paused(held, say=False)
-            start = (f"PAUSED ({held}) — a dead route's repo is dirty and was left as it is; nothing fires "
+            why = ("is on its route branch and could not be returned to its merge target"
+                   if held.startswith("start:route-branch:") else "is dirty and was left as it is")
+            start = (f"PAUSED ({held}) — a dead route's repo {why}; nothing fires "
                      f"until `python3 queue_daemon.py resume`")
         elif queued and not self.start_running:
             self._mark_paused(START_PAUSED_REASON, say=False)

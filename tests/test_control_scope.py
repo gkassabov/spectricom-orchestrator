@@ -824,6 +824,7 @@ class TestP7Recovery:
                 ) in capsys.readouterr().out
 
     def test_negative_control_a_clean_tree_is_left_alone(self, dead):
+        _git("git checkout -q main", dead.repo)   # [ORCH-CRASH-PRIMARY-ON-ROUTE-BRANCH-1] clean on the merge target
         dead.lock()
         before = dead.snapshot()
         dead.daemon.stop_after(1)
