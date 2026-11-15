@@ -201,7 +201,13 @@ def test_sim_P3_control_the_path_list_gains_exactly_the_one_glob():
     data = json.loads(prefire.OPEX_PATHS.read_text(encoding="utf-8"))
     assert data["agent_runtime"]["clinical-mp"] == ["src/lib/agentic-runtime/**", "src/daemon/**",
                                                     "src/lib/agentic-drafts/**", "server/**/agent*",
-                                                    "server/simulation/**", "src/lib/agentic-ops/**"]
+                                                    "server/simulation/**", "src/lib/agentic-ops/**",
+                                                    # [ORCH-PREFIRE-OBS-PATHS-1] Kanban 708, AC-OPS27-06 (i)
+                                                    "server/observability/**",
+                                                    "scripts/observability/pipeline.ts",
+                                                    "scripts/observability/cockpit.ts",
+                                                    "scripts/observability/canon-index.ts",
+                                                    "scripts/observability/flag-rate-probe.ts"]
 
 
 @pytest.mark.parametrize("path, hits", [("server/routes/agent-runner.ts", ["server/**/agent*"]),

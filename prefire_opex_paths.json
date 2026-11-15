@@ -8,12 +8,18 @@
       "src/lib/agentic-drafts/**",
       "server/**/agent*",
       "server/simulation/**",
-      "src/lib/agentic-ops/**"
+      "src/lib/agentic-ops/**",
+      "server/observability/**",
+      "scripts/observability/pipeline.ts",
+      "scripts/observability/cockpit.ts",
+      "scripts/observability/canon-index.ts",
+      "scripts/observability/flag-rate-probe.ts"
     ],
     "orchestrator": [
       "orchestrator.py",
       "executor/**"
     ],
+    "_clinical-mp": "server/observability/** and the four scripts/observability/ entry points are the code an O identity runs on (AP-OBS-ENGINE; AC-OPS27-06 (i)). scripts/observability-ci/, scripts/obs-emit/ and server/__tests__/obs-emit/ are not: no O identity runs them.",
     "_orchestrator": "orchestrator.py is the whole file: the fire path (fire_toni) cannot be told apart from the rest of it by file name."
   },
   "protected": {
@@ -49,9 +55,18 @@
       "*accesspolicy*",
       "*client-application*",
       "*clientapplication*",
-      "scripts/migrat*"
+      "scripts/migrat*",
+      "src/lib/observability/engine/**",
+      "src/lib/observability/schema/**",
+      "src/lib/observability/conformance/**",
+      "src/lib/observability/**/__tests__/fixtures/**",
+      "config/observability/**",
+      "server/observability/config/**",
+      "registry/**",
+      "src/lib/metric-registry/**",
+      "scripts/observability-ci/**"
     ],
-    "_clinical-mp": "CDS rules, clinical logic, FHIR mappings, PROs scoring, auth / AccessPolicy / ClientApplication code, migrations.",
+    "_clinical-mp": "CDS rules, clinical logic, FHIR mappings, PROs scoring, auth / AccessPolicy / ClientApplication code, migrations; Observability (O): the engine, schema, conformance vectors, test fixtures, tree / target / attention config, the metric registry and the CI scans — every file that defines what O sees or how it judges (OBS.17.3, Arch:3483; AC-OPS27-06 (ii)).",
     "orchestrator": [
       "executor/**",
       "orchestrator.py",
