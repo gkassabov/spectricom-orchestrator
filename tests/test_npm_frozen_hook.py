@@ -283,8 +283,11 @@ def _pre(repo):
 
 @pytest.mark.parametrize("repo", REPOS)
 def test_PN7_the_settings_file_runs_the_kill_hook_then_the_npm_hook(repo):
+    # [ORCH-ROUTE-TIME-1] G-3: then the long-wait hook, third (tests/test_route_time.py P-7)
+    wait = GN2_CMD.replace("npm_frozen.py", "long_wait.py").replace("🛡 npm frozen:", "🛡 long wait:")
     assert _pre(repo) == [{"matcher": "*", "hooks": [{"type": "command", "command": KILL_CMD}]},
-                          {"matcher": "Bash", "hooks": [{"type": "command", "command": GN2_CMD}]}]
+                          {"matcher": "Bash", "hooks": [{"type": "command", "command": GN2_CMD}]},
+                          {"matcher": "Bash", "hooks": [{"type": "command", "command": wait}]}]
 
 
 @pytest.fixture

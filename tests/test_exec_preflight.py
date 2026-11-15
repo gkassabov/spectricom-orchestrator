@@ -201,6 +201,11 @@ class TestPB3Red:
         assert "fail (environment)" in out
 
 
+# [ORCH-ROUTE-TIME-1] G-4: the typecheck sentence the fire prompt carries before the preflight sentence
+TYPECHECK = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to confirm a "
+             "type-error fix; while iterating, run the related tests of the files you changed.")
+
+
 # ── PB4 · the executor prompt ─────────────────────────────────────────────────────────────────────────────────────────
 class TestPB4Prompt:
 
@@ -208,15 +213,16 @@ class TestPB4Prompt:
         (tmp_path / "proj" / "briefs" / "61-x.md").write_text("#!queue model=m effort=high repo=clinical-mp\n# x\n")
         monkeypatch.setattr(orchestrator, "ACTIVE_REPO_NAME", "orchestrator")
         argv = child(1800)["argv"]
-        assert argv[-1] == "Read briefs/61-x.md" + PROMPT_TAIL + " " + SENTENCE.format(repo="clinical-mp")
+        assert argv[-1] == ("Read briefs/61-x.md" + PROMPT_TAIL + " " + TYPECHECK + " "
+                            + SENTENCE.format(repo="clinical-mp"))
 
     def test_no_header_falls_back_to_the_active_repo(self, child, monkeypatch):
         monkeypatch.setattr(orchestrator, "ACTIVE_REPO_NAME", "yorsie")
         argv = child(1800)["argv"]
-        assert argv[-1].endswith(PROMPT_TAIL + " " + SENTENCE.format(repo="yorsie"))
+        assert argv[-1].endswith(PROMPT_TAIL + " " + TYPECHECK + " " + SENTENCE.format(repo="yorsie"))
 
     def test_off_omits_it(self, child, monkeypatch):
         monkeypatch.setattr(orchestrator, "ACTIVE_REPO_NAME", "yorsie")
         monkeypatch.setenv("ORCH_EXEC_PREFLIGHT", "off")
         argv = child(1800)["argv"]
-        assert argv[-1] == "Read briefs/61-x.md" + PROMPT_TAIL
+        assert argv[-1] == "Read briefs/61-x.md" + PROMPT_TAIL + " " + TYPECHECK

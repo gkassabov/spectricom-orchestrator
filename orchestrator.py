@@ -1062,6 +1062,7 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
     pf_repo = parse_repo_from_brief(batch_file) or ACTIVE_REPO_NAME
     preflight_ask = ("" if os.environ.get(PREFLIGHT_VAR, "").strip().lower() == "off" or not pf_repo
                      else " " + PREFLIGHT_SENTENCE.format(repo=pf_repo).replace("`", "\\`"))
+    preflight_ask = " " + TYPECHECK_SENTENCE + preflight_ask   # [ORCH-ROUTE-TIME-1] T-4: always, before the preflight
     cmd = (
         f"cd {project} && "
         f"stdbuf -oL "
@@ -3234,6 +3235,8 @@ class UnitGateOutcome:
         on the PASS path (where flakes alone land) as well as the FAIL path."""
         if self.scope == "none":
             return self.detail   # [ORCH-UNIT-RELATED-1] nothing ran, and why
+        if self.signal == UNIT_REUSED_SIGNAL:   # [ORCH-ROUTE-TIME-1] T-1: nothing ran here; the preflight's run vouched
+            return f"{self.scope} files — {self.detail}"
         if not self.ran or self.branch is None:
             return None
         base = self.baseline.describe if self.baseline else (self.baseline_note or "not measured")
@@ -4128,6 +4131,7 @@ def _unit_cache_store_landed(repo_path: Path, verdict, merged_sha: Optional[str]
         uo = verdict.unit if verdict is not None and verdict.outcome is GateOutcome.PASS else None
         b = uo.branch if uo is not None and uo.ran else None
         base = set(uo.baseline.failing_files) if uo is not None and uo.baseline is not None else set()
+        flaky = set(uo.flaky_files) if uo is not None else set()   # [ORCH-ROUTE-TIME-1] T-3
         tip, ck_m, ck_t, why = (uo.branch_sha if uo is not None else None), None, None, None
         if b is None:
             why = ("(a) no unit branch run — " + (f"the unit gate was {uo.signal or 'not run'}" if uo is not None
@@ -4151,11 +4155,14 @@ def _unit_cache_store_landed(repo_path: Path, verdict, merged_sha: Optional[str]
         elif uo.baseline_source not in ("measured", "cache", "not-needed"):
             why = (f"(c) the baseline the gate accepted is {uo.baseline_source} — only a measured, cached or "
                    f"not-needed one vouches for the branch run")
-        elif uo.flaky_files:
-            why = f"(d) the gate confirmed flaky file(s) in isolation: {', '.join(uo.flaky_files)}"
-        elif set(b.failing_files) - base:
+        elif set(b.failing_files) - base - flaky:
             why = (f"(d) the branch run fails file(s) the accepted baseline does not: "
-                   f"{', '.join(sorted(set(b.failing_files) - base))}")
+                   f"{', '.join(sorted(set(b.failing_files) - base - flaky))}")
+        elif flaky and (b.failing_tests is None or b.failures is None or len(b.failing_tests) != b.failures):
+            # [ORCH-ROUTE-TIME-1] T-3: the flakes come out by test; a count the tests do not name cannot be split
+            why = (f"(d) flaky file(s) {', '.join(sorted(flaky))}: the failure count cannot be split — the branch run "
+                   f"names {len(b.failing_tests or ())} of its {b.failures if b.failures is not None else '?'} "
+                   f"failure(s)")
         elif not tip or uo.branch_tree_why:
             why = f"(e) the branch leg did not measure a commit — {uo.branch_tree_why or 'no commit recorded'}"
         elif tip != route_tip:
@@ -4172,6 +4179,15 @@ def _unit_cache_store_landed(repo_path: Path, verdict, merged_sha: Optional[str]
         if why:
             log.info(f"♻️  Unit baseline: route branch run NOT cached for {m7} — {why}")
             return
+        said = ""
+        if flaky:
+            # [ORCH-ROUTE-TIME-1] T-3: every new failure passed alone — the run is the tree's measurement with the
+            # flakes taken out (their tests counted passed, as alone they did), and the flakes go on the entry's tally
+            keep = tuple(t for t in b.failing_tests if _unit_test_file(t) not in flaky)
+            b = replace(b, failing_files=tuple(sorted(set(b.failing_files) - flaky)), failing_tests=keep,
+                        failures=len(keep), failures_source="derived",
+                        tests_passed=(None if b.tests_passed is None else b.tests_passed + b.failures - len(keep)))
+            said = f"; flaky file(s) taken out of it and recorded as flaky: {', '.join(sorted(flaky))}"
         _unit_cache_store(archive, ACTIVE_REPO_NAME, tip, cmd, b, repo_path=repo_path, content_key=ck_m,
                           landed_as=merged_sha)
         e = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, merged_sha, cmd, content_key=ck_m)
@@ -4179,8 +4195,11 @@ def _unit_cache_store_landed(repo_path: Path, verdict, merged_sha: Optional[str]
             log.info(f"♻️  Unit baseline: route branch run NOT cached for {m7} — the cache write did not land "
                      f"(see the warning above)")
             return
+        if flaky:
+            _unit_cache_record_flakes(archive, ACTIVE_REPO_NAME, merged_sha, cmd, tuple(sorted(flaky)),
+                                      repo_path=repo_path)
         log.info(f"♻️  Unit baseline: route branch run cached for {m7} (gated tip {tip[:7]}, non-briefs tree "
-                 f"identical) — {b.collection}; the next route off this tree reads it")
+                 f"identical) — {b.collection}; the next route off this tree reads it{said}")
     except Exception as e:
         log.warning(f"♻️  Unit baseline: route branch run NOT cached for {m7} — the check raised "
                     f"{type(e).__name__}: {e}; nothing stored")
@@ -4843,12 +4862,40 @@ def _unit_related_files(repo_path: Path, list_cmd: str, diff: "BranchDiff") -> t
     member = set(suite)
     changed = {_norm_test_path(p) for p in diff.paths}
     chosen = (set(affected) | changed) & member
+    graph = bool(chosen)   # [ORCH-ROUTE-TIME-1] the import-graph set, before any declared addition
     extra, extra_said = _unit_related_extra(repo_path, changed, member, chosen)   # [ORCH-PREFLIGHT-READMAP-1]
     chosen |= extra
+    always, always_said = _unit_always(member, chosen) if graph else (set(), "")
+    chosen |= always
     files = tuple(f for f in suite if f in chosen)
     return files, len(suite), (f"{len(set(affected) & member)} affected by the diff against merge-base "
                                f"{diff.base[:7]} (--changed), {len(changed & member)} changed by the branch"
-                               + extra_said)
+                               + extra_said + always_said)
+
+
+# ── [ORCH-ROUTE-TIME-1] T-2 · the source scanners every related-only run carries (Kanban 698) ────────────────────────
+# A unit test that reads the source tree (readdirSync / globSync / git ls-files) is related to no file by the import
+# graph, so a related-only run never selected it and a nightly full gate was the first to see it red. repos.yaml
+# `unit_always_files` (a list of test files) joins every related set whose import-graph set is non-empty; an empty
+# one keeps _unit_scope's two rules exactly ("(c)" full suite while source changed; nothing for a docs-only diff).
+UNIT_ALWAYS_FILES_KEY = "unit_always_files"
+UNIT_ALWAYS_VAR = "ORCH_UNIT_ALWAYS"   # `off` ⇒ no union: the related set is vitest's (and unit_related_extra's)
+
+
+def _unit_always(member: set, chosen: set) -> tuple:
+    """(the listed files in the suite not yet chosen, `, + N always-run (unit_always_files)` or ""). A malformed key
+    is one warning and nothing added."""
+    raw = ACTIVE_REPO_CONFIG.get(UNIT_ALWAYS_FILES_KEY)
+    if raw is None or os.environ.get(UNIT_ALWAYS_VAR, "").strip().lower() == "off":
+        return set(), ""
+    if not isinstance(raw, list) or not all(isinstance(f, str) and f.strip() for f in raw):
+        log.warning(f"⚠️  Unit gate: repos.yaml {UNIT_ALWAYS_FILES_KEY} is malformed (a list of test files expected; "
+                    f"got {str(raw)[:120]!r}) — ignored")
+        return set(), ""
+    listed = {_norm_test_path(f.strip()) for f in raw}
+    add = (listed & member) - chosen
+    return add, (f", + {len(add)} always-run ({UNIT_ALWAYS_FILES_KEY}: {len(listed & member)} of {len(listed)} "
+                 f"listed are in the suite)")
 
 
 # ── [ORCH-PREFLIGHT-READMAP-1] G-C1 · declared extras the import graph cannot see (Kanban 601, 341n6b F-1) ─────────
@@ -4971,7 +5018,8 @@ def _count_said(run) -> str:
 
 
 def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
-                  archive_path: Optional[Path] = None, diff: Optional["BranchDiff"] = None) -> UnitGateOutcome:
+                  archive_path: Optional[Path] = None, diff: Optional["BranchDiff"] = None,
+                  scope: Optional[UnitScope] = None) -> UnitGateOutcome:
     """Baseline unit-suite gate. Halts iff the branch has a confirmed regression.
 
     [ORCH-6b] decision 1 — a regression is a named test FILE that fails in isolation on the
@@ -4984,6 +5032,9 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     [ORCH-UNIT-RELATED-1] `diff` (run_pre_merge_gates' — a direct call passes none and runs the whole suite, exactly
     as before): the branch leg runs the related files (_unit_scope) or the full suite and says why; with related
     files the baseline is _unit_baseline_related's, and the rule below is the same rule.
+
+    [ORCH-ROUTE-TIME-1] `scope`: the _unit_scope run_pre_merge_gates already computed for `diff` (its preflight-reuse
+    check), so the unit listing pair runs once a route; None ⇒ computed here, as before.
     """
     started = time.time()
     test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
@@ -5016,7 +5067,8 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     archive = archive_path or SIT_ARCHIVE_DIR
     load_check = _unit_load_check_said("Unit gate")   # [ORCH-FULLGATE-WT-FSDENY-1] G-A4
     # [ORCH-UNIT-RELATED-1] what the branch leg runs: one 🎯 line, always, when a diff was handed over
-    scope = _unit_scope(repo_path, test_cmd, diff) if diff is not None else None
+    if scope is None and diff is not None:
+        scope = _unit_scope(repo_path, test_cmd, diff)
     if scope is not None and not scope.capable:
         log.info(f"🎯 Unit gate: full suite: {scope.reason}")
         scope = None
@@ -5679,6 +5731,10 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                 log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                 return v
         elif gate == "sit":
+            reused = None if SKIP_SIT else _sit_preflight_reuse(repo_path, diff, branch_name, sit_enum)
+            if reused is not None:   # [ORCH-ROUTE-TIME-1] T-1: the executor's clean-green preflight, same tree
+                sit_collection = reused
+                continue
             # only a started worker is handed over: callers that stub run_sit_post_merge keep its old signature
             so = run_sit_post_merge(repo_path, diff=diff, **({"enumerated": sit_enum} if sit_enum else {}))
             sit_collection = so.collection
@@ -5703,7 +5759,12 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
     # from PRE_MERGE_GATES: §2.3 derives it from the repo's `test_cmd` in config/repos.yaml,
     # so a repo that declares a command is gated even when it has no entry above, and a repo
     # that declares none is reported "ungated by policy" and does not block.
-    uo = run_unit_gate(repo_path, branch_name, diff=diff)   # [ORCH-UNIT-RELATED-1] the diff, as SIT's D3 has it
+    # [ORCH-ROUTE-TIME-1] T-1: the executor's clean-green related preflight on this tree, else the leg — handed the
+    # scope the check computed (a direct run_unit_gate call computes its own, as before)
+    uo, unit_scope = _unit_preflight_reuse(repo_path, branch_name, diff)
+    if uo is None:
+        uo = run_unit_gate(repo_path, branch_name, diff=diff,   # [ORCH-UNIT-RELATED-1] the diff, as SIT's D3 has it
+                           **({"scope": unit_scope} if unit_scope is not None else {}))
     unit_collection = uo.collection
     if not uo.passed:
         if uo.env:
@@ -5748,6 +5809,10 @@ PREFLIGHT_SENTENCE = ("Before you write the handback's final status, run `python
                       "orchestrator.py preflight --repo {repo}` and paste its summary; a red there is handled by your "
                       "brief's rule #8 and STOP rules like any other red.")
 PREFLIGHT_EXIT = {"pass": 0, "fail": 1, "environment": 2, "not computed": 3}
+# [ORCH-ROUTE-TIME-1] T-4: executors re-ran the full typecheck in a loop while iterating; the fire prompt says when it
+# runs. Joined inside fire_toni's preflight_ask placeholder, present whether or not the preflight sentence is.
+TYPECHECK_SENTENCE = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to "
+                      "confirm a type-error fix; while iterating, run the related tests of the files you changed.")
 
 
 @dataclass
@@ -5890,6 +5955,8 @@ def preflight(repo_path: Path, json_path: Optional[Path] = None) -> int:
     st = subprocess.run(["git", "-C", str(repo_path), "status", "--porcelain", "--untracked-files=all"],
                         capture_output=True, text=True)
     dirty = [l[3:] for l in (st.stdout or "").splitlines() if l[3:] and not _under_subdir(l[3:], briefs)]
+    # [ORCH-ROUTE-TIME-1] T-1: the gate reuses a record only when this is [] (None: git could not say)
+    rec["dirty"] = dirty if st.returncode == 0 else None
     if dirty:
         lines.append(f"⚠️  uncommitted outside {briefs}/: {', '.join(dirty[:BRIEFS_ONLY_NAMED_FILES])}"
                      f"{' …' if len(dirty) > BRIEFS_ONLY_NAMED_FILES else ''} — the gate runs on commits; commit, "
@@ -5938,6 +6005,196 @@ def preflight(repo_path: Path, json_path: Optional[Path] = None) -> int:
         print(l, flush=True)
     log.info(summary)
     return code
+
+
+# ── [ORCH-ROUTE-TIME-1] T-1 · the gate reuses the executor's clean-green preflight (Kanban 698, D-S7CORE54-01) ──────
+# 34 gated merges since 11-08: the unit leg was 25.1 % of a route, and a clinical-mp route's SIT leg ran the very
+# files the executor's preflight had just run green on the same tree. run_pre_merge_gates now reads that record
+# (state/preflight/<branch>.json, read-only; the executor may not edit it — the settings files' Edit deny) and a leg
+# is PASS without running iff every condition below holds; any condition that cannot be proven runs the leg exactly
+# as before, and one line names the first that failed. Never on `full-gate` / the nightly, never on the re-gate lane.
+PREFLIGHT_REUSE_VAR = "ORCH_PREFLIGHT_REUSE"              # `off` ⇒ every leg runs, as before
+PREFLIGHT_REUSE_MAX_H_VAR = "ORCH_PREFLIGHT_REUSE_MAX_H"  # the oldest record reused, in hours (not positive ⇒ off)
+PREFLIGHT_REUSE_MAX_H = 2.0
+UNIT_REUSED_SIGNAL = "reused-preflight"
+
+
+def _preflight_record(branch_name: str) -> tuple:
+    """(the record, None) or (None, why): state/preflight/<slug(branch)>.json, as preflight() wrote it. Read only."""
+    f = _running_marker_dir() / PREFLIGHT_DIR / f"{_marker_repo_slug(branch_name)}.json"
+    if not f.is_file():
+        return None, f"no preflight record ({PREFLIGHT_DIR}/{f.name})"
+    try:
+        rec = json.loads(f.read_text())
+    except (OSError, ValueError) as e:
+        return None, f"the preflight record {PREFLIGHT_DIR}/{f.name} does not parse ({type(e).__name__})"
+    if not isinstance(rec, dict):
+        return None, f"the preflight record {PREFLIGHT_DIR}/{f.name} does not parse (not an object)"
+    return rec, None
+
+
+def _preflight_reuse_check(repo_path: Path, diff: BranchDiff, branch_name: Optional[str]) -> tuple:
+    """(record, None) when every condition the SIT and unit legs share holds; else (None, the first that failed).
+    Never raises: a check that raises is a condition not proven."""
+    try:
+        return _preflight_reuse_conditions(repo_path, diff, branch_name)
+    except Exception as e:
+        return None, f"the reuse check raised {type(e).__name__}: {e}"
+
+
+def _preflight_reuse_conditions(repo_path: Path, diff: BranchDiff, branch_name: Optional[str]) -> tuple:
+    if os.environ.get(PREFLIGHT_REUSE_VAR, "").strip().lower() == "off":
+        return None, f"{PREFLIGHT_REUSE_VAR}=off"
+    raw = os.environ.get(PREFLIGHT_REUSE_MAX_H_VAR)
+    try:
+        max_h = PREFLIGHT_REUSE_MAX_H if raw is None or not raw.strip() else float(raw)
+    except ValueError:
+        max_h = None
+    if max_h is None or not (0 < max_h < float("inf")):
+        return None, f"{PREFLIGHT_REUSE_MAX_H_VAR}={raw!r} is not a positive number — reuse is off"
+    if REGATE is not None:
+        return None, "the re-gate lane runs every leg itself (ORCH-REGATE-GATE-ONLY-1)"
+    if not branch_name:
+        return None, "the gate has no branch name to find a preflight record by"
+    rec, why = _preflight_record(branch_name)
+    if why:
+        return None, why
+    if rec.get("repo") != ACTIVE_REPO_NAME:
+        return None, f"the record is for repo {rec.get('repo')!r}, not {ACTIVE_REPO_NAME!r}"
+    if rec.get("branch") != branch_name:
+        return None, f"the record is for branch {rec.get('branch')!r}, not {branch_name!r}"
+    ex = rec.get("exit")
+    if not isinstance(rec.get("sit"), dict) or not isinstance(ex, int) or isinstance(ex, bool):
+        return None, f"the record is incomplete (sit: {type(rec.get('sit')).__name__}, exit: {ex!r})"
+    if diff is None or not diff.base or rec.get("base") != diff.base:
+        return None, (f"the record's merge base {str(rec.get('base'))[:7]} is not the gate's "
+                      f"{str(diff.base if diff is not None else None)[:7]}")
+    briefs = _active_briefs_subdir()
+    if not isinstance(rec.get("dirty"), list):
+        return None, "the record has no `dirty` list (written before ORCH-ROUTE-TIME-1, or git could not say)"
+    if rec["dirty"]:
+        return None, (f"the preflight ran with files uncommitted outside {briefs}/: "
+                      f"{', '.join(map(str, rec['dirty'][:BRIEFS_ONLY_NAMED_FILES]))}")
+    tip = _git_read("git rev-parse HEAD", repo_path) or ""
+    ck_r, ck_g = _unit_content_key(repo_path, rec.get("tip")), _unit_content_key(repo_path, tip)
+    if ck_r is None or ck_g is None or ck_r != ck_g:
+        return None, (f"the gated tip {tip[:7] or '?'}'s non-briefs tree is not the preflight's "
+                      f"({str(rec.get('tip'))[:7]})" + ("" if ck_r and ck_g else " — a content key could not be read"))
+    st = subprocess.run(["git", "-C", str(repo_path), "--no-optional-locks", "status", "--porcelain",
+                         "--untracked-files=all"], capture_output=True, text=True, timeout=120)
+    here = [l[3:] for l in (st.stdout or "").splitlines() if l[3:] and not _under_subdir(l[3:], briefs)]
+    if st.returncode != 0 or here:
+        return None, (f"the gate's checkout has files uncommitted outside {briefs}/: "
+                      f"{', '.join(here[:BRIEFS_ONLY_NAMED_FILES]) or '(git status failed)'}")
+    try:
+        age_h = (datetime.now() - datetime.fromisoformat(str(rec.get("at")))).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return None, f"the record's time {rec.get('at')!r} does not parse"
+    if age_h < 0:
+        return None, f"the record's time {rec.get('at')} is in the future"
+    if age_h > max_h:
+        return None, f"the record is {age_h:.1f} h old (limit {max_h:g} h, {PREFLIGHT_REUSE_MAX_H_VAR})"
+    return rec, None
+
+
+def _sit_preflight_reuse(repo_path: Path, diff: BranchDiff, branch_name: Optional[str],
+                         sit_enum: Optional[_SitEnumJob]) -> Optional[str]:
+    """T-1: the SIT leg's `collection` when the executor's preflight record vouches for it — one sit-log entry
+    (`reused: "preflight"`) and one line; None (one line naming why) when the leg must run. The enumeration
+    worker is taken for the file-set check or discarded; one the check never reached is handed to the leg as before."""
+    rec, why = _preflight_reuse_check(repo_path, diff, branch_name)
+    sit = rec["sit"] if rec else {}
+    if why is None:
+        if sit.get("status") != "pass":
+            why = f"the preflight SIT leg is {sit.get('status')!r}"
+        elif "verdict" in sit:
+            why = f"the preflight SIT leg needed isolation ({sit['verdict']}) — not the gate's own PASS"
+        elif not isinstance(sit.get("files"), list):
+            why = "the preflight SIT leg names no file list"
+    plan, related, note, taken = None, None, None, None
+    if why is None:
+        if sit_enum is not None:
+            taken, note = sit_enum.take(repo_path)
+        if taken is not None and taken.diff is diff:
+            plan, related, how = taken.plan, taken.related, taken.how
+        else:
+            plan, how = _sit_plan(repo_path), None
+            if plan is None:
+                why = f"no {SIT_LIST_CMD_KEY} for {ACTIVE_REPO_NAME}: the gate runs the whole SIT suite"
+            elif plan.error:
+                why = f"the SIT suite could not be enumerated ({plan.error})"
+            else:
+                related, how = _sit_related_files(repo_path, plan, diff)
+        if why is None:
+            files = list(sit["files"])
+            if related is None:
+                why = f"the gate runs the FULL SIT suite on this diff — {how}"
+            elif not related:
+                why = "no SIT file relates to this diff — the leg runs nothing anyway"
+            elif sorted(related) != sorted(files):
+                gone, new = sorted(set(files) - set(related)), sorted(set(related) - set(files))
+                why = (f"the SIT file set differs (gate {len(related)}, preflight {len(files)}"
+                       + (f"; only the gate's: {', '.join(new[:BRIEFS_ONLY_NAMED_FILES])}" if new else "")
+                       + (f"; only the preflight's: {', '.join(gone[:BRIEFS_ONLY_NAMED_FILES])}" if gone else "") + ")")
+    if why:
+        log.info(f"♻️  SIT: preflight not reused — {why}; the SIT leg runs")
+        return None
+    if sit_enum is not None and taken is None:
+        sit_enum.discard("reused the executor preflight")
+    at, tip = str(rec.get("at")), str(rec.get("tip") or "")
+    scope = f"related {len(related)}/{len(plan.files)}"
+    log.info(f"♻️  SIT: reused the executor preflight ({at}, tip {tip[:7]}) — sit[{scope} files] ran green there on "
+             f"this tree; not run again")
+    SIT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    _log_sit_outcome(SIT_ARCHIVE_DIR, repo_path, True, 0, 0.0, None, scope=scope, enumeration=note,
+                     reused="preflight", preflight_at=at, preflight_tip=tip or None)
+    return f"sit[{scope} files] — reused preflight {at}"
+
+
+def _unit_preflight_reuse(repo_path: Path, branch_name: Optional[str], diff: BranchDiff) -> tuple:
+    """T-1: (the unit outcome, its scope) when the executor's preflight ran this exact related set clean green on this
+    tree — the counter +1, one unit-log entry (_unit_done), nothing stored by the landing; else (None, the _unit_scope
+    the check computed, for run_unit_gate, or None). Silent when the unit leg would not run (run_unit_gate says why)."""
+    test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
+    if not test_cmd or ACTIVE_REPO_NAME not in _unit_gate_eligible_repos() or not UNIT_GATE_ENABLED or diff is None:
+        return None, None
+    started = time.time()
+    rec, why = _preflight_reuse_check(repo_path, diff, branch_name)
+    unit, scope = (rec.get("unit") if rec else None), None
+    if why is None:
+        if rec.get("exit") != 0 or rec.get("result") != "pass":
+            why = (f"the record's result is {rec.get('result')!r} (exit {rec.get('exit')}) — the unit leg is reused "
+                   f"only when both legs were green")
+        elif not isinstance(unit, dict):
+            why = "the record has no unit leg"
+        elif unit.get("status") != "pass":
+            why = f"the preflight unit leg is {unit.get('status')!r}"
+        elif unit.get("failed") != []:
+            why = f"the preflight unit leg names failures: {unit.get('failed')!r}"
+        elif "flaky" in unit:
+            why = f"the preflight unit leg needed isolation (flaky: {unit['flaky']}) — not the gate's own PASS"
+        elif not isinstance(unit.get("files"), list) or not unit["files"]:
+            why = "the preflight unit leg ran no file"
+    if why is None:
+        scope = _unit_scope(repo_path, test_cmd, diff)
+        if not scope.capable or scope.files is None:
+            why = f"the gate's unit scope is the full suite — {scope.reason}"
+        elif not scope.files:
+            why = "no unit file relates to this diff — the leg runs nothing anyway"
+        elif sorted(scope.files) != sorted(unit["files"]):
+            why = f"the unit file set differs (gate {len(scope.files)}, preflight {len(unit['files'])})"
+    if why:
+        log.info(f"♻️  unit: preflight not reused — {why}; the unit leg runs")
+        return None, scope
+    at, tip, n = str(rec.get("at")), str(rec.get("tip") or ""), len(scope.files)
+    _unit_full_counter_record(ACTIVE_REPO_NAME, full=False, why=f"{branch_name}: reused preflight")
+    log.info(f"♻️  unit: reused the executor preflight ({at}, tip {tip[:7]}) — related {n}/{scope.total} files ran "
+             f"green there on this tree; not run again")
+    o = UnitGateOutcome(passed=True, ran=False, signal=UNIT_REUSED_SIGNAL, scope=f"related {n}/{scope.total}",
+                        scope_reason=scope.reason, related_files=tuple(scope.files),
+                        branch_cmd=_unit_confirm_cmd(test_cmd, scope.files),
+                        detail=f"reused the executor preflight ({at}, tip {tip[:7]})")
+    return _unit_done(o, started, repo_path, None), scope
 
 
 # ── [ORCH-RELIABILITY-1] Brief 2 · ORCH-PRELIST-1: the gate's pre-list, in the brief Toni reads ─────────────────────
@@ -6042,7 +6299,9 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
                      tests_total: Optional[int] = None, tests_passed: Optional[int] = None,
                      tests_failed: Optional[int] = None, batches: Optional[int] = None,
                      isolation: Optional[dict] = None, scope: Optional[str] = None,
-                     not_applicable: Optional[str] = None, enumeration: Optional[str] = None):
+                     not_applicable: Optional[str] = None, enumeration: Optional[str] = None,
+                     reused: Optional[str] = None, preflight_at: Optional[str] = None,
+                     preflight_tip: Optional[str] = None):
     """Append SIT outcome to orchestrator-sit-log.json. [ORCH-2] carries the four collection
     counts (null when the summary did not parse) so "was the gate ever thin?" is answerable
     historically. Old-shape entries without them still load.
@@ -6083,6 +6342,8 @@ def _log_sit_outcome(archive: Path, repo_path: Path, passed: bool, exit_code: in
         entry["not_applicable"] = not_applicable
     if enumeration is not None:   # [ORCH-SIT-ENUM-PARALLEL-1] only when a worker was started
         entry["enumeration"] = enumeration
+    if reused is not None:        # [ORCH-ROUTE-TIME-1] T-1: nothing ran; the executor's preflight record vouched
+        entry.update(reused=reused, preflight_at=preflight_at, preflight_tip=preflight_tip)
     entries.append(entry)
     log_file.write_text(json.dumps(entries, indent=2))
 

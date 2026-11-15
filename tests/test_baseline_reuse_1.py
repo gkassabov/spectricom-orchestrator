@@ -398,11 +398,15 @@ class TestP5LandedButNotStored:
         assert said(caplog) == [not_cached(merged, "(a) no unit branch run — the unit gate was ungated")]
 
     def test_a_flake_only_pass(self, lane, caplog):
+        # [ORCH-ROUTE-TIME-1] G-2: a flake-only pass is cached, the flaky file out of failing_files, into flaky_files
         lane.suites.out.update(branch=(1, FLAKY_UC), baseline=(1, BASE_290EA), confirm=(0, ALONE_GREEN))
         with caplog.at_level(logging.INFO, logger="orch"):
             merged = self._landed(fire(lane, "290ea-flake", code()))
-        assert key(lane, merged) not in entries(lane)
-        assert said(caplog) == [not_cached(merged, f"(d) the gate confirmed flaky file(s) in isolation: {UC}")]
+        e = entries(lane)[key(lane, merged)]
+        assert UC not in e["failing_files"] and e["flaky_files"] == [UC] and e["landed_as"] == merged
+        (line,) = said(caplog)
+        assert line.startswith(f"♻️  Unit baseline: route branch run cached for {merged[:7]} ")
+        assert line.endswith(f"; flaky file(s) taken out of it and recorded as flaky: {UC}")
 
     def test_an_ancestor_cache_pass(self, lane, caplog):
         m0 = main_sha(lane)

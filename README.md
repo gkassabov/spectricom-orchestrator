@@ -225,6 +225,31 @@ every lane, exactly what it would have merged as `passed`, and no red route is e
 status line, or an unreadable file keeps today's verdict. To roll back, revert the commit. Older code ignores
 the `stopped` lists.
 
+## Route test cost (ORCH-ROUTE-TIME-1)
+
+The pre-merge gate reads the executor's `preflight` record (`state/preflight/<branch>.json`). After the build
+passes, it treats the SIT leg as PASS without running it only when all of these hold: the record is for this repo
+and branch; its SIT leg is `pass` and needed no isolation; its base is the gate's base; it was taken with nothing
+uncommitted outside `briefs/`; the gated tip's non-briefs tree equals the record's; the gate's checkout is clean;
+the record's SIT files are the related set the gate computes; and the record is no older than
+`ORCH_PREFLIGHT_REUSE_MAX_H` hours (default 2). The unit leg is reused under the same conditions, and also needs
+both legs green (`exit` 0), a unit leg with no failures and no isolation pass, and a gate scope that is related
+(not full) and the same files. Either way the gate logs one `♻️  SIT:` / `♻️  unit:` line, either
+`reused the executor preflight …` or `preflight not reused — <the first condition that failed>`. If any condition
+fails, the leg runs as it does today. A reused SIT leg writes a sit-log entry with `reused: "preflight"`. A reused
+unit leg adds one to the related-run counter, writes one unit-log entry (`signal: "reused-preflight"`), and
+stores no cache entry. `full-gate`, the nightly run and the re-gate lane never read the record.
+`ORCH_PREFLIGHT_REUSE=off` turns reuse off. A non-positive `ORCH_PREFLIGHT_REUSE_MAX_H` also turns it off.
+clinical-mp's `unit_full_triggers` are the files every test loads (manifests, the vitest, vite and ts configs,
+`src/test.setup.ts`, `src/test/**`, `server/allowlist*.ts`); they no longer include whole source trees. Its
+`unit_always_files` lists the source-scanner tests, which read the tree and so cannot be related through imports.
+Each one in the suite joins any related set whose import-graph part is non-empty. `ORCH_UNIT_ALWAYS=off` drops
+them. A full-scope PASS whose only new failures were flaky in isolation now seeds the merged tree's baseline, with
+the flaky files' tests taken out and the files recorded as flaky. It is stored only when the run names every
+failing test. In the executor, `executor/hooks/long_wait.py` refuses a Bash `sleep` of 300 s or more, or one with
+a non-literal operand. `TONI_LONG_WAIT=off` allows all sleeps. The settings files also deny the executor edits under
+`~/spectricom-orchestrator/state/preflight/`, and the fire prompt says when to run the full typecheck.
+
 ## Pre-fire assertions (prefire.py)
 
 `run_batch` runs `prefire.report(brief)` before anything fires; any failure refuses the brief (the daemon moves it to

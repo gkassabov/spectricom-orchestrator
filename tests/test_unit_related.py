@@ -182,7 +182,9 @@ class TestP2_1Related:
 # P2-2 · every trigger class forces the full suite, with its reason
 # ═══════════════════════════════════════════════════════
 TRIGGERS = ["package.json", "package-lock.json", "vitest.config.ts", "vite.config.ts", "tsconfig.app.json",
-            "src/test/helpers.ts", "src/setupTests.ts", "src/lib/x.ts", "server/api.ts", "src/types/t.ts"]
+            "src/test/helpers.ts", "src/setupTests.ts", "src/test.setup.ts"]
+# [ORCH-ROUTE-TIME-1] G-1: source trees are no longer triggers — a change under them is related through the import graph
+NOT_TRIGGERS = ["src/lib/x.ts", "server/api.ts", "src/types/t.ts"]
 
 
 class TestP2_2Full:
@@ -198,6 +200,17 @@ class TestP2_2Full:
         line = next(m for m in _msgs(caplog) if m.startswith("🎯 Unit gate: full suite: "))
         assert "(a)" in line and path in line and "unit_full_triggers" in line
         assert "full suite: (a)" in v.unit_collection
+
+    @pytest.mark.parametrize("path", NOT_TRIGGERS)
+    def test_a_source_tree_change_is_related_not_full(self, rig, caplog, path):
+        rig.cfg["unit_full_triggers"] = CLINICAL["unit_full_triggers"]
+        _branch(rig.repo, {**THREE, path: "changed\n"})
+        u = Unit(rig.monkeypatch, rig.repo)
+        with caplog.at_level(logging.INFO, logger="orch"):
+            v = _gate(rig)
+        assert u.runs() == [f"{TEST_CMD} -- {T1}"], u.runs()
+        assert not any(m.startswith("🎯 Unit gate: full suite: ") for m in _msgs(caplog)), _msgs(caplog)
+        assert f"related 1/{len(SUITE)} files" in v.unit_collection
 
     def test_a_sit_core_file_is_a_trigger(self, rig, caplog):
         rig.cfg["sit_core_files"] = ["sit/core.integration.test.ts"]
@@ -403,6 +416,9 @@ class TestConfig:
     def test_clinical_mp_declares_the_triggers_and_the_every(self):
         trig = CLINICAL["unit_full_triggers"]
         for t in ("package.json", "package-lock.json", "vitest*.config.*", "vite.config.*", "tsconfig*.json",
-                  "src/test/**", "**/setupTests.*", "src/lib/**", "server/**", "src/types/**"):
+                  "src/test/**", "**/setupTests.*", "src/test.setup.ts", "server/allowlist*.ts"):
             assert t in trig
+        for t in ("src/lib/**", "server/**", "src/types/**"):   # [ORCH-ROUTE-TIME-1] G-1
+            assert t not in trig
+        assert isinstance(CLINICAL["unit_always_files"], list) and CLINICAL["unit_always_files"]
         assert CLINICAL["unit_full_every"] == 5 and CLINICAL["full_gate_reuse_max_h"] == 24

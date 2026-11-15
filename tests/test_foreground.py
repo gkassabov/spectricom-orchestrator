@@ -167,9 +167,14 @@ def test_an_unfit_env_is_refused_not_fired(child, monkeypatch, caplog):
 
 # ── AC-FG-03 · the prompt pin ───────────────────────────────────────────────────────────────
 
+# [ORCH-ROUTE-TIME-1] G-4: the typecheck sentence the fire prompt carries before the preflight sentence
+TYPECHECK = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to confirm a "
+             "type-error fix; while iterating, run the related tests of the files you changed.")
+
+
 def test_the_child_is_told_to_stay_in_the_foreground(child):
     argv = child(1800)["argv"]
-    assert argv[-1] == "Read briefs/61-x.md" + PROMPT_TAIL
+    assert argv[-1] == "Read briefs/61-x.md" + PROMPT_TAIL + " " + TYPECHECK
 
 
 def test_source_guard_the_literal_in_fire_toni():
