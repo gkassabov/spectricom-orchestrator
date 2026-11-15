@@ -208,6 +208,23 @@ appears in the gate verdict's collection, or in the full gate's state file.
   test, `scripts/__tests__/gen-member-allowlist.test.ts`, for `docs/portal-read-map.md` and every call site it
   names. A malformed entry gives one warning line, and the related set is vitest's alone.
 
+## Route verdict `stopped` (ORCH-HANDBACK-STOP-STATUS-1, Kanban 690)
+
+Some routes run clean and say in their handback that they stopped. Every route logs one line:
+`🛑 handback-status: <STOP (g) | PARTIAL | DONE | none (…)> (<path>)`. The handback read is
+`<briefs_subdir>/<stem>.handback.md`; for a stem with a queue-order zero prefix (`0686-…`) whose exact handback
+is absent, it is `686-…`; for a re-gate, it is the re-gated route's. The line is the first of the first 40 lines
+that starts `Status:` or `Route status:`. A `passed` route whose line says `STOP` / `STOPPED` / `HELD` or
+`PARTIAL`, `DONE except`, or names an upper-case `STOP (x)` / `STOPPED` / `HELD` in a sentence that does not
+negate it, is reported `🏁 FINAL STATUS: stopped | gate: <the same gate label> | handback: STOP (g)` (or
+`| handback: PARTIAL`). `Result.error` quotes the line. `run` and `queue` exit `5` (`EXIT_STOPPED`), and
+`state.json` lists the route under `stopped`. `queue` halts after it. The queue daemon records it in
+`queue-state.json`'s `stopped` list (`stopped_total` in `status`), prints `[QUEUE] STOPPED: …`, counts it as a
+fire and does not pause. `verify` returns 1 for it. It never changes what merges: a stopped route merges, on
+every lane, exactly what it would have merged as `passed`, and no red route is ever demoted. No handback, no
+status line, or an unreadable file keeps today's verdict. To roll back, revert the commit. Older code ignores
+the `stopped` lists.
+
 ## Pre-fire assertions (prefire.py)
 
 `run_batch` runs `prefire.report(brief)` before anything fires; any failure refuses the brief (the daemon moves it to

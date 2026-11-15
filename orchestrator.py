@@ -576,6 +576,13 @@ class Status(str, Enum):
     # [ORCH-HANDBACK-GUARD-1] Neither `passed` nor `failed`: the executor's own closing words said
     # it had not finished, so no gate was run and nothing merged. See INCOMPLETE_VERDICT.
     INCOMPLETE="incomplete"
+    # [ORCH-HANDBACK-STOP-STATUS-1] Ran clean and merged what `passed` would merge, but its own handback's
+    # first STATUS line says STOP / PARTIAL. Only ever a demoted PASSED. See handback_status().
+    STOPPED="stopped"
+
+# [ORCH-HANDBACK-STOP-STATUS-1] G-5: the `run` / `queue` exit code of a STOPPED route (0-4 are taken).
+# queue_daemon.py mirrors it (pinned equal by tests/test_handback_stop_status.py).
+EXIT_STOPPED = 5
 
 @dataclass
 class Brief:
@@ -1366,7 +1373,7 @@ def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
 
 def notify(result: Result):
     e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else
-        ("🚨" if result.status == Status.TAMPERED else "❌"))
+        ("🚨" if result.status == Status.TAMPERED else ("🛑" if result.status == Status.STOPPED else "❌")))
     status_label = "passed (no changes)" if result.no_changes and result.status == Status.PASSED else result.status.value
     msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
     if result.tampered:
@@ -1417,7 +1424,7 @@ def notify(result: Result):
 # ═══════════════════════════════════════════════════════
 def load_state() -> dict:
     if STATE_FILE.exists(): return json.loads(STATE_FILE.read_text())
-    return {"queue":[], "completed":[], "failed":[], "watched":{}}
+    return {"queue":[], "completed":[], "failed":[], "stopped":[], "watched":{}}
 def save_state(s):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(s, indent=2, default=str))
@@ -1776,7 +1783,7 @@ def _finish_route_worktree(wt: Path, result: Optional["Result"]):
     """A route that merged, or changed nothing, leaves no worktree; any other keeps it, named in the log.
     The dependency links are removed first, so the removal can never reach into the main checkout."""
     branch = _git_read("git rev-parse --abbrev-ref HEAD", wt) or "?"
-    if result is None or result.status != Status.PASSED:
+    if result is None or result.status not in (Status.PASSED, Status.STOPPED):   # STOPPED merged as PASSED (G-3)
         log.warning(f"🌳 Route worktree preserved: {wt} (branch {branch}). After review: "
                     f"git -C {PROJECT_ROOT} worktree remove {wt}")
         return
@@ -4437,6 +4444,11 @@ def verify_route(stem: str, commit: Optional[str] = None) -> int:
     if not final:
         print(f"no FINAL STATUS line in {orch.name} — the route has not finished, or was killed")
         rc = 1
+    elif re.search(rf"FINAL STATUS: {Status.STOPPED.value}\b", final[-1]):
+        # [ORCH-HANDBACK-STOP-STATUS-1] G-7: merged as `passed` would, but its handback says STOP / PARTIAL
+        print(f"FINAL STATUS is {Status.STOPPED.value} — the handback's status line says STOP / PARTIAL; "
+              f"read it before closing the Kanban row (rule #15)")
+        rc = 1
     toni = _verify_toni_log(stem, log_dir, text)
     if toni is None:
         print(f"== handback-scan: no toni log in {log_dir} (toni-{stem}-*.log) — not run")
@@ -6798,6 +6810,95 @@ def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = No
 # BATCH RUNNER
 # ═══════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════
+# [ORCH-HANDBACK-STOP-STATUS-1] A ROUTE WHOSE HANDBACK SAYS STOP IS NOT REPORTED `passed`
+# ═══════════════════════════════════════════════════════
+# Route 685 STOPPED (g), merged its briefs-only handback and was reported `FINAL STATUS: passed`. The reader
+# below judges the handback FILE's first STATUS line; it only ever turns `passed` into `stopped` (fail-open:
+# no file / no status line / unreadable ⇒ None, today's verdict) and never changes what merges.
+HANDBACK_STATUS_LINES = 40
+_HB_STATUS_LABEL_RE = re.compile(r"^(route\s+)?status\s*:", re.IGNORECASE)
+_HB_STOP_LETTER_RE = re.compile(r"\bSTOP\s*\(([^()]{1,20})\)")
+_HB_STOP_TOKEN_RE = re.compile(r"\bSTOP\s*\([^()]{1,20}\)|\bSTOPPED\b|\bHELD\b")
+_HB_NEGATED_RE = re.compile(r"did not fire|not hit|was not hit|no STOP|not STOP", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class HandbackStatus:
+    """The first `Status:` / `Route status:` line of a handback, classified (G-1)."""
+    verdict: str            # "STOP" | "PARTIAL" | "DONE" (DONE = any status line that is not a stop)
+    letter: Optional[str]   # "g" for `STOP (g)`; None when the line names no STOP letter
+    line: str               # the status line as written (whitespace-stripped)
+    path: str
+
+    @property
+    def is_stop(self) -> bool:
+        return self.verdict in ("STOP", "PARTIAL")
+
+    @property
+    def label(self) -> str:
+        return f"STOP ({self.letter})" if self.verdict == "STOP" and self.letter else self.verdict
+
+
+def _classify_handback_status(text: str) -> tuple[str, Optional[str]]:
+    """The text after the status label's colon ⇒ (verdict, STOP letter). G-1 steps (1)-(5), in order."""
+    m = re.match(r"[A-Za-z]+", text)
+    first = m.group(0).upper() if m else ""
+    lm = _HB_STOP_LETTER_RE.search(text)
+    letter = lm.group(1).strip() if lm else None
+    if first in ("STOP", "STOPPED", "HELD"):
+        return "STOP", letter
+    if first == "PARTIAL" or re.search(r"DONE except", text, re.IGNORECASE):
+        return "PARTIAL", None
+    for sentence in re.split(r"(?<=[.;!?])\s+", text):
+        if _HB_STOP_TOKEN_RE.search(sentence) and not _HB_NEGATED_RE.search(sentence):
+            return "PARTIAL", None
+    return "DONE", None
+
+
+def _read_handback_status(path: Path) -> tuple[Optional[HandbackStatus], str]:
+    """(status, why-none). The first of the first HANDBACK_STATUS_LINES lines that, stripped of markdown
+    (`#`, `*`, `_`, backticks) and whitespace, starts `status:` or `route status:` (any case) is THE line."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[:HANDBACK_STATUS_LINES]
+    except FileNotFoundError:
+        return None, "no handback file"
+    except (OSError, UnicodeDecodeError) as e:
+        return None, f"unreadable: {type(e).__name__}: {str(e)[:120]}"
+    for raw in lines:
+        clean = re.sub(r"[*`]+", "", raw).strip().strip("#_ \t")
+        m = _HB_STATUS_LABEL_RE.match(clean)
+        if m:
+            verdict, letter = _classify_handback_status(clean[m.end():].strip(" \t#_"))
+            return HandbackStatus(verdict, letter, raw.strip(), str(path)), ""
+    return None, f"no status line in its first {HANDBACK_STATUS_LINES} lines"
+
+
+def handback_status(path: Path) -> Optional[HandbackStatus]:
+    """[ORCH-HANDBACK-STOP-STATUS-1] G-1: the handback's first status line, classified; None ⇒ no file, no
+    status line in its first 40 lines, or unreadable (the route keeps today's verdict). Pure: reads one file."""
+    return _read_handback_status(Path(path))[0]
+
+
+def route_handback_path(proj: Path, stem: str) -> Path:
+    """The route's handback: `<briefs_subdir>/<stem>.handback.md`; when absent and the stem carries a queue-order
+    zero prefix (`0686-…`), the zero-less name (`686-…`) a front-of-queue copy's executor writes, if that exists."""
+    d = proj / ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
+    exact = d / f"{stem}.handback.md"
+    if not exact.exists() and re.match(r"0+\d", stem):
+        alt = d / f"{re.sub(r'^0+(?=\d)', '', stem)}.handback.md"
+        if alt.exists():
+            return alt
+    return exact
+
+
+def _log_handback_status(path: Path) -> Optional[HandbackStatus]:
+    """Read the route's handback once and say what its status line was — one `🛑 handback-status:` line."""
+    hs, why = _read_handback_status(path)
+    log.info(f"🛑 handback-status: {hs.label if hs else f'none ({why})'} ({path})")
+    return hs
+
+
+# ═══════════════════════════════════════════════════════
 # [ORCH-HANDBACK-GUARD-1] A ROUTE THAT SAYS IT IS UNFINISHED DOES NOT MERGE
 # ═══════════════════════════════════════════════════════
 # The executor sometimes starts a long verification in the background and ends its turn:
@@ -6951,6 +7052,11 @@ def _regate_refused(batch_file: Path, why: str) -> Result:
                   exit_code=2, briefs=0, error=f"{REGATE_REFUSED} — {why}")
 
 
+def _regate_route_stem(spec: RegateSpec) -> str:
+    """The re-gated route's own stem — its branch less BRANCH_PREFIX — whose handback _regate_bring appends to."""
+    return spec.branch[len(BRANCH_PREFIX) + 1:] if spec.branch.startswith(BRANCH_PREFIX + "-") else spec.branch
+
+
 def _regate_bring(proj: Path, branch_name: Optional[str], batch_file: Path, spec: RegateSpec) -> Optional[str]:
     """On the re-gate's freshly cut branch (from MERGE_TARGET): merge the route's tip as a landing merges, then
     append the orchestrator's note to the route's handback and commit. None ⇒ done; else the typed refusal, with
@@ -6964,8 +7070,7 @@ def _regate_bring(proj: Path, branch_name: Optional[str], batch_file: Path, spec
         return (f"conflict bringing {spec.branch}@{spec.sha[:7]} onto {MERGE_TARGET} "
                 f"({', '.join(unmerged) or (r.stderr or r.stdout).strip()[-200:]})")
     briefs = ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
-    stem = spec.branch[len(BRANCH_PREFIX) + 1:] if spec.branch.startswith(BRANCH_PREFIX + "-") else spec.branch
-    hb = proj / briefs / f"{stem}.handback.md"
+    hb = proj / briefs / f"{_regate_route_stem(spec)}.handback.md"
     hb.parent.mkdir(parents=True, exist_ok=True)
     with hb.open("a") as f:
         f.write(f"\n\n## Re-gate (orchestrator, gates only — ORCH-REGATE-GATE-ONLY-1)\n\n"
@@ -7108,7 +7213,8 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
         _clear_running_marker(ACTIVE_REPO_NAME)
         if meta_wt:
             if is_self_mod and meta_branch:
-                if result is not None and result.exit_code == 0 and result.status == Status.PASSED:
+                # [ORCH-HANDBACK-STOP-STATUS-1] G-3: a STOPPED route merges exactly what `passed` would
+                if result is not None and result.exit_code == 0 and result.status in (Status.PASSED, Status.STOPPED):
                     # [ORCH-1] gate verdict was rendered in _run_batch_inner on the worktree checkout
                     merged = _self_mod_auto_merge(ORCH_DIR, meta_branch, gate_outcome=result.gate_outcome,
                                                   batch_file=batch_file)
@@ -7268,6 +7374,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     if tamper is None and status == Status.PASSED and regate is None:   # a re-gate has no executor to judge
         hold = (_executor_exit_hold(ec, branch_name or f"{BRANCH_PREFIX}-{batch_file.stem}", out_log)
                 or _handback_hold(out_log))
+    # [ORCH-HANDBACK-STOP-STATUS-1] G-2: the handback FILE's first status line, read once here; acted on only
+    # after the landed invariant below, and only on a `passed`. A re-gate's is the re-gated route's handback.
+    hb_status = _log_handback_status(route_handback_path(
+        proj, _regate_route_stem(regate) if regate is not None else batch_file.stem))
     if tamper is not None:
         # [ORCH-10] S2: not `passed`, and not `failed(product)` either — the run was handed a
         # repo it no longer recognises, so it has no opinion about the product at all.
@@ -7524,11 +7634,19 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             status = Status.FAILED
             gate_error = f"ORCH-CONFLICT-1 invariant — {unlanded[0]}; gate was {gate_outcome}"
 
+    # [ORCH-HANDBACK-STOP-STATUS-1] G-2: after every lane has merged (or not) and the landed invariant is judged —
+    # so a STOPPED route merged exactly what `passed` would have. Only a `passed` is demoted; a red stays red.
+    stop_error, stop_tag = None, ""
+    if status is Status.PASSED and hb_status is not None and hb_status.is_stop:
+        status, stop_tag = Status.STOPPED, f" | handback: {hb_status.label}"
+        stop_error = f"handback STATUS: {hb_status.label} — \"{hb_status.line[:160]}\""
+
     # [ORCH-10] AC-O10-05: `tampered` in the status field and `TAMPERED` in the gate field —
     # distinct from `passed` and from `FAIL(product)`, and greppable either way.
     incomplete = hold.label if hold is not None and status == Status.INCOMPLETE else None
     log.info(f"🏁 FINAL STATUS: {status.value} | gate: "
-             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label, incomplete, hold.verdict if hold else INCOMPLETE_VERDICT)}")
+             f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label, incomplete, hold.verdict if hold else INCOMPLETE_VERDICT)}"
+             f"{stop_tag}")
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),
@@ -7536,7 +7654,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
         new_migrations=new_mig, log_file=out_log,
         worktree=str(worktree) if worktree else None,
         no_changes=no_change_run, gate_outcome=gate_outcome, gate_collection=gate_collection,
-        unit_collection=unit_collection, error=gate_error,
+        unit_collection=unit_collection, error=stop_error or gate_error,
         tampered=(tamper.label if tamper is not None else None))  # [ORCH-10]
     notify(result)
     rate_limiter.record(batch_file.name, len(briefs), dur, status.value)
@@ -7552,6 +7670,27 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
 # ═══════════════════════════════════════════════════════
 # QUEUE (SEQUENTIAL)
 # ═══════════════════════════════════════════════════════
+def _record_result(state: dict, r: Result) -> None:
+    """[ORCH-HANDBACK-STOP-STATUS-1] G-5: state.json's list for one result — completed / stopped / failed."""
+    key = {Status.PASSED: "completed", Status.STOPPED: "stopped"}.get(r.status, "failed")
+    state.setdefault(key, []).append(asdict(r))
+
+
+def _exit_code_of(results: list) -> int:
+    """0 — every result passed; EXIT_STOPPED — every one passed or stopped, at least one stopped; else 1."""
+    if all(r.status == Status.PASSED for r in results):
+        return 0
+    if all(r.status in (Status.PASSED, Status.STOPPED) for r in results):
+        return EXIT_STOPPED
+    return 1
+
+
+def _stopped_tag(results: list) -> str:
+    """`, N stopped` for the QUEUE DONE / PARALLEL DONE line — empty when none stopped (today's line)."""
+    n = sum(1 for r in results if r.status == Status.STOPPED)
+    return f", {n} stopped" if n else ""
+
+
 def run_queue(files: list[Path], force: bool = False, skip_deps: bool = False):
     state = load_state(); results = []
     log.info(f"\n{'═'*60}\nQUEUE: {len(files)} batches\n{'═'*60}")
@@ -7569,13 +7708,15 @@ def run_queue(files: list[Path], force: bool = False, skip_deps: bool = False):
             log.error(f"⛔ Queue HALTED at batch {i+1} — rate limit exceeded")
             break
         r = run_batch(bf); results.append(r)
-        state["completed" if r.status==Status.PASSED else "failed"].append(asdict(r))
+        _record_result(state, r)
         save_state(state)
         # [ORCH-10] TAMPERED halts too: the working directory is not the one the route was
         # handed, so firing the next batch in it would compound the damage, not survive it.
-        if r.status in (Status.FAILED, Status.BLOCKED, Status.TAMPERED, Status.INCOMPLETE):
+        # [ORCH-HANDBACK-STOP-STATUS-1] G-5: STOPPED halts like INCOMPLETE (the daemon does not pause — OPEN (d)).
+        if r.status in (Status.FAILED, Status.BLOCKED, Status.TAMPERED, Status.INCOMPLETE, Status.STOPPED):
             rem = len(files)-i-1
-            if rem: log.error(f"⛔ Queue HALTED ({r.gate_outcome or r.status.value}) — {rem} batches skipped")
+            why = r.status.value if r.status is Status.STOPPED else (r.gate_outcome or r.status.value)
+            if rem: log.error(f"⛔ Queue HALTED ({why}) — {rem} batches skipped")
             break
         if i < len(files)-1:
             log.info(f"Cooldown {TONI_COOLDOWN}s..."); time.sleep(TONI_COOLDOWN)
@@ -7584,6 +7725,7 @@ def run_queue(files: list[Path], force: bool = False, skip_deps: bool = False):
     t = sum(r.duration_s for r in results)
     b = sum(r.briefs for r in results)
     nc_tag = f" ({nc} no changes)" if nc else ""
+    nc_tag += _stopped_tag(results)
     log.info(f"\n{'═'*60}\nQUEUE DONE: {p}/{len(results)} passed{nc_tag} | {b} briefs | {t:.0f}s\n{'═'*60}")
     return results
 
@@ -7620,11 +7762,11 @@ def run_parallel(files: list[Path], force: bool = False):
     branches = {r.batch_file: f"{BRANCH_PREFIX}-{Path(r.batch_file).stem}-w{wts.index(wt)+1}" for r, wt in results}
     log.info("\nGating each branch before any merge...")
     green = {r.batch_file for r, wt in sorted(results, key=lambda x: x[0].batch_file)
-             if r.status == Status.PASSED
+             if r.status in (Status.PASSED, Status.STOPPED)   # [ORCH-HANDBACK-STOP-STATUS-1] G-3
              and _gate_parallel_branch(wt, branches[r.batch_file]).outcome is GateOutcome.PASS}
     log.info("\nMerging sequentially...")
     for r, wt in sorted(results, key=lambda x: x[0].batch_file):
-        if r.status == Status.PASSED and r.batch_file in green:
+        if r.status in (Status.PASSED, Status.STOPPED) and r.batch_file in green:
             br = branches[r.batch_file]
             if merge_branch(br) and RUN_PLAYWRIGHT:
                 ok, _ = run_playwright()
@@ -7633,6 +7775,7 @@ def run_parallel(files: list[Path], force: bool = False):
     p = sum(1 for r,_ in results if r.status==Status.PASSED)
     nc = sum(1 for r,_ in results if r.no_changes)
     nc_tag = f" ({nc} no changes)" if nc else ""
+    nc_tag += _stopped_tag([r for r, _ in results])
     log.info(f"\nPARALLEL DONE: {p}/{len(results)} passed{nc_tag}")
 
 # ═══════════════════════════════════════════════════════
@@ -7661,7 +7804,7 @@ def watch():
                     briefs = parse_batch(f)
                     if approval_gate(f, briefs, approve=False, force=False):
                         r = run_batch(f)
-                        state["completed" if r.status==Status.PASSED else "failed"].append(asdict(r))
+                        _record_result(state, r)
                         save_state(state)
 
                         # Re-check blocked batches for cascade
@@ -8122,14 +8265,14 @@ def main():
                 sys.exit(2)
         r = run_batch(bf)
         s = load_state()
-        s["completed" if r.status==Status.PASSED else "failed"].append(asdict(r))
+        _record_result(s, r)
         save_state(s)
-        sys.exit(0 if r.status==Status.PASSED else 1)
+        sys.exit(_exit_code_of([r]))
 
     elif a.cmd == "queue":
         files = [resolve(f) for f in a.batch_files]
         rs = run_queue(files, force=a.force, skip_deps=getattr(a, 'skip_deps', False))
-        sys.exit(0 if all(r.status==Status.PASSED for r in rs) else 1)
+        sys.exit(_exit_code_of(rs))
 
     elif a.cmd == "watch":
         watch()

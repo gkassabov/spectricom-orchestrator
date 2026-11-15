@@ -58,6 +58,10 @@ QUEUE_STATE = ORCH_DIR / "queue-state.json"
 LOG_DIR = ORCH_DIR / "logs"   # the same root orchestrator.py writes to
 ORCHESTRATOR = ORCH_DIR / "orchestrator.py"
 REPOS_CONFIG = ORCH_DIR / "config" / "repos.yaml"
+# [ORCH-HANDBACK-STOP-STATUS-1] G-6: orchestrator.py's EXIT_STOPPED, mirrored (the daemon does not import
+# orchestrator.py; tests/test_handback_stop_status.py pins the two equal). Ran clean, merged as `passed` would,
+# but the handback's status line says STOP / PARTIAL.
+EXIT_STOPPED = 5
 
 # S7-CORE-16 [QUEUE-PAUSE-OPAQUE]. The CLI is another process: it cannot touch the daemon's memory, so
 # it leaves a request in the CONTROL FILE (state/queue-control.json, a monotonic `id`) and the daemon
@@ -738,6 +742,7 @@ class QueueDaemon:
         self.current_process = None
         self.completed = []
         self.failed = []
+        self.stopped = []              # [ORCH-HANDBACK-STOP-STATUS-1] G-6: exit EXIT_STOPPED routes
         self.consecutive_count = 0
         self.started_at = None
         self.config = {
@@ -795,6 +800,7 @@ class QueueDaemon:
                 data = json.loads(QUEUE_STATE.read_text())
                 self.completed = data.get("completed", [])
                 self.failed = data.get("failed", [])
+                self.stopped = data.get("stopped", [])
                 self.refused = data.get("refused", [])
                 self.persisted_executor = _executor_of(data)
                 self.persisted_repo = (data.get("config") or {}).get("repo")
@@ -827,6 +833,7 @@ class QueueDaemon:
                 "queue": [f.name for f in self._scan_queue()],
                 "completed": self.completed[-30:],
                 "failed": self.failed[-15:],
+                "stopped": self.stopped[-15:],
                 "refused": self.refused[-15:],
                 "config": self.config,
                 "consecutive_count": self.consecutive_count,
@@ -871,11 +878,13 @@ class QueueDaemon:
                 "queue_count": len(queue_files),
                 "completed": self.completed[-10:],
                 "failed": self.failed[-5:],
+                "stopped": self.stopped[-5:],
                 "refused": self.refused[-5:],
                 "config": self.config,
                 "consecutive_count": self.consecutive_count,
                 "completed_total": len(self.completed),
-                "failed_total": len(self.failed)
+                "failed_total": len(self.failed),
+                "stopped_total": len(self.stopped)
             }
 
     def enqueue(self, batch_path):
@@ -1038,9 +1047,9 @@ class QueueDaemon:
         return out
 
     def find_missing_gate_logs(self) -> list[GateLogViolation]:
-        """ORCH-STDOUT-1 over the recorded history: every completed/failed entry whose log is
+        """ORCH-STDOUT-1 over the recorded history: every completed/failed/stopped entry whose log is
         not a readable, non-empty file. Empty = clean. Report only — `check-logs` calls this."""
-        return check_gate_log_invariants(self.completed + self.failed)
+        return check_gate_log_invariants(self.completed + self.failed + self.stopped)
 
     def retire_merged_briefs(self) -> int:
         """Boot assert B6, automated (QUEUE-RETIRE-1 / T3). Returns the number retired.
@@ -1548,6 +1557,15 @@ class QueueDaemon:
                     self.completed.append(entry)
                     self.consecutive_count += 1
                     print(f"[QUEUE] PASSED: {batch_name} ({duration_s:.0f}s)")
+                elif exit_code == EXIT_STOPPED:
+                    # [ORCH-HANDBACK-STOP-STATUS-1] G-6: a fire that merged what `passed` would, whose handback
+                    # says STOP / PARTIAL. The tray as the merge left it (as for 0); no pause (OPEN (d)).
+                    entry["status"] = "stopped"
+                    _safe_move(next_batch, QUEUE_DONE / batch_name)
+                    self.stopped.append(entry)
+                    self.consecutive_count += 1
+                    print(f"[QUEUE] STOPPED: {batch_name} (handback STATUS STOP/PARTIAL — read it before closing "
+                          f"the Kanban row, rule #15; {duration_s:.0f}s)")
                 else:
                     _safe_move(next_batch, QUEUE_FAILED / batch_name)
                     self.failed.append(entry)
@@ -1903,7 +1921,7 @@ def main(argv: list) -> int:
         print(f"B6: {len(violations)} queued brief(s) whose route already merged")
         return 1 if violations else 0
     elif cmd == "check-logs":
-        # ORCH-STDOUT-1 over completed + failed, report-only. Deliberately NOT part of
+        # ORCH-STDOUT-1 over completed + failed + stopped, report-only. Deliberately NOT part of
         # `check`: B6's exit semantics stay B6's. Entries recorded before ORCH-STDOUT-1
         # have no log_file and report no-log-recorded until they roll out of the lists.
         violations = d.find_missing_gate_logs()
