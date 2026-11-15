@@ -193,6 +193,11 @@ appears in the gate verdict's collection, or in the full gate's state file.
   second link, never with itself. With no reference the log line says so, and the leg is judged as before. Kill
   switch: `ORCH_UNIT_LOAD_CHECK=off` skips the signal and the collection check, with one warning line per gate.
   Entries cached before this change are not re-measured here; cleaning them up is Gemma's step, OPEN (b).
+- **A newly-failing file keeps its error lines** (Part B). The first ≤5 error lines of each failing file, each
+  ≤200 chars, are read from the whole suite output before it is cut to its last 20 000 chars. A line naming the
+  env_file or a `.env` is elided. The unit-log entry gains `confirm_errors: {<file>: [<lines>]}` for every
+  newly-failing file, flaky or not. The lines come from the whole-suite run that named the file, not the
+  isolation pass. The full gate's state carries the same field for its suspects. No verdict changes.
 
 ## Pre-fire assertions (prefire.py)
 

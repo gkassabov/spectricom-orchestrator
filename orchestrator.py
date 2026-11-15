@@ -3097,11 +3097,13 @@ class UnitSuiteRun:
     # [ORCH-UNIT-RELATED-1] False on a baseline made from another measurement (a full-suite entry restricted to the
     # related files, or no related file at the base): its `failures` counts FILES, so no count is compared with it.
     count_comparable: bool = True
-    # [ORCH-FULLGATE-WT-FSDENY-1] G-A1, read from the UNTRUNCATED output before `output` is capped: the test files
-    # vitest could not load because Vite denied a path under a node_modules link _link_unit_deps made for this run —
-    # ((file, denied path), …), first first. () ⇒ none seen (a cached or stubbed run carries none).
+    # [ORCH-FULLGATE-WT-FSDENY-1] G-B1, read from the UNTRUNCATED output before `output` is capped: (a) the test
+    # files vitest could not load because Vite denied a path under a node_modules link _link_unit_deps made for this
+    # run — ((file, denied path), …), first first; (b) per failing file its first ≤5 error lines. () / None ⇒ none
+    # seen (a cached or stubbed run carries neither).
     load_denied: tuple = ()
     linked_realpaths: tuple = ()
+    file_errors: Optional[dict] = None
 
     @property
     def collection(self) -> Optional[str]:
@@ -3206,6 +3208,9 @@ class UnitGateOutcome:
     scope_reason: Optional[str] = None
     related_files: tuple = ()
     branch_cmd: Optional[str] = None
+    # [ORCH-FULLGATE-WT-FSDENY-1] G-B1: {newly-failing file: its first ≤5 error lines from the whole-suite run that
+    # named it} — written to the unit-log entry as `confirm_errors`. None ⇒ no file was newly failing.
+    confirm_errors: Optional[dict] = None
 
     @property
     def clock(self) -> Optional[ClockViolation]:
@@ -3445,9 +3450,12 @@ def _link_unit_deps(src: Path, dst: Path, isolated: bool = False) -> list:
 # leg's `vite-fs-deny` is evaluated HERE, never in ENV_BLOCK_SIGNALS (the build and SIT gates read that table).
 UNIT_LOAD_CHECK_VAR = "ORCH_UNIT_LOAD_CHECK"   # `off` ⇒ no vite-fs-deny signal and no full-gate collection check
 UNIT_LOAD_SIGNAL = "vite-fs-deny"
+UNIT_ERROR_LINES = 5          # G-B1: a failing file's first error lines kept, each ≤ _GATE_STDERR_LINE_CHARS
 _UNIT_DENIED_ID_RE = re.compile(r"^\s*(?:Error: )?Denied ID (\S+)")
 _UNIT_FAIL_HEAD_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(.+?)\s*$")
 _UNIT_BLOCK_END_RE = re.compile(r"^\s*(?:⎯|Test Files\s|Tests\s|Duration\s|Start at\s|RUN\s+v)")
+_UNIT_PYTEST_FAILED_MSG_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?\.py)(?:::\S+)?\s+-\s+(.+?)\s*$")
+_UNIT_ENV_TOKEN_RE = re.compile(r"(?<![\w.])\.env\b")
 _UNIT_LINKED: dict = {}       # str(worktree root) → realpaths of the node_modules links _link_unit_deps made there
 
 
@@ -3518,6 +3526,29 @@ def _unit_load_said(denied: tuple) -> str:
     """`vite-fs-deny: 82 test file(s) could not load (first: <file> · Denied ID <path>)`."""
     f, p = denied[0]
     return f"{UNIT_LOAD_SIGNAL}: {len(denied)} test file(s) could not load (first: {f} · Denied ID {p})"
+
+
+def _unit_file_errors(raw: str, elide: Optional[str] = None) -> dict:
+    """G-B1: {failing file: its first UNIT_ERROR_LINES error lines} — the lines under its vitest FAIL header(s), or
+    pytest's `FAILED <file>::<test> - <message>`; each ≤ _GATE_STDERR_LINE_CHARS. A line naming the env_file (or any
+    `.env`) is never kept, only said elided (canon §23.9d, as _gate_fast_death)."""
+    out: dict = {}
+
+    def keep(f, line):
+        lines = out.setdefault(f, [])
+        if len(lines) < UNIT_ERROR_LINES:
+            s = line.strip()
+            if (elide and elide in s) or _UNIT_ENV_TOKEN_RE.search(s):
+                s = f"<a line naming {elide or '.env'}, elided — its values are never logged>"
+            lines.append(s[:_GATE_STDERR_LINE_CHARS])
+    for f, line in _unit_blocks(raw):
+        if f:
+            keep(f, line)
+    for line in _ANSI_RE.sub("", raw or "").splitlines():
+        m = _UNIT_PYTEST_FAILED_MSG_RE.match(line)
+        if m:
+            keep(_norm_test_path(m.group(1)), m.group(2))
+    return out
 
 
 def _unit_unloadable(*runs) -> dict:
@@ -3648,12 +3679,13 @@ def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None
                            text=True, cwd=str(cwd), timeout=budget)
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         parsed = _parse_unit_summary(raw)
-        # [ORCH-FULLGATE-WT-FSDENY-1] G-A1: the evidence comes from the WHOLE output, before the cap below
+        # [ORCH-FULLGATE-WT-FSDENY-1] G-B1: the evidence comes from the WHOLE output, before the cap below
         linked = _UNIT_LINKED.get(str(cwd), ())
         try:
-            evidence = {"load_denied": _unit_load_denied(raw, linked, cwd), "linked_realpaths": linked}
+            evidence = {"load_denied": _unit_load_denied(raw, linked, cwd), "linked_realpaths": linked,
+                        "file_errors": _unit_file_errors(raw, _gate_env_file(Path(cwd))[0])}
         except Exception as e:   # evidence only: a parse that raises costs the evidence, never the run
-            log.warning(f"⚠️  Unit run {ref}: load evidence not read ({type(e).__name__}: {e})")
+            log.warning(f"⚠️  Unit run {ref}: load/error evidence not read ({type(e).__name__}: {e})")
             evidence = {"linked_realpaths": linked}
         return UnitSuiteRun(ref=ref, exit_code=r.returncode, duration_s=time.time() - started,
                             output=raw[-20000:], clocks=(c0, _leg_clocks()),
@@ -4955,8 +4987,12 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                                   red=branch_run.exit_code != 0 or bool(branch_run.failures),
                                   completed=branch_run.error is None)
 
+    confirm_errors: dict = {}   # [ORCH-FULLGATE-WT-FSDENY-1] G-B1: filled when a file is newly failing
+
     def _finish(o: UnitGateOutcome) -> UnitGateOutcome:
         o.branch_sha, o.branch_tree_why = tip or None, tree_why
+        if confirm_errors and o.confirm_errors is None:
+            o.confirm_errors = dict(confirm_errors)
         if scope is not None:
             o.scope, o.scope_reason, o.branch_cmd = scope_label, scope.reason, branch_cmd
             o.related_files = tuple(scope.files or ())
@@ -5065,6 +5101,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         # evidence for FAIL(product) — confirm the suspect set in isolation before deciding.
         log.info(f"🔬 Unit gate: {len(new_files)} newly-failing file(s) — confirming in "
                  f"isolation before verdict: {', '.join(new_files)}")
+        confirm_errors.update({f: list((branch_run.file_errors or {}).get(f, ())) for f in new_files})
         flakes, regressions, confirm_run = _unit_confirm_new_files(repo_path, test_cmd, label, new_files)
         if load_check and regressions and confirm_run is not None and confirm_run.load_denied:
             # a file that could not load ALONE is not confirmed failing: it joins the unloadable files
@@ -5169,6 +5206,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         files = tuple(sorted({_unit_test_file(t) for t in extras}))
         log.info(f"🔬 Unit gate: {rose} — {len(extras)} extra failing test(s): {'; '.join(extras)}; confirming "
                  f"their file(s) in isolation: {', '.join(files)}")
+        confirm_errors.update({f: list((branch_run.file_errors or {}).get(f, ())) for f in files})
         flaky_t, regressions, confirm_run = _unit_confirm_new_files(repo_path, test_cmd, label, files, tests=extras)
         if confirm_run is not None:
             confirm_run.clock = _judge_leg("unit-confirm", confirm_run.clocks, archive,
@@ -5266,6 +5304,8 @@ def _log_unit_outcome(archive: Path, repo_path: Path, o: UnitGateOutcome):
         "baseline_source": o.baseline_source,   # [ORCH-5] AC-O5-05 / decision 5
         "branch": _side(o.branch),
         "flaky_files": list(o.flaky_files),     # [ORCH-6] AC-O6-06
+        # [ORCH-FULLGATE-WT-FSDENY-1] G-B1 optional: each newly-failing file's first error lines (whole-suite run)
+        **({"confirm_errors": o.confirm_errors} if o.confirm_errors is not None else {}),
         # [ORCH-UNIT-RELATED-1] optional: only when the per-route leg chose its scope
         **({"scope": o.scope, "scope_reason": o.scope_reason, "related_files": list(o.related_files),
             "branch_cmd": o.branch_cmd} if o.scope else {}),
@@ -6241,6 +6281,8 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
         base = {"source": "none", "sha": None, "note": "nothing measured to compare against — every failing file is new"}
     out["baseline"] = base
     suspects = tuple(sorted(set(run.failing_files) - ref_files - set(unloadable)))
+    if suspects and run.file_errors is not None:   # [ORCH-FULLGATE-WT-FSDENY-1] G-B1
+        out["confirm_errors"] = {f: list(run.file_errors.get(f, ())) for f in suspects}
     if run.clock is None and hit is None and reused is None and ck and _unit_is_cacheable(run) \
             and not (coll or {}).get("dropped"):   # G-A3: a dropped collection is never a reference (no ratchet)
         _unit_cache_store(archive, ACTIVE_REPO_NAME, sha, test_cmd, run, repo_path=PROJECT_ROOT, content_key=ck)
