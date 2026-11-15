@@ -17,7 +17,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
+import prefire  # noqa: E402
 from test_control_scope import TS, DeadRoute, _git, _sha  # noqa: E402
+from test_opex_prefire import FIVE, brief, canon, opex  # noqa: E402,F401  (canon: the autouse scratch canon)
 
 TAG = "[QUEUE] 🛡 dead-route-recovery: clinical-mp —"
 ROUTE = "101-clip-truth-2"
@@ -178,3 +180,64 @@ def test_P_A6c_a_non_executor_process_in_the_tree_does_not_hold_it(dead, capsys)
     with _Holder(dead.repo, "node"):
         _start(dead)
         _assert_returned_to_main(dead, capsys.readouterr().out)
+
+
+# ── Part B ───────────────────────────────────────────────────────────────────
+def test_P_B1_a_h3_list_beside_a_h2_list_is_judged(tmp_path):
+    b = brief(tmp_path, allowed="`src/x.ts`\n\n## Part B\n### B2 · ALLOWED FILES\n`src/lib/cds/y.ts`\n")
+    assert prefire.allowed_paths(b) == ["src/x.ts", "src/lib/cds/y.ts"]
+    v = opex(b)["OPX-3"]
+    assert not v.ok and v.line.startswith("OPX-3 ❌ NEVER-AUTONOMOUS") and "src/lib/cds/y.ts" in v.line, v.line
+
+
+@pytest.mark.parametrize("hashes", ["####", "#####", "######"])
+def test_P_B2_every_depth_to_six_is_read(tmp_path, hashes):
+    b = brief(tmp_path, allowed="`src/x.ts`\n\n## Part B\n%s B2 · ALLOWED FILES\n`src/lib/cds/y.ts`\n" % hashes)
+    assert prefire.allowed_paths(b) == ["src/x.ts", "src/lib/cds/y.ts"]
+    v = opex(b)["OPX-3"]
+    assert not v.ok and "src/lib/cds/y.ts" in v.line, v.line
+
+
+def test_P_B3_a_brief_whose_only_lists_are_h3_is_read_not_refused(tmp_path):
+    b = brief(tmp_path, allowed=None, header="\n## Part A\n### A2 · ALLOWED FILES\n`src/x.ts`\n")
+    assert prefire.allowed_paths(b) == ["src/x.ts"]
+    v = opex(b)
+    assert v["OPX-3"].line == "OPX-3 ✅ no never-autonomous path in ALLOWED FILES", v["OPX-3"].line
+    assert v["OPX-2"].ok, v["OPX-2"].line
+
+
+def test_P_B3b_a_brief_whose_only_lists_are_h3_with_a_protected_path_is_refused(tmp_path):
+    b = brief(tmp_path, allowed=None, header="\n## Part A\n### A2 · ALLOWED FILES\n`src/lib/cds/y.ts`\n")
+    v = opex(b)["OPX-3"]
+    assert not v.ok and v.line.startswith("OPX-3 ❌ NEVER-AUTONOMOUS") and "src/lib/cds/y.ts" in v.line, v.line
+
+
+def test_P_B4_a_deep_section_ends_at_its_own_depth_or_shallower(tmp_path):
+    b = brief(tmp_path, allowed="`a.ts`\n\n## Part B\n### B2 · ALLOWED FILES\n`b/one.ts`\n#### more\n`b/two.ts`\n"
+                                 "### B3 · PREDICATES\n`src/lib/cds/not-read.ts`\n")
+    assert prefire.allowed_paths(b) == ["a.ts", "b/one.ts", "b/two.ts"]
+
+
+@pytest.mark.parametrize("line", ["# ALLOWED FILES", "####### ALLOWED FILES", "###ALLOWED FILES"])
+def test_P_B5_control_what_is_not_an_allowed_heading(tmp_path, line):
+    b = brief(tmp_path, allowed="`a.ts`\n\n## Part B\n%s\n`src/lib/cds/y.ts`\n" % line)
+    assert prefire.allowed_paths(b) == ["a.ts"]
+
+
+def test_P_B5b_control_a_heading_in_a_code_fence_is_not_a_heading(tmp_path):
+    b = brief(tmp_path, allowed="`a.ts`\n\n## Part B\n```\n### B2 · ALLOWED FILES\n`src/lib/cds/y.ts`\n```\n")
+    assert prefire.allowed_paths(b) == ["a.ts"]
+
+
+def test_P_B6_control_a_h2_section_is_read_as_today(tmp_path):
+    """A `##` section keeps its `###` sub-headings and ends at the next `#`/`##` heading — as at base."""
+    b = brief(tmp_path, allowed="`a.ts`\n### Part A\n`b/c.ts`\n### Part B ALLOWED FILES\n`d/e.ts`\n\n"
+                                 "## 2b · ALLOWED FILES (second brief)\n`f.ts`\n")
+    assert prefire.allowed_paths(b) == ["a.ts", "b/c.ts", "d/e.ts", "f.ts"]
+
+
+def test_P_B6b_control_the_operability_reader_is_unchanged(tmp_path):
+    """Only the ALLOWED FILES reader learns heading depth: a `###` Operability section is still not read (OPX-1
+    refuses, fail closed, as today)."""
+    b = brief(tmp_path, opex=FIVE.replace("## Operability", "### Operability"))
+    assert not opex(b)["OPX-1"].ok

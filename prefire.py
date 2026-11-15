@@ -55,7 +55,9 @@ ENFORCED:
                       '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying George … go / agreed.
                       A go line that is a placeholder (OWED, pending, TBD, …), empty, or carries no ruling id / go word /
                       timed quote is no go; words in quotes are George's.  [ORCH-PREFIRE-GO-TYPED-1] D-S7CORE50-27.
-                      OPX-2/-3 refuse a brief on row >= 393 with no ALLOWED FILES section (fail closed).
+                      OPX-2/-3 refuse a brief on row >= 393 with no ALLOWED FILES section (fail closed). An
+                      ALLOWED FILES heading is read at any depth, ## … ######; its section runs to the next heading
+                      of its depth or shallower.  [ORCH-PREFIRE-ALLOWED-H3-MISSED-1] D-S7CORE53-09.
   DEPCHANGE         — each '## Dependency change: <pkg>@<exact version> (dev|prod) — George go "<George's words>"'
                       line names an npm package, an exact version (no range, tag or URL) and a go whose quoted words
                       pass OPX-3's go grammar; a bad line, or two for one package, is a refusal. The fire hands the
@@ -569,7 +571,8 @@ OPEX_FROM_ROW = 393                       # OPX-1: rows below were written befor
 OPEX_LABELS = ("Telemetry", "Failure mode", "Rollback", "Agent permissions", "PHI")
 AGENT_INVENTORY = "SCP_Agent_Inventory"   # <canon>/SCP_Agent_Inventory_v*.md, the newest
 _OPEX_HEADING = re.compile(r'^##\s*Operability\s*(?:&|and)\s*safety\b', re.IGNORECASE)
-_ALLOWED_HEADING = re.compile(r'^##\s.*\bALLOWED\s+FILES\b', re.IGNORECASE)
+_ALLOWED_HEADING = re.compile(r'^#{2,6}\s.*\bALLOWED\s+FILES\b', re.IGNORECASE)   # any depth ## … ######
+_HEADING = re.compile(r'^(#{1,6})(?:\s|$)')
 _SECTION_END = re.compile(r'^#{1,2}(?:\s|$)')
 _FENCE = re.compile(r'^\s*(?:```|~~~)')
 _BULLET = re.compile(r'^\s*(?:[-*+]|\d+[.)])\s+')
@@ -623,6 +626,31 @@ def _section(text: str, heading: re.Pattern, every: bool = False) -> Optional[li
                 out = out if out is not None else []
             continue
         if inside:
+            out.append(raw)
+    return out
+
+
+def _allowed_section(text: str) -> Optional[list[str]]:
+    """[ORCH-PREFIRE-ALLOWED-H3-MISSED-1] The lines under every ALLOWED FILES heading at any depth (## … ######), each
+    up to the next heading of its own depth or shallower outside a code fence — so a `##` section ends exactly where
+    `_section` ends it, and a deeper heading inside one (an ALLOWED FILES one too) is part of it. Fence lines are
+    content. None when there is no such heading."""
+    out: Optional[list[str]] = None
+    depth = 0                                      # the open section's heading depth; 0 = none open
+    fenced = False
+    for raw in text.splitlines():
+        if _FENCE.match(raw):
+            fenced = not fenced
+        elif not fenced and _HEADING.match(raw):
+            d = len(_HEADING.match(raw).group(1))
+            if depth and d <= depth:
+                depth = 0
+            if not depth:
+                if _ALLOWED_HEADING.match(raw):
+                    depth = d
+                    out = out if out is not None else []
+                continue
+        if depth:
             out.append(raw)
     return out
 
@@ -696,8 +724,9 @@ def check_operability(filepath: Path) -> OpexVerdict:
 def allowed_paths(filepath: Path) -> Optional[list[str]]:
     """Every path the brief's ALLOWED FILES section(s) name, in order, once each: each word of a `code span`, and each
     bare word with a '/' or a file extension. What a line says after 'Read only:' or '**Not**' is not an edit and is
-    not read. A `:<line>` suffix is dropped. None when the brief has no ALLOWED FILES section."""
-    lines = _section(_read(filepath), _ALLOWED_HEADING, every=True)
+    not read. A `:<line>` suffix is dropped. None when the brief has no ALLOWED FILES section. A section's heading may
+    be at any depth, ## … ###### (_allowed_section, ORCH-PREFIRE-ALLOWED-H3-MISSED-1)."""
+    lines = _allowed_section(_read(filepath))
     if lines is None:
         return None
     words: list[str] = []
