@@ -53,6 +53,14 @@ NPM_FROZEN = ROOT / "executor" / "hooks" / "npm_frozen.py"
 TYPECHECK = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to confirm a "
              "type-error fix; while iterating, run the related tests of the files you changed.")
 PREFLIGHT_DENY = "Edit(~/spectricom-orchestrator/state/preflight/**)"
+# [698t] the deny list every settings file held before 698 (7b6cc99, all six identical), frozen here so P-9 never
+# reads `main`: true on 698's branch only, it failed every later orchestrator route's build gate (705, 13:16).
+PRE_698_DENY = ([f"{tool}({p})" for p in ("~/.ssh/**", "~/.aws/**", "~/.config/gcloud/**", "~/.config/gh/**",
+                                         "~/.git-credentials", "~/.npmrc", "~/.docker/config.json", "~/.claude/**",
+                                         "//mnt/c/**") for tool in ("Read", "Edit")]
+                + [f"Edit({a}{p})" for a in ("", "//") for p in ("**/.claude/**", "**/.mcp.json",
+                                                                "**/.github/workflows/**", "**/.husky/**",
+                                                                "**/.vscode/tasks.json")])
 KILL_CMD = 'bash "${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/kill_switch.sh" || exit 2'
 NPM_CMD = ('f="${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/npm_frozen.py"; '
            '{ [ -r "$f" ] && command -v python3 >/dev/null; } || { echo "🛡 npm frozen: the hook could not run (no $f '
@@ -616,9 +624,7 @@ class TestP9Deny:
     def test_every_settings_file_denies_edits_to_the_record(self, repo):
         deny = json.loads((SETTINGS / f"{repo}.json").read_text())["permissions"]["deny"]
         assert deny.count(PREFLIGHT_DENY) == 1 and deny[-1] == PREFLIGHT_DENY
-        head = json.loads(subprocess.run(["git", "-C", str(ROOT), "show", f"main:executor/settings/{repo}.json"],
-                                         capture_output=True, text=True, check=True).stdout)
-        assert deny[:-1] == head["permissions"]["deny"], "every pre-existing entry unchanged and in order"
+        assert deny[:-1] == PRE_698_DENY, "every pre-existing entry unchanged and in order"
         import re
         assert re.fullmatch(r"(Read|Edit)\((~/|//|\*\*/)[^()\s]+\)", PREFLIGHT_DENY)
 
