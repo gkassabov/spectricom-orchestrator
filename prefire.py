@@ -13,13 +13,18 @@ ENFORCED:
   A1  Kanban READY  — '## Kanban: <family> row <N>' must be declared, <family> one of
                       `kanban_families` in config/repos.yaml (default SCP_Kanban, Yorsie_Kanban), and row N
                       of the newest <family>_v*.md in the canon dir (`kanban_dir` in
-                      config/repos.yaml) must be READY and not MERGED / COMPLETE / CUT.
+                      config/repos.yaml): the State cell's first word is READY (markdown aside) and it
+                      carries no MERGED / COMPLETE / CUT. [ORCH-PREFIRE-PARSE-HAZARDS-1] a READY anywhere
+                      in the cell ('DONE … · was: READY', 'SUPERSEDED … · was READY') is not READY.
                       [ORCH-CONTROL-SCOPE-1] S7-CORE-18 L-49: five routes (99-103) were enqueued
                       with no Kanban row; "not decidable from the brief file" was true, and the
                       brief file now names the row that decides it.
   A2  sizing floor  — '## Estimated runtime:' must be declared and its lower bound
                       must be >= 30 min, unless '## Micro-fire trigger:' names a
-                      P0-infra or P1-safety trigger (System Prompt 5.9).
+                      P0-infra or P1-safety trigger (System Prompt 5.9): its value begins with P0 / P1
+                      (markdown aside) and does not negate it ('P1-safety: none', 'P1 — n/a'); a P0/P1
+                      later in the line ('none — no P1 trigger') is no trigger, and the A2 SIZING
+                      failure says so.  [ORCH-PREFIRE-PARSE-HAZARDS-1]
                       [ORCH-PREFIRE-RUNTIME-1] L-102: the line is also the route timeout
                       (orchestrator.parse_brief_timeout reads this module's parse, upper bound
                       × 1.25), so a line that gives no upper bound fails, micro-fire or not, and
@@ -42,7 +47,10 @@ ENFORCED:
                       reason of >= 3 words); rows below are grandfathered.  [ORCH-OPEX-PREFIRE-1] D-S7CORE33-20.
   OPX-2 agent policy — ALLOWED FILES naming an agent-runtime path (prefire_opex_paths.json `agent_runtime`) ⇒ the
                       brief cites an AP-… id the newest SCP_Agent_Inventory_v*.md in the canon folder lists. No
-                      inventory file ⇒ a refusal (fail closed; OC-4, D-S7CORE51-20).
+                      inventory file ⇒ a refusal (fail closed; OC-4, D-S7CORE51-20). A citation is an id on a
+                      '## Agent policy:' / '## Agent policies:' / '## Agent policy (…):' line or in the Operability
+                      Agent permissions answer — an id named anywhere else ('## Not in this route:', the body) is
+                      not credited, and the refusal names it.  [ORCH-PREFIRE-PARSE-HAZARDS-1]
   OPX-3 George go   — ALLOWED FILES naming a never-autonomous path (prefire_opex_paths.json `protected`) ⇒ a
                       '## George go:' line, or a '## Briefs:' / '## Spec reference:' line saying George … go / agreed.
                       A go line that is a placeholder (OWED, pending, TBD, …), empty, or carries no ruling id / go word /
@@ -53,6 +61,13 @@ ENFORCED:
                       pass OPX-3's go grammar; a bad line, or two for one package, is a refusal. The fire hands the
                       good entries to the executor's npm hook as TONI_DEP_CHANGES: the one install it allows.
                       [ORCH-NPM-FROZEN-1] OC-3, D-S7CORE51-18.
+  HDR header window — a header line a reader reads only in the brief's first N chars — Kanban, Estimated runtime,
+                      Test scope, Depends-on, Micro-fire trigger, Re-gate of (this module, _HEADER_CHARS = 6000);
+                      '## TONI_TIMEOUT_MIN:' and a '## Fire mechanism: … TONI_TIMEOUT_MIN=' line
+                      (admission.parse_brief_timeout, ADMISSION_HEADER_CHARS = 4000) — that ends past it is a refusal
+                      naming the line, its reader and the window: past it the line reads as absent. Lines inside a
+                      code fence are not judged. George go, Dependency change, ALLOWED FILES and Operability & safety
+                      are read in the whole file.  [ORCH-PREFIRE-PARSE-HAZARDS-1]
 
   Re-gate          — a brief whose header has '## Re-gate of: <route branch> <sha>' is a gates-only route
                       (orchestrator ORCH-REGATE-GATE-ONLY-1: no executor runs): A2's sizing floor is waived and the
@@ -92,9 +107,16 @@ KANBAN_FAMILIES = ("SCP_Kanban", "Yorsie_Kanban")
 _FAMILY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 KANBAN_READY = "READY"
 KANBAN_DONE = ("MERGED", "COMPLETE", "CUT")      # any of these in the State cell ⇒ not READY
+# [ORCH-PREFIRE-PARSE-HAZARDS-1] (i): READY is the cell's first word ('READY-REFIRE' and 'Ready' are not READY).
+_READY_FIRST = re.compile(r"^[^A-Za-z0-9]*" + KANBAN_READY + r"(?![\w-])")
 
 # How much of the brief header to scan for the declarations.
 _HEADER_CHARS = 6000
+# [ORCH-PREFIRE-PARSE-HAZARDS-1] (iv): admission.parse_brief_timeout's header window and its two override lines. This
+# module owns them (one copy — tests/test_admission_parser.py pins it) so that HDR judges the lines admission reads.
+ADMISSION_HEADER_CHARS = 4000
+TIMEOUT_MIN_LINE = re.compile(r'^## TONI_TIMEOUT_MIN:\s*(\d+)', re.MULTILINE)
+FIRE_MECHANISM_TIMEOUT_LINE = re.compile(r'^## Fire mechanism:.*TONI_TIMEOUT_MIN=(\d+)', re.MULTILINE)
 
 
 def _read(filepath: Path) -> str:
@@ -182,18 +204,34 @@ def parse_regate(filepath: Path) -> Optional[tuple[str, str]]:
     return (m.group(1), m.group(2).lower()) if m else None
 
 
+_MICROFIRE_LINE = re.compile(r'^##\s*Micro-fire trigger:\s*(.+)$', re.MULTILINE)
+# [ORCH-PREFIRE-PARSE-HAZARDS-1] (ii): the value begins with the P0/P1 token (and any '-qualifier'), and what follows it
+# — past ':', dashes and spaces — is not a negation ('P1-safety: none', 'P1 — n/a').
+_MICROFIRE_TOKEN = re.compile(r'P[01](?![0-9A-Za-z])(?:-\w+)*', re.IGNORECASE)
+_MICROFIRE_NEGATED = re.compile(r'[\s:—–-]*(?:none|n/a|na|no|not|never)\b', re.IGNORECASE)
+MICROFIRE_NOT_A_TRIGGER = ("The '## Micro-fire trigger:' line is not a trigger: it must begin with P0 or P1 and not "
+                           "negate it (ORCH-PREFIRE-PARSE-HAZARDS-1).")
+
+
+def microfire_line(filepath: Path) -> Optional[str]:
+    """The '## Micro-fire trigger:' value as written (stripped), trigger or not; None when the brief has no such line."""
+    m = _MICROFIRE_LINE.search(_read(filepath)[:_HEADER_CHARS])
+    return m.group(1).strip() if m else None
+
+
 def parse_microfire_trigger(filepath: Path) -> Optional[str]:
     """'## Micro-fire trigger:' line, if it names a P0-infra or P1-safety trigger.
 
     System Prompt 5.9 / A2: under the sizing floor is permitted only when the
     micro-fire trigger is named IN WRITING. A bare line does not satisfy it.
+    [ORCH-PREFIRE-PARSE-HAZARDS-1] (ii): named means the value (`*` and backticks aside) BEGINS with P0 / P1 and does
+    not negate it — 'none — no P1-safety trigger', 'not P0', 'P1-safety: none', 'P1 — n/a' are no trigger.
     """
-    m = re.search(r'^##\s*Micro-fire trigger:\s*(.+)$', _read(filepath)[:_HEADER_CHARS],
-                  re.MULTILINE)
-    if not m:
+    text = microfire_line(filepath)
+    if text is None:
         return None
-    text = m.group(1).strip()
-    if not re.search(r'\bP[01]\b', text, re.IGNORECASE):
+    m = _MICROFIRE_TOKEN.match(_MD.sub("", text).strip())
+    if not m or _MICROFIRE_NEGATED.match(m.string, m.end()):
         return None
     return text
 
@@ -355,12 +393,16 @@ def kanban_states(text: str, row: str) -> list[str]:
 
 def _state_word(state: str) -> str:
     """What a non-READY State cell says, in one word where it has one: a done token, else its
-    first capitalised status word (BACKLOG, LIVE, RETIRED), else the cell itself."""
+    first capitalised status word (BACKLOG, LIVE, RETIRED, DONE, SUPERSEDED), else the cell itself, quoted
+    (first 60 chars). [ORCH-PREFIRE-PARSE-HAZARDS-1] never READY: a cell whose first such word is READY
+    ('superseded — was READY') is quoted."""
     done = [t for t in KANBAN_DONE if re.search(rf"\b{t}\b", state)]
     if done:
         return done[0]
     word = re.search(r"\b[A-Z][A-Z_-]{2,}\b", state)
-    return word.group(0) if word else (state[:60] or "empty")
+    if word and word.group(0) != KANBAN_READY:
+        return word.group(0)
+    return "'%s'" % state[:60] if state else "empty"
 
 
 def check_kanban(filepath: Path) -> tuple[Optional[str], str]:
@@ -394,7 +436,7 @@ def check_kanban(filepath: Path) -> tuple[Optional[str], str]:
     if not states:
         return f"A1 KANBAN — {family} row {row} is missing from {newest[1]}, not READY", ""
     for state in states:
-        if not re.search(rf"\b{KANBAN_READY}\b", state) or any(re.search(rf"\b{t}\b", state) for t in KANBAN_DONE):
+        if not _READY_FIRST.match(state) or any(re.search(rf"\b{t}\b", state) for t in KANBAN_DONE):
             return f"A1 KANBAN — {family} row {row} is {_state_word(state)}, not READY", ""
     return None, f"{family} row {row} READY ({newest[1]})"
 
@@ -754,10 +796,23 @@ def _unjudged(tag: str, filepath: Path, paths: Optional[list[str]]) -> Optional[
     return None
 
 
+_AGENT_POLICY_LINE = re.compile(r'^##\s*Agent polic(?:y|ies)\b[^:\n]*:.*$', re.MULTILINE)
+
+
+def cited_policy_ids(filepath: Path) -> list[str]:
+    """[ORCH-PREFIRE-PARSE-HAZARDS-1] (iii): the AP-… ids the brief cites as its own, in order, once each — those on
+    every '## Agent policy:' / '## Agent policies:' / '## Agent policy (…):' line, then those in the Operability
+    `Agent permissions` answer. An id named anywhere else (`## Not in this route:`, the body) is not a citation."""
+    ids = [i for m in _AGENT_POLICY_LINE.finditer(_read(filepath)) for i in _POLICY_ID.findall(m.group(0))]
+    ids += _POLICY_ID.findall((operability_answers(filepath) or {}).get("Agent permissions", ""))
+    return list(dict.fromkeys(ids))
+
+
 def check_agent_policy(filepath: Path, paths: Optional[list[str]]) -> OpexVerdict:
     """OPX-2. ALLOWED FILES naming an agent-runtime path ⇒ the brief cites an Agent Policy id (AP-…) that the
     newest SCP_Agent_Inventory_v*.md in the canon folder lists. No inventory file ⇒ a refusal (fail closed; OC-4,
-    D-S7CORE51-20); the canon folder or the inventory unreadable ⇒ a refusal."""
+    D-S7CORE51-20); the canon folder or the inventory unreadable ⇒ a refusal. A citation is what cited_policy_ids
+    reads; a listed id the brief names only elsewhere is named in the refusal, not credited."""
     early = _unjudged("OPX-2", filepath, paths)
     if early:
         return early
@@ -781,14 +836,17 @@ def check_agent_policy(filepath: Path, paths: Optional[list[str]]) -> OpexVerdic
     except OSError as e:
         return OpexVerdict(False, "OPX-2 ❌ AGENT-POLICY — %s unreadable (%s), so no policy id can be checked (fails "
                                   "closed)" % (newest[1], e))
-    cited = list(dict.fromkeys(_POLICY_ID.findall(_read(filepath))))
+    cited = cited_policy_ids(filepath)
     good = [c for c in cited if c in listed]
     if good:
         return OpexVerdict(True, "OPX-2 ✅ agent-runtime path(s) %s under %s (%s)" % (_list(named), ", ".join(good), newest[1]))
+    elsewhere = [i for i in dict.fromkeys(_POLICY_ID.findall(_read(filepath))) if i in listed and i not in cited]
     return OpexVerdict(False, "OPX-2 ❌ AGENT-POLICY — ALLOWED FILES name agent-runtime path(s) %s and the brief cites no "
-                              "Agent Policy id that %s lists (%s)%s. Cite one, e.g. '## Agent policy: AP-…' "
+                              "Agent Policy id that %s lists (%s)%s%s. Cite one, e.g. '## Agent policy: AP-…' "
                               "(D-S7CORE33-20)" % (_list(named), newest[1], ", ".join(sorted(listed)) or "none",
-                                                         "; cited but not listed: %s" % ", ".join(cited) if cited else ""))
+                                                         "; cited but not listed: %s" % ", ".join(cited) if cited else "",
+                                                         "; named only outside '## Agent policy:' and Agent permissions "
+                                                         "(not credited): %s" % ", ".join(elsewhere) if elsewhere else ""))
 
 
 def _go_text_problem(text: str) -> Optional[str]:
@@ -963,6 +1021,45 @@ def dependency_changes(filepath: Path) -> tuple[list[dict], list[str]]:
     return [e for e, _ in good], problems
 
 
+# ── HDR: a header line its reader cannot see (ORCH-PREFIRE-PARSE-HAZARDS-1 (iv)) ──────────────────────────────────
+# (the reader's own regex, the window it reads, who reads it) — first matching entry names a line. A line past its
+# window reads as absent, silently: 341b5a's '## Depends-on:' started at char 6495, so its five dependencies were
+# never checked. George go / Dependency change / ALLOWED FILES / Operability are read whole and are not here.
+HEADER_WINDOWS = (
+    (_KANBAN_HEADER_ANY, _HEADER_CHARS, "prefire"),
+    (_RUNTIME_LINE, _HEADER_CHARS, "prefire"),
+    (_TEST_SCOPE_LINE, _HEADER_CHARS, "prefire"),
+    (_DEPENDS_ON_LINE, _HEADER_CHARS, "prefire"),
+    (_MICROFIRE_LINE, _HEADER_CHARS, "prefire"),
+    (_REGATE_LINE, _HEADER_CHARS, "prefire"),
+    (TIMEOUT_MIN_LINE, ADMISSION_HEADER_CHARS, "admission.parse_brief_timeout"),
+    (FIRE_MECHANISM_TIMEOUT_LINE, ADMISSION_HEADER_CHARS, "admission.parse_brief_timeout"),
+)
+
+
+def header_window_problems(filepath: Path) -> list[str]:
+    """HDR. One 'HDR ❌ HEADER-WINDOW — …' refusal per header line (HEADER_WINDOWS) whose END offset is past its
+    reader's window — a line the window cuts mid-way counts. Lines inside a code fence are not judged. [] when every
+    header line is in its window."""
+    out: list[str] = []
+    end, fenced = -1, False
+    for n, raw in enumerate(_read(filepath).split("\n"), 1):
+        start = end + 1
+        end = start + len(raw)
+        if _FENCE.match(raw):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        for rx, window, reader in HEADER_WINDOWS:
+            if end > window and rx.match(raw):
+                out.append("HDR ❌ HEADER-WINDOW — '%s' (line %d) ends at char %d, past %s's %d-char header window, so "
+                           "it is not read. Move it above char %d (ORCH-PREFIRE-PARSE-HAZARDS-1)"
+                           % (raw.strip()[:60], n, end, reader, window, window))
+                break
+    return out
+
+
 def check(filepath: Path) -> list[str]:
     """Return a list of assertion failures. Empty list == all checks pass."""
     failures: list[str] = []
@@ -974,6 +1071,8 @@ def check(filepath: Path) -> list[str]:
     line = _runtime_line(filepath)
     estimate = parse_declared_estimate(filepath)
     trigger = parse_microfire_trigger(filepath)
+    # [ORCH-PREFIRE-PARSE-HAZARDS-1] (ii): an A2 SIZING failure says when the micro-fire line it saw is no trigger
+    not_a_trigger = " " + MICROFIRE_NOT_A_TRIGGER if not trigger and microfire_line(filepath) is not None else ""
     regate_raw = regate_line(filepath)
     regate = parse_regate(filepath)
 
@@ -995,14 +1094,14 @@ def check(filepath: Path) -> list[str]:
                 "A2 SIZING — no '## Estimated runtime:' declared. "
                 "Declare it (>= %dm, ideally 45-90 — System Prompt 5.19.3), or add "
                 "'## Micro-fire trigger:' naming the P0-infra or P1-safety trigger (5.9)."
-                % SIZING_FLOOR_MIN
+                % SIZING_FLOOR_MIN + not_a_trigger
             )
     elif estimate < SIZING_FLOOR_MIN and not trigger:
         failures.append(
             "A2 SIZING — declared estimate %dm is under the %dm floor "
             "(System Prompt 5.19.3). Re-scope, bundle per 5.12, or add "
             "'## Micro-fire trigger:' naming the P0-infra or P1-safety trigger (5.9)."
-            % (estimate, SIZING_FLOOR_MIN)
+            % (estimate, SIZING_FLOOR_MIN) + not_a_trigger
         )
 
     hits = find_skip_sit(filepath)
@@ -1040,6 +1139,7 @@ def check(filepath: Path) -> list[str]:
 
     failures += [v.line for v in check_opex(filepath) if not v.ok]     # OPX-1/-2/-3 [ORCH-OPEX-PREFIRE-1]
     failures += dependency_changes(filepath)[1]                         # DEPCHANGE [ORCH-NPM-FROZEN-1]
+    failures += header_window_problems(filepath)                        # HDR [ORCH-PREFIRE-PARSE-HAZARDS-1]
 
     return failures
 

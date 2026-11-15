@@ -301,15 +301,17 @@ def parse_brief_timeout(brief) -> Optional[int]:
     line through prefire's parse (prefire.runtime_timeout: upper bound × 1.25).
 
     [ORCH-ADMISSION-PARSER-1] D1: this was a restated copy of the old '<n>-<m> m' grammar. After route 233,
-    a '2-3 h' brief got 180 min from the route but a daemon wall built from the 45-min default."""
+    a '2-3 h' brief got 180 min from the route but a daemon wall built from the 45-min default.
+    [ORCH-PREFIRE-PARSE-HAZARDS-1] (iv): the two override lines and their 4000-char window are prefire's
+    (TIMEOUT_MIN_LINE, FIRE_MECHANISM_TIMEOUT_LINE, ADMISSION_HEADER_CHARS), so prefire's HDR refuses a line past it."""
     try:
-        content = Path(brief).read_text(encoding="utf-8")[:4000]
+        content = Path(brief).read_text(encoding="utf-8")[:prefire.ADMISSION_HEADER_CHARS]
     except Exception:
         return None
-    m = re.search(r'^## TONI_TIMEOUT_MIN:\s*(\d+)', content, re.MULTILINE)
+    m = prefire.TIMEOUT_MIN_LINE.search(content)
     if m:
         return int(m.group(1))
-    m = re.search(r'^## Fire mechanism:.*TONI_TIMEOUT_MIN=(\d+)', content, re.MULTILINE)
+    m = prefire.FIRE_MECHANISM_TIMEOUT_LINE.search(content)
     if m:
         return int(m.group(1))
     return prefire.runtime_timeout(Path(brief))
