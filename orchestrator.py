@@ -4831,10 +4831,78 @@ def _unit_related_files(repo_path: Path, list_cmd: str, diff: "BranchDiff") -> t
     member = set(suite)
     changed = {_norm_test_path(p) for p in diff.paths}
     chosen = (set(affected) | changed) & member
+    extra, extra_said = _unit_related_extra(repo_path, changed, member, chosen)   # [ORCH-PREFLIGHT-READMAP-1]
+    chosen |= extra
     files = tuple(f for f in suite if f in chosen)
     return files, len(suite), (f"{len(set(affected) & member)} affected by the diff against merge-base "
-                               f"{diff.base[:7]} (--changed), {len(changed & member)} changed by the branch")
+                               f"{diff.base[:7]} (--changed), {len(changed & member)} changed by the branch"
+                               + extra_said)
 
+
+# ── [ORCH-PREFLIGHT-READMAP-1] G-C1 · declared extras the import graph cannot see (Kanban 601, 341n6b F-1) ─────────
+# scripts/__tests__/gen-member-allowlist.test.ts reads docs/portal-read-map.md (and the call-site files the map names)
+# with readFileSync, so `vitest --changed` never selects it for a change to them. repos.yaml `unit_related_extra`: a
+# list of {when: [globs], add: [test files], when_named_in: <doc>} — a diff path matching a `when` glob, or named in
+# the doc as a backtick span (a trailing :line / :line-line stripped) that is a file tracked at the head, adds `add`.
+UNIT_RELATED_EXTRA_KEY = "unit_related_extra"
+_DOC_BACKTICK_RE = re.compile(r"`([^`\n]+)`")
+_DOC_LINE_SUFFIX_RE = re.compile(r":\d+(?:-\d+)?$")
+
+
+def _unit_named_in(repo_path: Path, doc: str) -> set:
+    """Paths `doc` names in backticks that are files tracked at `repo_path`'s head (git ls-files); else nothing."""
+    try:
+        text = (repo_path / doc).read_text(encoding="utf-8", errors="replace")
+        r = subprocess.run(["git", "-C", str(repo_path), "ls-files", "-z"], capture_output=True, text=True,
+                           timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning(f"⚠️  Unit gate: {UNIT_RELATED_EXTRA_KEY}: {doc} unreadable ({type(e).__name__}) — no path named")
+        return set()
+    tracked = set((r.stdout or "").split("\0")) if r.returncode == 0 else set()
+    spans = {_norm_test_path(_DOC_LINE_SUFFIX_RE.sub("", s.strip())) for s in _DOC_BACKTICK_RE.findall(text)}
+    return {s for s in spans if s in tracked}
+
+
+def _unit_related_extra(repo_path: Path, changed: set, member: set, chosen: set) -> tuple:
+    """G-C1: (the suite files the declared rules add for `changed`, `, + N declared extra (unit_related_extra: …)`
+    or ""). A malformed entry is one warning line and adds nothing — today's related set, never an exception."""
+    raw = ACTIVE_REPO_CONFIG.get(UNIT_RELATED_EXTRA_KEY)
+    if raw is None:
+        return set(), ""
+    ok = isinstance(raw, list) and all(
+        isinstance(r, dict) and set(r) <= {"when", "add", "when_named_in"}
+        and isinstance(r.get("add"), list) and r["add"] and all(isinstance(a, str) and a.strip() for a in r["add"])
+        and isinstance(r.get("when", []), list) and all(isinstance(w, str) and w.strip() for w in r.get("when", []))
+        and (r.get("when") or isinstance(r.get("when_named_in"), str))
+        and (r.get("when_named_in") is None or (isinstance(r["when_named_in"], str) and r["when_named_in"].strip()))
+        for r in raw)
+    if not ok:
+        log.warning(f"⚠️  Unit gate: repos.yaml {UNIT_RELATED_EXTRA_KEY} is malformed (a list of {{when: [globs], add: "
+                    f"[test files], when_named_in: <doc>}} expected; got {str(raw)[:120]!r}) — ignored; the related "
+                    f"set is vitest's alone")
+        return set(), ""
+    try:
+        added, said = set(), []
+        for r in raw:
+            globs = [str(w).strip() for w in r.get("when") or ()]
+            hit = sorted(p for p in changed if any(_unit_trigger_hit(p, g) for g in globs))
+            doc = (r.get("when_named_in") or "").strip()
+            if doc and not hit:
+                named = _unit_named_in(repo_path, doc)
+                hit = sorted(p for p in changed if p in named)
+            if not hit:
+                continue
+            adds = [_norm_test_path(a) for a in r["add"]]
+            new = [a for a in adds if a in member and a not in chosen and a not in added]
+            added |= set(new)
+            rule = (", ".join(globs) or "-") + (f" or named in {doc}" if doc else "") + " → " + ", ".join(adds)
+            said.append(f"+ {len(new)} declared extra ({UNIT_RELATED_EXTRA_KEY}: {rule}; touched {hit[0]}"
+                        + (f" +{len(hit) - 1} more" if len(hit) > 1 else "") + ")")
+        return added, "".join(f", {s}" for s in said)
+    except Exception as e:   # a declared extra never breaks the gate: today's set
+        log.warning(f"⚠️  Unit gate: {UNIT_RELATED_EXTRA_KEY} not applied ({type(e).__name__}: {e}) — the related "
+                    f"set is vitest's alone")
+        return set(), ""
 
 
 def _unit_baseline_related(repo_path: Path, base_sha: str, test_cmd: str, files: tuple, archive: Path,

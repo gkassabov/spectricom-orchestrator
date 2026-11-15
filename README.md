@@ -198,6 +198,15 @@ appears in the gate verdict's collection, or in the full gate's state file.
   env_file or a `.env` is elided. The unit-log entry gains `confirm_errors: {<file>: [<lines>]}` for every
   newly-failing file, flaky or not. The lines come from the whole-suite run that named the file, not the
   isolation pass. The full gate's state carries the same field for its suspects. No verdict changes.
+- **Declared extras for the related set** (Part C). The import graph cannot relate some tests to a diff: a test
+  that reads a doc with `readFileSync`, for example. repos.yaml `unit_related_extra` declares them as a list of
+  `{when: [globs], add: [test files], when_named_in: <doc>}`. A rule fires when a diff path matches a `when` glob,
+  or when its doc names the path in a backtick span (a trailing `:line` / `:line-line` stripped) that is a file
+  tracked at the head. Routes and identifiers in backticks are ignored. A fired rule adds its `add` files that are
+  in the suite, and the scope line ends `+ N declared extra (unit_related_extra: <rule>; touched <path>)`. The
+  gate's related leg and the executor's `preflight` use the same function. clinical-mp declares the read-map pin
+  test, `scripts/__tests__/gen-member-allowlist.test.ts`, for `docs/portal-read-map.md` and every call site it
+  names. A malformed entry gives one warning line, and the related set is vitest's alone.
 
 ## Pre-fire assertions (prefire.py)
 
