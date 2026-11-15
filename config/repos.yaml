@@ -116,6 +116,14 @@ repos:
     # than this many hours, as its unit leg, and does not run the suite again. Set ORCH_FULLGATE_REUSE=off to
     # always run it.
     full_gate_reuse_max_h: 24
+    # ORCH-FULLGATE-WT-FSDENY-1 (Kanban 601): after its unit leg the full gate compares the tests it collected with
+    # the same tree's cached measurement (a drop above full_gate_collection_drop_same_pct percent is
+    # BLOCKED(environment)), else with the MAX of the nearest full_gate_collection_ref_n measured ancestors (above
+    # full_gate_collection_drop_pct percent), after subtracting the tests in test files deleted since. Any drop is
+    # never cached. ORCH_UNIT_LOAD_CHECK=off skips the check (and the unit legs' vite-fs-deny signal).
+    full_gate_collection_drop_pct: 2
+    full_gate_collection_drop_same_pct: 0.5
+    full_gate_collection_ref_n: 5
 
   orchestrator:
     project_dir: /home/gkassa/spectricom-orchestrator

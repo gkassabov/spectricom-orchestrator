@@ -171,6 +171,29 @@ appears in the gate verdict's collection, or in the full gate's state file.
   is refused unless `--requested-by <name>` is given. The name is recorded as `requested_by` in the state
   file. `--dry-run` and the daemon's `--trigger nightly` do not need it.
 
+## Unit evidence (ORCH-FULLGATE-WT-FSDENY-1 + ORCH-PREFLIGHT-READMAP-1, Kanban 601)
+
+- **A run whose test files could not load is not a measurement** (Part A). A baseline or full-gate worktree gets
+  `node_modules` as a symlink into the checkout. Vite may refuse the symlink's real path, printing
+  `Error: Denied ID <path>`, and that test file then never loads. The unit legs read this as the signal
+  `vite-fs-deny`: a `Denied ID` line at a line start, whose path (query string stripped) lies under a
+  `node_modules` link `_link_unit_deps` made for that run. It is not in `ENV_BLOCK_SIGNALS`, so build and SIT
+  classification never see it. `Failed to resolve import` stays a product failure. In such a run the regression
+  rule runs over the files that loaded on both sides, unchanged. A confirmed regression among them is still
+  `FAIL(product)`, and the detail adds `also vite-fs-deny: N file(s) could not load (first: …)`. Otherwise the
+  verdict is `BLOCKED(environment) — vite-fs-deny: N test file(s) could not load (first: <file> · Denied ID
+  <path>)`. Either way the run is never cached as a baseline, and never kept as a full gate's `previous`: its state
+  says `failing_files: null`. After its unit leg, the full gate also compares `tests_total` with a fixed reference.
+  The reference is the same tree's cached measurement, else the MAX of the nearest `full_gate_collection_ref_n`
+  (default 5) measured ancestors. Tests in `*.test.*` files deleted since are subtracted first, counted
+  statically (`it(` / `test(` calls, logged `approx −N deleted`). A drop above `full_gate_collection_drop_same_pct`
+  (same tree, default 0.5) or `full_gate_collection_drop_pct` (ancestor, default 2) is BLOCKED:
+  `⛔ full-gate unit: collected <n> tests vs <m> at <sha7> (−<k>%) — BLOCKED(environment), not FAIL(product)`. Any
+  drop is never cached, so it never becomes a reference (no ratchet). A reused leg is compared from the chain's
+  second link, never with itself. With no reference the log line says so, and the leg is judged as before. Kill
+  switch: `ORCH_UNIT_LOAD_CHECK=off` skips the signal and the collection check, with one warning line per gate.
+  Entries cached before this change are not re-measured here; cleaning them up is Gemma's step, OPEN (b).
+
 ## Pre-fire assertions (prefire.py)
 
 `run_batch` runs `prefire.report(brief)` before anything fires; any failure refuses the brief (the daemon moves it to

@@ -3097,6 +3097,11 @@ class UnitSuiteRun:
     # [ORCH-UNIT-RELATED-1] False on a baseline made from another measurement (a full-suite entry restricted to the
     # related files, or no related file at the base): its `failures` counts FILES, so no count is compared with it.
     count_comparable: bool = True
+    # [ORCH-FULLGATE-WT-FSDENY-1] G-A1, read from the UNTRUNCATED output before `output` is capped: the test files
+    # vitest could not load because Vite denied a path under a node_modules link _link_unit_deps made for this run —
+    # ((file, denied path), …), first first. () ⇒ none seen (a cached or stubbed run carries none).
+    load_denied: tuple = ()
+    linked_realpaths: tuple = ()
 
     @property
     def collection(self) -> Optional[str]:
@@ -3426,7 +3431,115 @@ def _link_unit_deps(src: Path, dst: Path, isolated: bool = False) -> list:
             created.append(d)
         except OSError as e:
             log.warning(f"⚠️  Unit baseline: could not link {rel}: {e}")
+    nm = tuple(os.path.realpath(d) for d in created if d.name == "node_modules")
+    if nm:   # [ORCH-FULLGATE-WT-FSDENY-1] G-A1: the links this run made — the only paths a vite-fs-deny may name
+        _UNIT_LINKED[str(dst)] = tuple(dict.fromkeys(_UNIT_LINKED.get(str(dst), ()) + nm))
     return created
+
+
+# ── [ORCH-FULLGATE-WT-FSDENY-1] a unit run whose files could not load is not a measurement (Kanban 601) ─────────────
+# 2026-11-12: the nightly full gate ran clinical-mp's unit suite in a detached worktree whose node_modules is a
+# symlink into the checkout; Vite's server.fs allow-list refused the symlink's real path (`Error: Denied ID
+# …/node_modules/pdfjs-dist/…/pdf.worker.min.mjs?url`), 82 files could not even load, and the gate called it
+# FAIL(product) — and every baseline measured that way since 2026-11-05 carried them as failing at the base. A unit
+# leg's `vite-fs-deny` is evaluated HERE, never in ENV_BLOCK_SIGNALS (the build and SIT gates read that table).
+UNIT_LOAD_CHECK_VAR = "ORCH_UNIT_LOAD_CHECK"   # `off` ⇒ no vite-fs-deny signal and no full-gate collection check
+UNIT_LOAD_SIGNAL = "vite-fs-deny"
+_UNIT_DENIED_ID_RE = re.compile(r"^\s*(?:Error: )?Denied ID (\S+)")
+_UNIT_FAIL_HEAD_RE = re.compile(r"^\s*(?:❯\s+)?FAIL\s+(.+?)\s*$")
+_UNIT_BLOCK_END_RE = re.compile(r"^\s*(?:⎯|Test Files\s|Tests\s|Duration\s|Start at\s|RUN\s+v)")
+_UNIT_LINKED: dict = {}       # str(worktree root) → realpaths of the node_modules links _link_unit_deps made there
+
+
+def _unit_links_forget(dst: Path):
+    _UNIT_LINKED.pop(str(dst), None)
+
+
+def _unit_load_check_on() -> bool:
+    return os.environ.get(UNIT_LOAD_CHECK_VAR, "").strip().lower() != "off"
+
+
+def _unit_load_check_said(where: str) -> bool:
+    """G-A4: True when the check runs; else one warning line for this gate, and False."""
+    if _unit_load_check_on():
+        return True
+    log.warning(f"⚠️  {where}: {UNIT_LOAD_CHECK_VAR}=off — the {UNIT_LOAD_SIGNAL} load check and the full gate's "
+                f"collection check are SKIPPED (today's verdicts)")
+    return False
+
+
+def _unit_blocks(raw: str):
+    """(file or None, line) for every non-blank line of `raw` (ANSI stripped), `file` the test file whose vitest
+    `FAIL <file> …` header the line sits under (None outside any block; a header line is its own file's)."""
+    cur = None
+    for line in _ANSI_RE.sub("", raw or "").splitlines():
+        if not line.strip():
+            continue
+        m = _UNIT_FAIL_HEAD_RE.match(line)
+        if m:
+            cur = _unit_test_file(_unit_strip_project(m.group(1))) or None
+            continue
+        if _UNIT_BLOCK_END_RE.match(line):
+            cur = None
+            continue
+        yield cur, line
+
+
+def _under_path(p: str, root: str) -> bool:
+    root = root.rstrip("/")
+    return bool(root) and (p == root or p.startswith(root + "/"))
+
+
+def _unit_load_denied(raw: str, linked_realpaths, root=None) -> tuple:
+    """G-A1: ((file, denied path), …), one per file in output order, for each vitest `Denied ID <path>` load error
+    (anchored at the line start, `Error: ` optional — never an assertion quoting it) whose path, query string
+    stripped, lies under one of `linked_realpaths` and outside `root`. A line under no FAIL header is file `?`."""
+    linked = [str(p) for p in (linked_realpaths or ()) if p]
+    if not linked or "Denied ID" not in (raw or ""):
+        return ()
+    out, seen = [], set()
+    for f, line in _unit_blocks(raw):
+        m = _UNIT_DENIED_ID_RE.match(line)
+        if not m:
+            continue
+        path = m.group(1).split("?", 1)[0]
+        if root is not None and _under_path(path, os.path.realpath(str(root))):
+            continue
+        if not any(_under_path(path, l) for l in linked):
+            continue
+        key = f or "?"
+        if key not in seen:
+            seen.add(key)
+            out.append((key, m.group(1)))
+    return tuple(out)
+
+
+def _unit_load_said(denied: tuple) -> str:
+    """`vite-fs-deny: 82 test file(s) could not load (first: <file> · Denied ID <path>)`."""
+    f, p = denied[0]
+    return f"{UNIT_LOAD_SIGNAL}: {len(denied)} test file(s) could not load (first: {f} · Denied ID {p})"
+
+
+def _unit_unloadable(*runs) -> dict:
+    """G-A2: {file: denied path} over the given runs' vite-fs-deny files (None runs skipped)."""
+    out: dict = {}
+    for r in runs:
+        for f, p in (getattr(r, "load_denied", None) or ()):
+            out.setdefault(f, p)
+    return out
+
+
+def _classify_unit_failure(output: str, repo_path: Path, exit_code: int, linked_realpaths=(), root=None,
+                           clock: Optional[ClockViolation] = None) -> GateVerdict:
+    """The unit leg's F-20 call: G-A1's vite-fs-deny first (unit legs only; ORCH_UNIT_LOAD_CHECK=off skips it), then
+    the shared _classify_gate_failure, unchanged."""
+    if _unit_load_check_on():
+        denied = _unit_load_denied(output, linked_realpaths, root)
+        if denied:
+            said = _unit_load_said(denied)
+            log.info(f"🔎 F-20 unit gate: signal '{UNIT_LOAD_SIGNAL}' matched — {said}")
+            return GateVerdict(GateOutcome.BLOCKED_ENV, "unit", UNIT_LOAD_SIGNAL, said)
+    return _classify_gate_failure("unit", output, repo_path, exit_code, clock=clock)
 
 
 def parse_isolated_deps(filepath: Path) -> bool:
@@ -3535,9 +3648,16 @@ def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None
                            text=True, cwd=str(cwd), timeout=budget)
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         parsed = _parse_unit_summary(raw)
+        # [ORCH-FULLGATE-WT-FSDENY-1] G-A1: the evidence comes from the WHOLE output, before the cap below
+        linked = _UNIT_LINKED.get(str(cwd), ())
+        try:
+            evidence = {"load_denied": _unit_load_denied(raw, linked, cwd), "linked_realpaths": linked}
+        except Exception as e:   # evidence only: a parse that raises costs the evidence, never the run
+            log.warning(f"⚠️  Unit run {ref}: load evidence not read ({type(e).__name__}: {e})")
+            evidence = {"linked_realpaths": linked}
         return UnitSuiteRun(ref=ref, exit_code=r.returncode, duration_s=time.time() - started,
                             output=raw[-20000:], clocks=(c0, _leg_clocks()),
-                            stderr_head=(r.stderr or "")[:GATE_STDERR_HEAD_CHARS], **parsed)
+                            stderr_head=(r.stderr or "")[:GATE_STDERR_HEAD_CHARS], **parsed, **evidence)
     except subprocess.TimeoutExpired:
         return UnitSuiteRun(ref=ref, exit_code=-1, duration_s=time.time() - started,
                             error="timeout", output="timeout", clocks=(c0, _leg_clocks()))
@@ -3581,6 +3701,7 @@ def _run_unit_baseline(repo_path: Path, sha: str, cmd: str) -> UnitSuiteRun:
                      f"(isolated deps — built its own {_describe_built(wt, built)})")
             return _run_unit_suite(cmd, wt, ref)
         finally:
+            _unit_links_forget(wt)
             for d in links:
                 try:
                     d.unlink()
@@ -3688,7 +3809,12 @@ def _unit_is_measurement(run: Optional[UnitSuiteRun]) -> bool:
 def _unit_is_cacheable(run: UnitSuiteRun) -> bool:
     """A baseline with no failure COUNT cannot serve as a baseline — the comparison needs a
     number. Caching one would freeze an unusable entry in place for every later route off
-    this base, so it is measured again instead."""
+    this base, so it is measured again instead.
+
+    [ORCH-FULLGATE-WT-FSDENY-1] G-A2: nor can a run in which test files could not load (vite-fs-deny) — its failing
+    set holds files that never ran, and every later route off this tree would read them as failing at the base."""
+    if getattr(run, "load_denied", None) and _unit_load_check_on():
+        return False
     return _unit_is_measurement(run) and run.failures is not None
 
 
@@ -4456,6 +4582,10 @@ def _unit_baseline_measure_or_reuse(repo_path: Path, base_sha: str, cmd: str, ar
                           related_files=related_files)
         return run, "measured", (f"measured now at {base_sha[:7]} and cached for later routes off this "
                                  f"tree (briefs aside){again}")
+    if _unit_is_measurement(run) and run.load_denied and _unit_load_check_on():
+        # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: compared over the files that loaded, never cached
+        return run, "measured", (f"measured now at {base_sha[:7]}; NOT cached — {_unit_load_said(run.load_denied)}"
+                                 f"{again}")
     if _unit_is_measurement(run):
         # It ran and collected something, but the summary gave no failure count. That is the
         # [ORCH-3] `comparison-unavailable` path — let it reach its own verdict, uncached.
@@ -4674,6 +4804,7 @@ def _unit_related_files(repo_path: Path, list_cmd: str, diff: "BranchDiff") -> t
                                f"{diff.base[:7]} (--changed), {len(changed & member)} changed by the branch")
 
 
+
 def _unit_baseline_related(repo_path: Path, base_sha: str, test_cmd: str, files: tuple, archive: Path,
                            repo_name: str) -> tuple:
     """[ORCH-UNIT-RELATED-1] the merge-base baseline for the related files: (run, source, note), as
@@ -4771,6 +4902,7 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
 
     label = branch_name or "HEAD"
     archive = archive_path or SIT_ARCHIVE_DIR
+    load_check = _unit_load_check_said("Unit gate")   # [ORCH-FULLGATE-WT-FSDENY-1] G-A4
     # [ORCH-UNIT-RELATED-1] what the branch leg runs: one 🎯 line, always, when a diff was handed over
     scope = _unit_scope(repo_path, test_cmd, diff) if diff is not None else None
     if scope is not None and not scope.capable:
@@ -4840,8 +4972,11 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     if branch_run.tests_total == 0 or branch_run.test_files_total == 0:
         # §2.4 / AC-O3-07: a green exit over an empty collection tested nothing.
         detail = f"branch suite collected NOTHING ({branch_run.collection}) — nothing was tested"
+        signal = "zero-collection"
+        if load_check and branch_run.load_denied:   # [ORCH-FULLGATE-WT-FSDENY-1] and why
+            detail, signal = f"{_unit_load_said(branch_run.load_denied)}; {detail}", UNIT_LOAD_SIGNAL
         log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not PASS, not FAIL(product)")
-        return _finish(UnitGateOutcome(passed=False, signal="zero-collection", detail=detail, env=True,
+        return _finish(UnitGateOutcome(passed=False, signal=signal, detail=detail, env=True,
                                        ran=True, branch=branch_run))
 
     # [ORCH-5]'s green-branch fast path is the one consumer of `failures` that reads an
@@ -4915,7 +5050,10 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
                                        ran=True, branch=branch_run, baseline=baseline_run,
                                        baseline_note=baseline_note, baseline_source=baseline_source))
 
-    new_files = tuple(sorted(set(branch_run.failing_files) - set(baseline_run.failing_files)))
+    # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: a file that could not load on either side is not compared — the rule below
+    # runs over the files that loaded, unchanged; with any such file the verdict is never PASS
+    unloadable = _unit_unloadable(branch_run, baseline_run) if load_check else {}
+    new_files = tuple(sorted(set(branch_run.failing_files) - set(baseline_run.failing_files) - set(unloadable)))
     # S7-CORE-9 [ORCH-6b] decision 1/2: the same tree measures 68/104/106/118 failures across
     # runs on one commit — a count delta carries no signal on its own. It is still measured,
     # logged and cached below, but it never appears in the boolean that decides the verdict.
@@ -4928,6 +5066,11 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         log.info(f"🔬 Unit gate: {len(new_files)} newly-failing file(s) — confirming in "
                  f"isolation before verdict: {', '.join(new_files)}")
         flakes, regressions, confirm_run = _unit_confirm_new_files(repo_path, test_cmd, label, new_files)
+        if load_check and regressions and confirm_run is not None and confirm_run.load_denied:
+            # a file that could not load ALONE is not confirmed failing: it joins the unloadable files
+            gone = _unit_unloadable(confirm_run)
+            unloadable.update({f: gone[f] for f in regressions if f in gone})
+            regressions = tuple(f for f in regressions if f not in gone)
         if confirm_run is not None:
             confirm_run.clock = _judge_leg("unit-confirm", confirm_run.clocks, archive,
                                            red=flakes is None or bool(regressions),
@@ -4962,10 +5105,26 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
             reasons.append(f"{branch_run.failures} failures vs baseline {baseline_run.failures}")
         if flakes:
             reasons.append(f"flaky in isolation, not blocking: {', '.join(flakes)}")
+        if unloadable:   # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: the real failure wins, the load error is still said
+            reasons.append(f"also {_unit_load_said(tuple(unloadable.items()))}")
         detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — " + "; ".join(reasons)
                   + f" (baseline {baseline_source})")
         log.error(f"⛔ UNIT BASELINE GATE FAILED — {detail}. BLOCKING: branch stays unmerged.")
         return _finish(UnitGateOutcome(passed=False, signal="regression", detail=detail,
+                                       ran=True, branch=branch_run, baseline=baseline_run,
+                                       baseline_note=baseline_note, baseline_source=baseline_source,
+                                       flaky_files=flakes, confirm=confirm_run))
+
+    if unloadable:
+        # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: no regression among the files that loaded, and some files did not —
+        # never PASS (the run measured less than the suite), never FAIL(product) (a file that never ran)
+        sides = " and ".join(s for s, r in (("branch", branch_run), ("baseline", baseline_run))
+                             if r is not None and r.load_denied) or "confirmation"
+        detail = (f"{_unit_load_said(tuple(unloadable.items()))} on the {sides} run — no regression among the files "
+                  f"that loaded" + (f"; flaky in isolation, not blocking: {', '.join(flakes)}" if flakes else "")
+                  + f" (baseline {baseline_source})")
+        log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment), not PASS, not FAIL(product)")
+        return _finish(UnitGateOutcome(passed=False, signal=UNIT_LOAD_SIGNAL, detail=detail, env=True,
                                        ran=True, branch=branch_run, baseline=baseline_run,
                                        baseline_note=baseline_note, baseline_source=baseline_source,
                                        flaky_files=flakes, confirm=confirm_run))
@@ -5568,8 +5727,14 @@ def _preflight_unit(repo_path: Path, reach: PathReach, label: str) -> dict:
     # never re-run alone, so a still-red file cannot read as flaky because its label matched nothing
     paths = tuple(f for f in run.failing_files if _unit_is_test_path(f))
     tests = list(run.failing_tests or ()) or _preflight_failures(run.output)
-    if not paths:
-        v = _classify_gate_failure("unit", run.output, repo_path, run.exit_code, clock=run.clock)
+    # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: a file that could not load is never re-run as a suspect, and never a pass
+    denied = _unit_unloadable(run) if _unit_load_check_said("Preflight unit") else {}
+    paths = tuple(f for f in paths if f not in denied)
+    if denied and not paths:
+        return {**leg, "status": "environment", "why": _unit_load_said(tuple(denied.items())), "failed": list(denied)}
+    if not paths:   # [ORCH-FULLGATE-WT-FSDENY-1] the unit leg's classifier: vite-fs-deny first, then F-20
+        v = _classify_unit_failure(run.output, repo_path, run.exit_code, run.linked_realpaths, repo_path,
+                                   clock=run.clock)
         return {**leg, "status": "fail" if v.outcome is GateOutcome.FAIL_PRODUCT else "environment",
                 "why": f"exit {run.exit_code}, no failing file named — {v.label}", "failed": tests}
     # the gate's isolation rule: a file that passes alone was its run's; one that fails alone is the branch's
@@ -5582,6 +5747,9 @@ def _preflight_unit(repo_path: Path, reach: PathReach, label: str) -> dict:
     if confirmed:
         leg.update(status="fail", why=f"{leg['why']}; failing alone: {', '.join(confirmed)} (the gate calls a file a "
                                       f"regression only if it is not failing at the merge base — not measured here)")
+    if denied:
+        leg.update(status=leg["status"] if confirmed else "environment",
+                   why=f"{leg['why']}; also {_unit_load_said(tuple(denied.items()))}")
     return leg
 
 
@@ -6006,6 +6174,7 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
         return {"ran": False, "outcome": "not gated", "detail": f"{ACTIVE_REPO_NAME}: no test_cmd in repos.yaml",
                 "failing_files": None, "new": []}
     label = f"full-gate {ref}@{sha[:7]}"
+    load_check = _unit_load_check_said("full-gate unit")   # [ORCH-FULLGATE-WT-FSDENY-1] G-A4
     reused, why_not = _full_gate_reusable(archive, sha, ck, test_cmd)
     if reused is not None:
         # [ORCH-FULLGATE-CACHE-1] 1b: this tree's judged full-suite measurement IS the unit leg — no suite run
@@ -6035,6 +6204,19 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
     out["failing_files"] = list(run.failing_files)
     _unit_full_counter_record(ACTIVE_REPO_NAME, full=True, why=f"{label}: the full gate's unit leg "
                                                                f"({'reused' if reused is not None else 'measured'})")
+    # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: files that could not load — never compared, never a later `previous`
+    unloadable = _unit_unloadable(run) if load_check else {}
+    if unloadable:
+        out["failing_files"] = None
+        out[UNIT_LOAD_SIGNAL] = {"files": len(unloadable), "first": next(iter(unloadable)),
+                                 "denied": unloadable[next(iter(unloadable))]}
+    # G-A3: the collection against the chain's measurements — a shrunken one is not a verdict
+    coll = _full_gate_collection(archive, sha, ck, test_cmd, run, reused) if load_check and not unloadable else None
+    if coll is not None:
+        out["collection_check"] = coll
+        if coll.get("blocked"):
+            return {**out, "outcome": "BLOCKED", "signal": "collection-shrank", "detail": coll["line"],
+                    "failing_files": None}
     # a reused leg is not its own baseline: the chain starts at the nearest measured ancestor of another tree
     hit = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck) if ck and reused is None \
         else None
@@ -6058,18 +6240,31 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
         ref_files = set()
         base = {"source": "none", "sha": None, "note": "nothing measured to compare against — every failing file is new"}
     out["baseline"] = base
-    suspects = tuple(sorted(set(run.failing_files) - ref_files))
-    if run.clock is None and hit is None and reused is None and ck and _unit_is_cacheable(run):
+    suspects = tuple(sorted(set(run.failing_files) - ref_files - set(unloadable)))
+    if run.clock is None and hit is None and reused is None and ck and _unit_is_cacheable(run) \
+            and not (coll or {}).get("dropped"):   # G-A3: a dropped collection is never a reference (no ratchet)
         _unit_cache_store(archive, ACTIVE_REPO_NAME, sha, test_cmd, run, repo_path=PROJECT_ROOT, content_key=ck)
         out["cached"] = True
     said = f"{out['reused']['note']}; " if reused is not None else ""
+
+    def _denied(extra: str = "") -> dict:   # G-A2: nothing confirmed among the files that loaded
+        d = f"{said}{_unit_load_said(tuple(unloadable.items()))} — no regression among the files that loaded{extra}"
+        log.error(f"⛔ full-gate unit: {d} — BLOCKED(environment), not PASS, not FAIL(product)")
+        return {**out, "outcome": "BLOCKED", "signal": UNIT_LOAD_SIGNAL, "detail": d}
     if not suspects:
+        if unloadable:
+            return _denied()
         return {**out, "outcome": "PASS", "detail": f"{said}{run.failures} failure(s), no failing file outside the "
                                                     f"baseline ({base['source']})"}
     if run.clock is not None:
         return {**out, "outcome": "BLOCKED", "signal": "clock-implausible",
                 "detail": f"{run.clock} — failing file(s) {', '.join(suspects)} measured on that clock"}
     flakes, regressions, confirm = _unit_confirm_new_files(wt, test_cmd, label, suspects)
+    if load_check and regressions and confirm is not None and confirm.load_denied:
+        gone = _unit_unloadable(confirm)   # could not load ALONE either: not confirmed failing
+        unloadable.update({f: gone[f] for f in regressions if f in gone})
+        regressions = tuple(f for f in regressions if f not in gone)
+        out["failing_files"] = None if unloadable else out["failing_files"]
     if confirm is not None:
         confirm.clock = _judge_leg("unit-confirm", confirm.clocks, archive, red=flakes is None or bool(regressions),
                                    completed=confirm.error is None, files=len(suspects))
@@ -6082,10 +6277,156 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
         return {**out, "outcome": "BLOCKED", "signal": "clock-implausible",
                 "detail": f"{confirm.clock} — {', '.join(regressions)} confirmed on that clock"}
     if regressions:
+        also = f"; also {_unit_load_said(tuple(unloadable.items()))}" if unloadable else ""   # G-A2: the real red wins
         return {**out, "outcome": "FAIL(product)", "new": list(regressions),
-                "detail": f"{said}failing alone, not in the baseline ({base['source']}): {', '.join(regressions)}"}
+                "detail": f"{said}failing alone, not in the baseline ({base['source']}): {', '.join(regressions)}{also}"}
+    if unloadable:
+        return _denied(f"; flaky in isolation, not new: {', '.join(flakes)}" if flakes else "")
     return {**out, "outcome": "PASS", "detail": f"{said}failing file(s) outside the baseline passed alone (flaky, not "
                                                 f"new): {', '.join(flakes)}"}
+
+
+# ── [ORCH-FULLGATE-WT-FSDENY-1] G-A3 · the full gate's collection against the chain's measurements ─────────────────
+# 2026-11-12 08:04 the nightly collected 19543 tests on a tree the checkout had measured at 20300 and returned a
+# verdict anyway. The unit leg's tests_total is compared with a fixed reference — the same tree's measurement, else
+# the MAX of the nearest full_gate_collection_ref_n measured ancestors — less the tests in test files deleted since
+# (a static `it(` / `test(` count: unit runs store no per-file counts). A drop beyond the threshold is
+# BLOCKED(environment); any drop is never cached, so it never becomes a reference (no ratchet).
+FULL_GATE_COLLECTION_DROP_PCT_KEY = "full_gate_collection_drop_pct"            # ancestor reference, percent
+FULL_GATE_COLLECTION_DROP_PCT = 2.0
+FULL_GATE_COLLECTION_DROP_SAME_PCT_KEY = "full_gate_collection_drop_same_pct"  # same content key, percent
+FULL_GATE_COLLECTION_DROP_SAME_PCT = 0.5
+FULL_GATE_COLLECTION_REF_N_KEY = "full_gate_collection_ref_n"                  # measured ancestors considered
+FULL_GATE_COLLECTION_REF_N = 5
+_UNIT_TEST_CALL_RE = re.compile(r"(?<![\w.$])(?:it|test)(?:\.(?:each|skip|only|todo))*\s*[(`]")
+_UNIT_TEST_NAME_RE = re.compile(r"\.test\.[^/]+$")
+
+
+def _full_gate_number(key: str, default, integer: bool = False):
+    """A positive number from repos.yaml, else `default` — a bad value is ignored loudly, never an exception."""
+    raw = ACTIVE_REPO_CONFIG.get(key)
+    if raw in (None, ""):
+        return default
+    try:
+        v = int(raw) if integer and not isinstance(raw, bool) else float(raw) if not isinstance(raw, bool) else -1
+    except (TypeError, ValueError):
+        v = -1
+    if v <= 0:
+        log.warning(f"⚠️  full-gate unit: repos.yaml {key}={raw!r} is not a positive number — using {default}")
+        return default
+    return v
+
+
+def _unit_cache_measured_ancestors(repo_path: Path, archive: Path, repo_name: str, sha: str, cmd: str, n: int,
+                                   exclude_ck: Optional[str] = None) -> list:
+    """G-A3: the `n` nearest judged FULL-suite cache measurements of strict ancestors of `sha` that carry a
+    tests_total, nearest first, each with `ancestor_distance`. `exclude_ck`: a reused leg's own tree never counts."""
+    found = []
+    for e in _unit_cache_load(archive).values():
+        if not isinstance(e, dict) or e.get("repo") != repo_name or e.get("test_cmd") != cmd:
+            continue
+        if (exclude_ck and e.get("content_key") == exclude_ck) or not e.get("sha") or e.get("sha") == sha:
+            continue
+        if not _unit_cache_judged(e) or (e.get("scope") or "full") != "full" \
+                or not isinstance(e.get("tests_total"), int) or isinstance(e.get("tests_total"), bool):
+            continue
+        if subprocess.run(["git", "-C", str(repo_path), "merge-base", "--is-ancestor", e["sha"], sha],
+                          capture_output=True).returncode != 0:
+            continue
+        d = subprocess.run(["git", "-C", str(repo_path), "rev-list", "--count", f"{e['sha']}..{sha}"],
+                           capture_output=True, text=True)
+        try:
+            found.append(dict(e, ancestor_distance=int((d.stdout or "").strip())))
+        except ValueError:
+            continue
+    return sorted(found, key=lambda e: e["ancestor_distance"])[:n]
+
+
+def _unit_deleted_tests(repo_path: Path, ref_sha: str, sha: str) -> tuple:
+    """G-A3: (tests counted, [deleted test files counted], [deleted test files unreadable]) — every `*.test.*` file
+    `git diff --name-status -M <ref_sha> <sha>` says was deleted, its `it(` / `test(` calls (with .each / .skip /
+    .only / .todo) counted in `git show <ref_sha>:<file>`. A diff that cannot be read deletes nothing."""
+    r = subprocess.run(["git", "-C", str(repo_path), "diff", "--name-status", "-M", ref_sha, sha],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return 0, [], []
+    total, counted, unread = 0, [], []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or parts[0] != "D" or not _UNIT_TEST_NAME_RE.search(parts[1]):
+            continue
+        s = subprocess.run(["git", "-C", str(repo_path), "show", f"{ref_sha}:{parts[1]}"],
+                           capture_output=True, text=True)
+        if s.returncode != 0:
+            unread.append(parts[1])
+            continue
+        total += len(_UNIT_TEST_CALL_RE.findall(s.stdout or ""))
+        counted.append(parts[1])
+    return total, counted, unread
+
+
+def _full_gate_collection(archive: Path, sha: str, ck: Optional[str], test_cmd: str, run: UnitSuiteRun,
+                          reused: Optional[dict]) -> dict:
+    """G-A3: the collection check's record (state `unit.collection_check`): `blocked` ⇒ the leg is
+    BLOCKED(environment) with `line`; `dropped` ⇒ fewer tests than the reference — judged as today, never cached.
+    No reference ⇒ judged as today, and the line says so. A reused leg is compared from the chain's second link."""
+    n = run.tests_total
+    if not isinstance(n, int):
+        line = "🔎 full-gate unit: the run states no test total — no collection comparison; judged as today"
+        log.info(line)
+        return {"reference": None, "line": line}
+    same = None
+    if reused is None and ck:
+        hit = _unit_cache_lookup(archive, ACTIVE_REPO_NAME, sha, test_cmd, content_key=ck)
+        if hit and _unit_cache_judged(hit) and (hit.get("scope") or "full") == "full" \
+                and isinstance(hit.get("tests_total"), int):
+            same = hit
+    if same is not None:
+        refs, kind = [same], "same content key"
+        pct, key = _full_gate_number(FULL_GATE_COLLECTION_DROP_SAME_PCT_KEY, FULL_GATE_COLLECTION_DROP_SAME_PCT), \
+            FULL_GATE_COLLECTION_DROP_SAME_PCT_KEY
+    else:
+        k = _full_gate_number(FULL_GATE_COLLECTION_REF_N_KEY, FULL_GATE_COLLECTION_REF_N, integer=True)
+        refs = _unit_cache_measured_ancestors(PROJECT_ROOT, archive, ACTIVE_REPO_NAME, sha, test_cmd, k,
+                                              exclude_ck=ck if reused is not None else None)
+        kind = f"max of the {len(refs)} nearest measured ancestor(s) ({FULL_GATE_COLLECTION_REF_N_KEY} {k})"
+        pct, key = _full_gate_number(FULL_GATE_COLLECTION_DROP_PCT_KEY, FULL_GATE_COLLECTION_DROP_PCT), \
+            FULL_GATE_COLLECTION_DROP_PCT_KEY
+    if not refs:
+        line = (f"🔎 full-gate unit: collected {n} tests — no measurement to compare the collection with (no judged "
+                f"full-suite measurement of this tree{' other than the reused one' if reused is not None else ''} or "
+                f"of a measured ancestor); judged as today")
+        log.info(line)
+        return {"reference": None, "tests_total": n, "line": line}
+    ref = max(refs, key=lambda e: e["tests_total"])
+    ref_sha = str(ref.get("sha"))
+    deleted, counted, unread = _unit_deleted_tests(PROJECT_ROOT, ref_sha, sha)
+    m = ref["tests_total"] - deleted
+    said = []
+    if counted:
+        said.append(f"approx −{deleted} deleted ({len(counted)} test file(s) deleted since {ref_sha[:7]}, static "
+                    f"it(/test( count)")
+    if unread:
+        said.append(f"{len(unread)} deleted test file(s) unreadable at {ref_sha[:7]}, not subtracted: "
+                    f"{', '.join(unread[:BRIEFS_ONLY_NAMED_FILES])}")
+    why = f"[{kind}; threshold {pct:g}% ({key}){'; ' + '; '.join(said) if said else ''}]"
+    rec = {"reference": ref["tests_total"], "reference_sha": ref_sha, "kind": kind, "deleted_tests": deleted,
+           "deleted_unreadable": unread, "compared_with": m, "tests_total": n, "threshold_pct": pct}
+    if n >= m:
+        rec["line"] = f"🔎 full-gate unit: collected {n} tests vs {m} at {ref_sha[:7]} — not fewer; judged as today {why}"
+        log.info(rec["line"])
+        return rec
+    drop = (m - n) * 100.0 / m if m > 0 else 0.0
+    rec.update(dropped=True, drop_pct=round(drop, 3))
+    if drop > pct:
+        rec.update(blocked=True, line=f"⛔ full-gate unit: collected {n} tests vs {m} at {ref_sha[:7]} (−{drop:.1f}%) "
+                                      f"— BLOCKED(environment), not FAIL(product) {why}")
+        log.error(rec["line"])
+        return rec
+    rec["line"] = (f"🔎 full-gate unit: collected {n} tests vs {m} at {ref_sha[:7]} (−{drop:.2f}%) — within the "
+                   f"threshold: judged as today; NOT cached, never a reference (no ratchet) {why}")
+    log.warning(rec["line"])
+    return rec
 
 
 # ── [ORCH-FULLGATE-CACHE-1] 1b · the nightly reuses a measured unit run (D-S7CORE33-36 fix #4) ────────────────────
@@ -6327,6 +6668,7 @@ def full_gate(ref: str = "", dry_run: bool = False, log_path: Optional[str] = No
         (log.info if outcome == "PASS" else log.error)(line)
         return state["exit_code"]
     finally:
+        _unit_links_forget(wt)
         for d in links:
             d.unlink(missing_ok=True)
         subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "remove", "--force", str(wt)], capture_output=True)

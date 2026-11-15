@@ -1,0 +1,13 @@
+> clinical-mp@0.0.0 build
+> tsc -b && vite build
+
+vite v7.1.4 building for production...
+transforming...
+✓ 412 modules transformed.
+x Build failed in 2.31s
+error during build:
+[vite]: Rollup failed to resolve import "./nope" from "/home/gkassa/spectricom-clinical-mp/src/x.tsx".
+This is most likely unintended because it can break your application at runtime.
+Error: [vite]: Rollup failed to resolve import "./nope" from "src/x.tsx".
+    at viteLog (file:///home/gkassa/spectricom-clinical-mp/node_modules/vite/dist/node/chunks/dep.js:4021:15)
+Failed to resolve import "./nope" from "src/x.tsx". Does the file exist?

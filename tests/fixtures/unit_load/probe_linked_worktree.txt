@@ -1,0 +1,4 @@
+[41m[1m FAIL [22m[49m [30m[43m app [49m[39m src/components/healthspan/IngestedResultReview.pdf-text.test.tsx[2m [ src/components/healthspan/IngestedResultReview.pdf-text.test.tsx ][22m
+[31m[1mError[22m: Denied ID /home/gkassa/spectricom-clinical-mp/node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs?url[39m
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [2mno tests[22m

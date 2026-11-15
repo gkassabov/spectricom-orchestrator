@@ -1,0 +1,24 @@
+
+ RUN  v4.1.4 /tmp/orch-unit-baseline-x/wt
+
+ ❯ src/lib/guard.test.ts (2 tests | 1 failed) 8ms
+   × guard > refuses a path outside the allow list 5ms
+     → expected 'Denied ID x' to be 'Allowed'
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/lib/guard.test.ts > guard > refuses a path outside the allow list
+AssertionError: expected 'Denied ID /home/gkassa/spectricom-clinical-mp/node_modules/x.mjs' to be 'Allowed'
+
+- Expected
++ Received
+
+- Allowed
++ Denied ID /home/gkassa/spectricom-clinical-mp/node_modules/x.mjs
+
+ ❯ src/lib/guard.test.ts:12:30
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed (2)
+   Duration  0.90s
