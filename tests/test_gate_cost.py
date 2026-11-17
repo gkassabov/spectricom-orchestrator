@@ -513,6 +513,9 @@ class Sit:
         self.calls, self.related, self.red, self.red_alone = [], related, set(red), set(red_alone)
         self.batches = 0
         monkeypatch.setattr(subprocess, "run", self)
+        # [ORCH-LEAN-GATE-1] harness (D-S7CORE36-01 class iii): the related set is the one-hop importer set now
+        monkeypatch.setattr(orchestrator, "_direct_importers", lambda repo, files, changed, roots=():
+                            set(self.related[1].split()) & set(files), raising=False)
         monkeypatch.setattr("time.sleep", lambda s: None)
 
     def __call__(self, cmd, *a, **kw):
@@ -557,7 +560,7 @@ class TestP3Related:
         fake = Sit(sit.monkeypatch, related=(0, f"{F[2]}\n", ""))
         with caplog.at_level(logging.INFO, logger="orch"):
             so = _run_sit(sit, _diff("src/lib/a.ts", F[4]))
-        assert any("--changed bbbbbbb" in c and "--filesOnly" in c for c in fake.calls), fake.calls
+        assert not any("--changed" in c for c in fake.calls), fake.calls   # [ORCH-LEAN-GATE-1] G-5b: no graph listing
         assert fake.handed() == [[F[2], F[4]]], "exactly {affected} ∪ {added}, in listing order"
         assert so.passed and so.scope == "related 2/5"
         assert so.collection.startswith("sit[related 2/5 files] 2 files/4 tests in 1 batches, ")
@@ -594,18 +597,8 @@ class TestP3Related:
         assert v.detail == "unit green on route; sit: no SIT file relates to this diff (1 changed files)"
         assert v.collection == "sit: no SIT file relates to this diff (1 changed files)"
 
-    @pytest.mark.parametrize("related,why", [
-        ((1, "", "Collect Error\nError: fatal: bad revision"), "exit 1"),
-        ((0, "", "There were unhandled errors during test collection"), "exit 0"),
-    ], ids=["exit-1", "exit-0-with-collection-errors"])
-    def test_an_enumeration_failure_runs_the_full_suite_and_says_why(self, sit, caplog, related, why):
-        fake = Sit(sit.monkeypatch, related=related)
-        with caplog.at_level(logging.INFO, logger="orch"):
-            so = _run_sit(sit, _diff("src/x.ts"))
-        assert fake.handed() == [list(F.values())], "never none — the full suite"
-        assert so.scope == "full 5" and so.collection.startswith("sit[full 5 files] 5 files/10 tests")
-        assert any("related set not computed" in m and why in m and "FULL suite" in m for m in _msgs(caplog))
-
+    # [ORCH-LEAN-GATE-1] G-5b: test_an_enumeration_failure_runs_the_full_suite_and_says_why is removed — the related set
+    # is read from the files, so no `--changed` enumeration can fail; an unknown diff is still the full suite:
     def test_an_unknown_diff_runs_the_full_suite(self, sit, caplog):
         fake = Sit(sit.monkeypatch)
         with caplog.at_level(logging.INFO, logger="orch"):
@@ -613,11 +606,13 @@ class TestP3Related:
         assert fake.handed() == [list(F.values())] and so.scope == "full 5"
         assert not any("--changed" in c for c in fake.calls)
 
-    def test_a_change_to_the_sit_config_runs_the_full_suite(self, sit):
+    def test_a_change_to_the_sit_config_is_said_not_the_full_suite(self, sit, caplog):   # [ORCH-LEAN-GATE-1] G-5b
         sit.monkeypatch.setitem(orchestrator.ACTIVE_REPO_CONFIG, "sit_list_cmd", f"{LIST_CMD} --config sit.config.ts")
         fake = Sit(sit.monkeypatch, related=(0, "", ""))
-        so = _run_sit(sit, _diff("sit.config.ts"))
-        assert fake.handed() == [list(F.values())] and so.scope == "full 5"
+        with caplog.at_level(logging.INFO, logger="orch"):
+            so = _run_sit(sit, _diff("sit.config.ts"))
+        assert fake.handed() == [] and so.not_applicable
+        assert any("changes the SIT config sit.config.ts — the nightly full gate" in m for m in _msgs(caplog))
 
     def test_the_core_set_joins_and_an_unknown_name_is_said(self, sit, caplog):
         sit.monkeypatch.setitem(orchestrator.ACTIVE_REPO_CONFIG, "sit_core_files", [F[5], "sit/integration/nope.ts"])

@@ -33,7 +33,8 @@ from tests.test_gate_cost import _activate, _git  # noqa: E402
 
 ROOT = Path(__file__).parent.parent
 SIT_LIST = "npx vitest list --config vitest.sit.config.ts"
-PROVIDER, INDEX, PAGE = "src/lib/llm/provider.ts", "src/lib/llm/index.ts", "src/pages/SearchPage.tsx"
+PROVIDER, INDEX, PAGE = "src/lib/llm/provider.ts", "src/lib/llm/index.ts", "server/search-page.ts"
+# [ORCH-LEAN-GATE-1] G-4: PAGE is a server file — a SIT file runs per route only for a changed server/ file it imports
 MOCKED = "src/feature/chat.test.ts"          # imports INDEX, `vi.mock('../lib/llm/provider')` — the 341b3/341b5 class
 OTHER_UNIT = "src/feature/other.test.ts"
 SEARCH_SIT = "sit/integration/search.integration.test.ts"   # getByPlaceholder('Search patients') — SearchPage's text
@@ -50,12 +51,18 @@ class Vitest:
         self.real, self.unit_rc, self.sit_rc, self.cwds = subprocess.run, unit_rc, sit_rc, []
         self.unit_prefix = unit_prefix   # "[app] " ⇒ the workspace-project listing clinical-mp's unit config prints
         monkeypatch.setattr(subprocess, "run", self)
+        # [ORCH-LEAN-GATE-1] harness (D-S7CORE36-01 class iii): the related set is the one-hop importer set now
+        monkeypatch.setattr(orchestrator, "_direct_importers", lambda repo, files, changed, roots=(): {
+            t for p in changed if not roots or p.startswith(tuple(roots))
+            for t in GRAPH["sit" if roots else "unit"].get(p, [])} & set(files), raising=False)
 
     def __call__(self, cmd, *a, **kw):
         if not (isinstance(cmd, str) and cmd.startswith("npx vitest list")):
             return self.real(cmd, *a, **kw)
         leg = "sit" if cmd.startswith(SIT_LIST) else "unit"
         self.cwds.append(kw.get("cwd"))
+        if (self.unit_rc if leg == "unit" else self.sit_rc):   # [ORCH-LEAN-GATE-1] G-4: the suite listing fails
+            return subprocess.CompletedProcess(cmd, self.unit_rc or self.sit_rc, stdout="", stderr="Startup Error\n")
         if "--changed" not in cmd:
             suite = SIT_SUITE if leg == "sit" else [self.unit_prefix + t for t in UNIT_SUITE]
             return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(suite) + "\n", stderr="")
@@ -135,9 +142,10 @@ class TestPL1IndexAndMock:
         b = _brief(rig, f"`{PROVIDER}`")
         Vitest(rig.monkeypatch)
         seen, real = [], orchestrator.tests_reaching
-        monkeypatch.setattr(orchestrator, "tests_reaching", lambda p, d: seen.append(d.paths) or real(p, d))
+        monkeypatch.setattr(orchestrator, "tests_reaching",   # [ORCH-LEAN-GATE-1] G-4: files_only=True is passed
+                            lambda p, d, **k: seen.append((d.paths, k)) or real(p, d, **k))
         orchestrator.gate_prelist(b, rig.repo)
-        assert seen == [(PROVIDER,)]
+        assert seen == [((PROVIDER,), {"files_only": True})]
 
 
 class TestPL2SitLocator:
@@ -215,8 +223,8 @@ class TestPP1UnitLegUnavailable:
         assert block and f"- `{SEARCH_SIT}` (SIT)" in text, text
         lines = [l for l in text.splitlines() if l.startswith("- unit leg: ")]
         assert len(lines) == 1, text
-        assert lines[0].startswith("- unit leg: the gate runs the FULL unit suite — (c) the related set could not "
-                                   "be computed") and lines[0].endswith("; the gate runs the full suite at merge")
+        assert lines[0].startswith("- unit leg: the gate runs the FULL unit suite — (c) the unit suite could not "
+                                   "be enumerated") and lines[0].endswith("; the gate runs the full suite at merge")
         assert "(unit)" not in text and b.read_text().rstrip().endswith(orchestrator.PRELIST_RULE)
         msgs = _generated(caplog)
         assert len(msgs) == 1 and msgs[0].startswith(
@@ -224,18 +232,16 @@ class TestPP1UnitLegUnavailable:
             f"runs the FULL unit suite — (c) "), msgs
         assert not any("not generated" in r.getMessage() for r in caplog.records)
 
-    def test_the_341b5c_shape_a_shared_trigger_and_a_project_prefixed_listing(self, rig, caplog):
-        rig.monkeypatch.setitem(orchestrator.ACTIVE_REPO_CONFIG, "unit_full_triggers", ["src/**"])
+    def test_the_341b5c_shape_a_project_prefixed_listing(self, rig, caplog):   # [ORCH-LEAN-GATE-1] G-4: no trigger
         b = _brief(rig, f"`{PAGE}`")
         Vitest(rig.monkeypatch, unit_prefix="[app] ")
         with caplog.at_level(logging.INFO, logger="orch"):
             orchestrator.gate_prelist(b, rig.repo)
         text = _block(b.read_text())
         # [ORCH-UNIT-LISTING-PREFIX-1] rule #8: the `[app] ` listing is read as its paths — the unit leg is named
-        why = f"(a) the diff touches a shared trigger (unit_full_triggers): {PAGE} (src/**)"
         assert f"- `{SEARCH_SIT}` (SIT)" in text and "- unit leg: " not in text, text
         assert _generated(caplog) == [f"📋 Gate pre-list generated: 1 SIT + 0 unit files for 1 allowed files at "
-                                      f"{rig.sha[:7]} (the gate's unit leg runs the full suite here: {why})"]
+                                      f"{rig.sha[:7]}"]
 
 
 class TestPP2SitLegUnavailable:
@@ -249,13 +255,13 @@ class TestPP2SitLegUnavailable:
         text = _block(b.read_text())
         assert block and f"- `{MOCKED}` (unit)" in text, text
         lines = [l for l in text.splitlines() if l.startswith("- SIT leg: ")]
-        assert len(lines) == 1 and lines[0].startswith("- SIT leg: the gate runs the FULL SIT suite — ") \
+        assert len(lines) == 1 and lines[0].startswith("- SIT leg: sit-list-failed (") \
             and lines[0].endswith("; the gate runs the full suite at merge"), text
         assert "(SIT)" not in text
         msgs = _generated(caplog)
         assert len(msgs) == 1 and msgs[0].startswith(
-            f"📋 Gate pre-list generated: 0 SIT + 1 unit files for 1 allowed files at {rig.sha[:7]} (SIT: the gate "
-            f"runs the FULL SIT suite — "), msgs
+            f"📋 Gate pre-list generated: 0 SIT + 1 unit files for 1 allowed files at {rig.sha[:7]} (SIT: "
+            f"sit-list-failed ("), msgs
 
 
 class TestPP3BothLegsUnavailable:
@@ -270,7 +276,7 @@ class TestPP3BothLegsUnavailable:
         assert b.read_bytes() == before
         msgs = [r.getMessage() for r in caplog.records if r.getMessage().startswith("📋 Gate pre-list not generated:")]
         assert len(msgs) == 1, msgs
-        assert msgs[0].startswith("📋 Gate pre-list not generated: SIT: the gate runs the FULL SIT suite — "), msgs
+        assert msgs[0].startswith("📋 Gate pre-list not generated: SIT: sit-list-failed ("), msgs
         assert "; unit: the gate runs the FULL unit suite — (c) " in msgs[0], msgs
         assert _generated(caplog) == []
 
@@ -278,7 +284,7 @@ class TestPP3BothLegsUnavailable:
 class TestPP4SharedTriggerListable:
     """PP4 (F2): a shared trigger whose related set is listable on the synthetic diff ⇒ the unit rows are there."""
 
-    def test_unit_rows_present_and_the_full_run_said(self, rig, caplog):
+    def test_unit_rows_present_and_no_full_run(self, rig, caplog):   # [ORCH-LEAN-GATE-1] G-4: a trigger is ignored
         rig.monkeypatch.setitem(orchestrator.ACTIVE_REPO_CONFIG, "unit_full_triggers", ["src/lib/**"])
         b = _brief(rig, f"`{PROVIDER}`")
         Vitest(rig.monkeypatch)
@@ -288,8 +294,8 @@ class TestPP4SharedTriggerListable:
         assert f"- `{MOCKED}` (unit)" in text and " leg: " not in text, text
         msgs = _generated(caplog)
         assert len(msgs) == 1 and msgs[0].startswith(
-            f"📋 Gate pre-list generated: 0 SIT + 1 unit files for 1 allowed files at {rig.sha[:7]} (the gate's unit "
-            f"leg runs the full suite here: (a) the diff touches a shared trigger"), msgs
+            f"📋 Gate pre-list generated: 0 SIT + 1 unit files for 1 allowed files at {rig.sha[:7]}"), msgs
+        assert "full suite" not in msgs[0], msgs
 
 
 class TestAllowedFiles:

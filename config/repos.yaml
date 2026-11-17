@@ -101,27 +101,24 @@ repos:
     # first full gate (2026-10-16, a4f0e18) lost 31 SIT files at setup without this one: probe-identity.ts reads
     # it when ADMIN_PASSWORD is unset. A listed file this checkout lacks ⇒ SIT BLOCKED before any batch, named.
     full_gate_link_files: [".medplum-admin-credentials.local"]
-    # ORCH-TEST-EFFICIENCY-1 (S7-CORE-33, D-S7CORE33-36, George 2026-10-24 "Agree").
-    # ORCH-UNIT-RELATED-1: on each route the unit gate's branch leg runs only the unit test files related to the
-    # diff (vitest's own `list --changed <merge base>` on the unit config, plus test files the branch changes). It
-    # runs the FULL suite, and logs why, in these cases: the diff touches one of these globs (a pattern with no `/`
-    # matches that file name in any directory; every sit_core_files path counts too); this is route N since the
-    # last full unit run, where N is unit_full_every (the counter is state/unit-full-counter-clinical-mp.json); the
-    # related set cannot be computed; or ORCH_UNIT_RELATED=off. Setting unit_full_every to 1 runs the full suite on
-    # every route, as before.
-    # ORCH-ROUTE-TIME-1 (Kanban 698, D-S7CORE54-01/-03): the triggers are what every test file loads — the manifests,
-    # the vitest/vite/ts configs, the setup file (vite.config.ts setupFiles: src/test.setup.ts) and its helpers, and
-    # the server allowlist — not whole source trees: src/lib/**, server/** and src/types/** made 0687's unit leg the
-    # full suite for one allowlist file. A source change is related through the import graph (vitest --changed).
-    unit_full_triggers: ["package.json", "package-lock.json", "vitest*.config.*", "vite.config.*", "tsconfig*.json",
-                         "src/test/**", "src/test.setup.ts", "**/setupTests.*", "server/allowlist*.ts"]
-    unit_full_every: 5
-    # ORCH-ROUTE-TIME-1: the unit test files that READ the source tree (readdirSync / globSync / fast-glob / git
-    # ls-files source scanners) rather than import it — no import graph relates them to the file they scan, so each
-    # one in the suite joins every related-only run whose import-graph set is non-empty (an empty set is still
-    # today's "(c)" full suite, or nothing for a docs-only diff). ORCH_UNIT_ALWAYS=off drops them. Generated
-    # 2026-11-15 at clinical-mp e7a99957 with: git -C ~/spectricom-clinical-mp grep -l -E
-    # "readdirSync|scanTree|globSync|fast-glob|ls-files" main -- '*.test.ts' '*.test.tsx' ':!sit/integration' (93).
+    # ORCH-LEAN-GATE-1 (D-S7CORE54-77, George 2026-11-16 14:03; supersedes ORCH-UNIT-RELATED-1's triggers and
+    # every-5th rule): per route the gate runs only what the change touches — build, lint on the changed files, the
+    # test files the branch adds or changes, the test files that DIRECTLY import a changed file (one hop), the fast
+    # guard scanners below, and SIT files the branch changes or that directly import a changed server/ file. No
+    # trigger (package.json, lockfile, configs) and no route count runs the full suite; the nightly full gate
+    # (02:30) and the before-tester full gate run everything. A red is judged against the newest full gate's
+    # failure list (state/full-gate-clinical-mp.json), never a merge base re-measured per route.
+    lint_changed_cmd: "npx eslint --no-warn-ignored"
+    # The guard scanners: unit test files that READ the source tree (readdirSync / globSync / fast-glob / git
+    # ls-files) rather than import it, so no import relates them to the file they scan. Each one here joins every
+    # route whose diff changes non-test source. ORCH_UNIT_ALWAYS=off drops them. ORCH-LEAN-GATE-1 (TC-6): a guard is
+    # kept per route by RISK, not by stopwatch — every listed guard matching unit_always_risk_globs runs per route
+    # whatever its time; only the rest uses the unit_always_max_s cut against the times in unit_always_slow_s
+    # (measured 2026-11-16 at clinical-mp 37159d6, vitest JSON reporter on 4 workers, test time;
+    # ~/_eos/s7core54/leangate/guards-timed.json). 90 of the 93 run per route (126.1 s summed test time); the 3 slow
+    # non-risk ones run nightly. A guard not in unit_always_slow_s counts as fast. Candidates:
+    # git -C ~/spectricom-clinical-mp grep -l -E "readdirSync|scanTree|globSync|fast-glob|ls-files" main --
+    # '*.test.ts' '*.test.tsx' ':!sit/integration' (93 at e7a99957).
     unit_always_files:
       - "scripts/__tests__/backfill-unsigned-note-tag.test.ts"
       - "scripts/__tests__/curation-boundary.test.ts"
@@ -216,6 +213,48 @@ repos:
       - "src/pages/portal/__tests__/care-gap-member-dismiss-guard.test.ts"
       - "src/pages/portal/__tests__/clinician-reasons-member-guard.test.ts"
       - "src/pages/portal/__tests__/member-longevity-gate-guard.test.ts"
+    unit_always_max_s: 3.0
+    unit_always_slow_s:
+      "src/lib/fhir/__tests__/do-not-perform-readers.test.ts": 3.3
+      "scripts/__tests__/curation-cli.test.ts": 3.4
+      "src/components/encounter/rooming/__tests__/rooming-tied-responses.test.tsx": 3.5
+      "src/components/healthspan/internal-names-scan.test.ts": 3.9
+      "src/lib/cache/__tests__/write-invalidation-invariants.test.ts": 4.0
+      "src/hooks/ai-draft-coverage-1.test.tsx": 4.1
+      "src/lib/tasks/__tests__/safety-status-writers-guard.test.ts": 4.6
+      "src/lib/llm/__tests__/llm-seams-2.test.tsx": 4.7
+      "src/__tests__/no-clinical-literals.test.ts": 4.9
+      "src/lib/release/__tests__/sign-creates-final.test.ts": 5.4
+      "src/components/encounter/rooming/__tests__/before-this-visit.test.tsx": 5.6
+      "src/components/encounter-compose/__tests__/medrec-hardening-1.test.tsx": 6.6
+      "src/lib/copilot/replay/__tests__/copilot-replay.test.ts": 9.3
+      "src/components/encounter-compose/layouts/__tests__/ai-draft-ux-1.test.tsx": 9.4
+      "src/lib/clinical/__tests__/clinician-reasons.test.ts": 11.1
+      "src/lib/clinical/time-dimension/date-semantics-invariants.test.ts": 20.1
+    # TC-6 risk classes (a pattern with no `/` matches the file name anywhere; `dir/**` everything under dir):
+    # release, clinical, tasks (safety), LLM, copilot, crisis, agentic-ops, the server, member guards, allow-lists,
+    # read-maps, no-clinical-literals — plus, by path, three guards the TC-6 review named that no class covers, the
+    # two rooming safety-item guards (verifier r3 B2) and the write-invalidation guard (r3 m1, George LG-R4-1).
+    unit_always_risk_globs:
+      - "src/lib/release/**"
+      - "src/lib/clinical/**"
+      - "src/lib/tasks/**"
+      - "src/lib/llm/**"
+      - "src/lib/copilot/**"
+      - "src/lib/crisis/**"
+      - "src/lib/agentic-ops/**"
+      - "server/**"
+      - "**/*member*guard*"
+      - "**/*allowlist*"
+      - "**/*allow-list*"
+      - "**/*read-map*"
+      - "no-clinical-literals.test.ts"
+      - "src/lib/fhir/__tests__/do-not-perform-readers.test.ts"
+      - "src/hooks/ai-draft-coverage-1.test.tsx"
+      - "src/components/encounter-compose/__tests__/medrec-hardening-1.test.tsx"
+      - "src/components/encounter/rooming/__tests__/before-this-visit.test.tsx"        # D-076-09 safety-item gate (verifier r3 B2)
+      - "src/components/encounter/rooming/__tests__/rooming-tied-responses.test.tsx"   # PHQ-9 item 9 / MA role hiding (verifier r3 B2)
+      - "src/lib/cache/__tests__/write-invalidation-invariants.test.ts"   # no stale med/allergy list after a write (r3 m1, George LG-R4-1)
     # ORCH-FULLGATE-CACHE-1: the nightly full gate uses a judged full-suite measurement of its own tree, no older
     # than this many hours, as its unit leg, and does not run the suite again. Set ORCH_FULLGATE_REUSE=off to
     # always run it.
@@ -247,7 +286,9 @@ repos:
     meta_fire: true
     briefs_subdir: briefs
     test_cmd: "pytest -q tests/"
-    build_gate_cmd: "pytest -q tests/"   # AC-ORCH1-09: meta-fire pre-merge gate (PRE_MERGE_GATES in orchestrator.py)
+    # ORCH-LEAN-GATE-1 (D-S7CORE54-77): the build leg compiles; the suite runs ONCE per route, as the unit leg
+    # (its test command) — it ran twice before (build 112 s + unit 108 s, route 000000697). AC-ORCH1-09 still gates the lane.
+    build_gate_cmd: "python3 -m py_compile orchestrator.py queue_daemon.py prefire.py admission.py canon_assert.py executor_auth.py"
 
   # Future repos (scaffolded per S5S37 decision #6, NOT LIVE):
   # gateway: (Spectricom Gateway repo, Phase 3+)

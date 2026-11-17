@@ -232,6 +232,26 @@ def executor_default_line(persisted: dict, config: dict, env) -> str:
             f"earlier daemon ran with, L-8)")
 
 
+# [ORCH-LEAN-GATE-1] (D-S7CORE54-77; WASTE-REPORT 2026-11-16: xhigh cost 2.2 h a week, no measured outcome gain) a
+# header's `effort=xhigh` is honoured only when the brief's `## Executor:` line names xhigh and gives its reason
+# (`Why:`, D-S7CORE35-09: safety, clinical-logic or privacy routes); otherwise the route fires at high, said in one line.
+XHIGH_REASON_RE = re.compile(r"^##\s*Executor:[^\n]*\bxhigh\b[^\n]*\bWhy:\s*\S", re.MULTILINE | re.IGNORECASE)
+
+
+def header_effort(path, effort: str) -> tuple:
+    """(the effort the route fires with, the line saying a downgrade, or None)."""
+    if str(effort).strip().lower() != "xhigh":
+        return effort, None
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    if XHIGH_REASON_RE.search(text):
+        return effort, None
+    return "high", (f"[QUEUE] effort: {Path(path).name} asks effort=xhigh with no `## Executor: … xhigh … Why: …` "
+                    f"line — fired at high (ORCH-LEAN-GATE-1, D-S7CORE35-09)")
+
+
 # [ORCH-YORSIE-SAFETY-1] S7-CORE-17 · Yorsie PDLC plan Phase 0. A brief names its repo in its `#!queue repo=…`
 # header or it is refused: moved to queue/failed/ with this reason, nothing fired, and the queue goes on.
 # There is no daemon default — QUEUE_REPO and a persisted `config.repo` (the old "else clinical-mp") are
@@ -1522,6 +1542,10 @@ class QueueDaemon:
             hdr = _parse_batch_header(next_batch)   # re-read: it may have been edited while it waited
             b_model = hdr.get("model", self.config["model"])
             b_effort = hdr.get("effort", self.config["effort"])
+            if "effort" in hdr:   # [ORCH-LEAN-GATE-1] a header's xhigh needs its reason in the brief
+                b_effort, said = header_effort(next_batch, b_effort)
+                if said:
+                    print(said)
             b_repo = hdr.get("repo")
             if not b_repo:
                 with self.lock:

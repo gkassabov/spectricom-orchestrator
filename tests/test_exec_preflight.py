@@ -47,6 +47,9 @@ class Suites:
         self.sit_red, self.sit_red_alone, self.sit_env = set(sit_red), set(sit_red_alone), sit_env
         self.calls, self.sit_runs, self.unit_runs = [], [], []
         monkeypatch.setattr(subprocess, "run", self)
+        # [ORCH-LEAN-GATE-1] harness (D-S7CORE36-01 class iii): the related set is the one-hop importer set now
+        monkeypatch.setattr(orchestrator, "_direct_importers", lambda repo, files, changed, roots=():
+                            set(self.sit_related if roots else self.unit_related) & set(files), raising=False)
         monkeypatch.setattr("time.sleep", lambda s: None)
 
     def __call__(self, cmd, *a, **kw):
@@ -148,12 +151,12 @@ class TestPB1SameSet:
         reach = orchestrator.tests_reaching(rig.repo, diff)
         assert list(reach.sit) == sit and reach.unit == scope.files == (U1, U2)
 
-    def test_a_shared_trigger_runs_the_related_set_and_says_the_gate_runs_full(self, rig, capsys):
+    def test_a_former_trigger_runs_the_related_set_and_the_gate_does_too(self, rig, capsys):   # [ORCH-LEAN-GATE-1] G-5c
         _route(rig.repo, {"src/feature/a.ts": "a2\n", "package.json": '{"scripts": {"test": "vitest run"}} \n'})
         fake = Suites(rig.monkeypatch)
         code, out, rec = _preflight(rig, capsys)
         assert code == 0 and fake.unit_runs == [[U1, U2]], (out, fake.unit_runs)
-        assert rec["unit"]["gate_runs_full"].startswith("(a)") and "FULL unit suite" in out
+        assert rec["unit"]["gate_runs_full"] is None and "FULL unit suite" not in out
 
     def test_a_set_that_cannot_be_computed_runs_no_full_suite_and_exits_3(self, rig, capsys):
         rig.monkeypatch.setitem(orchestrator.ACTIVE_REPO_CONFIG, "sit_list_cmd", "")
@@ -202,8 +205,10 @@ class TestPB3Red:
 
 
 # [ORCH-ROUTE-TIME-1] G-4: the typecheck sentence the fire prompt carries before the preflight sentence
-TYPECHECK = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to confirm a "
-             "type-error fix; while iterating, run the related tests of the files you changed.")
+TYPECHECK = ("Compile once: run the repo's typecheck (if it has one: npx tsc --noEmit, plus -p server where the "
+             "repo has one) one time after your last code change, and again only to confirm a fix to an error it "
+             "reported; never run npm run build (the gate builds). Run only the test files you added or changed, "
+             "by path; never a suite or a related set (the gate runs those).")   # [ORCH-LEAN-GATE-1] G-1
 
 
 # ── PB4 · the executor prompt ─────────────────────────────────────────────────────────────────────────────────────────
@@ -212,12 +217,14 @@ class TestPB4Prompt:
     def test_the_prompt_carries_the_sentence_with_the_briefs_repo(self, child, tmp_path, monkeypatch):
         (tmp_path / "proj" / "briefs" / "61-x.md").write_text("#!queue model=m effort=high repo=clinical-mp\n# x\n")
         monkeypatch.setattr(orchestrator, "ACTIVE_REPO_NAME", "orchestrator")
+        monkeypatch.setenv("ORCH_EXEC_PREFLIGHT", "on")   # [ORCH-LEAN-GATE-1] G-1: opt-in now
         argv = child(1800)["argv"]
         assert argv[-1] == ("Read briefs/61-x.md" + PROMPT_TAIL + " " + TYPECHECK + " "
                             + SENTENCE.format(repo="clinical-mp"))
 
     def test_no_header_falls_back_to_the_active_repo(self, child, monkeypatch):
         monkeypatch.setattr(orchestrator, "ACTIVE_REPO_NAME", "yorsie")
+        monkeypatch.setenv("ORCH_EXEC_PREFLIGHT", "on")   # [ORCH-LEAN-GATE-1] G-1: opt-in now
         argv = child(1800)["argv"]
         assert argv[-1].endswith(PROMPT_TAIL + " " + TYPECHECK + " " + SENTENCE.format(repo="yorsie"))
 

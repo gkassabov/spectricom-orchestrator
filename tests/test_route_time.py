@@ -50,8 +50,10 @@ REPOS = sorted(yaml.safe_load((ROOT / "config" / "repos.yaml").read_text())["rep
 SETTINGS = ROOT / "executor" / "settings"
 LONG_WAIT = ROOT / "executor" / "hooks" / "long_wait.py"
 NPM_FROZEN = ROOT / "executor" / "hooks" / "npm_frozen.py"
-TYPECHECK = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to confirm a "
-             "type-error fix; while iterating, run the related tests of the files you changed.")
+TYPECHECK = ("Compile once: run the repo's typecheck (if it has one: npx tsc --noEmit, plus -p server where the "
+             "repo has one) one time after your last code change, and again only to confirm a fix to an error it "
+             "reported; never run npm run build (the gate builds). Run only the test files you added or changed, "
+             "by path; never a suite or a related set (the gate runs those).")   # [ORCH-LEAN-GATE-1] G-1
 PREFLIGHT_DENY = "Edit(~/spectricom-orchestrator/state/preflight/**)"
 # [698t] the deny list every settings file held before 698 (7b6cc99, all six identical), frozen here so P-9 never
 # reads `main`: true on 698's branch only, it failed every later orchestrator route's build gate (705, 13:16).
@@ -184,8 +186,6 @@ CONTROLS = {
     "exit-not-int": (lambda r: _edit(r, exit="0"), {}, "incomplete"),
     "status-environment": (lambda r: _edit(r, sit={**json.loads(_pf_file(r).read_text())["sit"],
                                                    "status": "environment"}), {}, "SIT leg is 'environment'"),
-    "verdict": (lambda r: _edit(r, sit={**json.loads(_pf_file(r).read_text())["sit"],
-                                        "verdict": "PASS (isolation)"}), {}, "needed isolation"),
     "base": (lambda r: _edit(r, base="0" * 40), {}, "merge base"),
     "dirty": (lambda r: _edit(r, dirty=["src/feature/a.ts"]), {}, "uncommitted outside briefs/"),
     "dirty-absent": (lambda r: _edit(r, dirty=_DROP), {}, "no `dirty` list"),
@@ -242,7 +242,6 @@ class TestP3UnitReuse:
     def test_a_clean_green_related_record_is_reused(self, rig, capsys, caplog):
         _route(rig.repo, {"src/feature/a.ts": "a2\n"})
         _, rec = _pf(rig, capsys)
-        before = _counter(rig).get("since_full", 0)
         n_log = len(_unit_log(rig))
         v, s = _gate(rig, caplog)
         assert v.outcome is PASS and s.unit_runs == [], s.unit_runs
@@ -251,7 +250,7 @@ class TestP3UnitReuse:
         assert uo.scope == f"related 2/{len(UNIT_SUITE)}" and uo.related_files == (U1, U2)
         assert uo.detail == f"reused the executor preflight ({rec['at']}, tip {rec['tip'][:7]})"
         assert "reused the executor preflight" in (v.unit_collection or ""), v.unit_collection
-        assert _counter(rig)["since_full"] == before + 1
+        assert _counter(rig) == {}, "[ORCH-LEAN-GATE-1] G-3: no every-N-th counter is kept"
         log_ = _unit_log(rig)
         assert len(log_) == n_log + 1 and log_[-1]["signal"] == "reused-preflight"
         (line,) = _said(caplog, UNIT_YES)
@@ -263,36 +262,13 @@ class TestP3UnitReuse:
         assert any("(a) no unit branch run — the unit gate was reused-preflight" in m for m in _msgs(caplog))
         assert not (archive / orchestrator.UNIT_BASELINE_CACHE_FILE).exists()
 
-    def test_a_flaky_key_runs_the_suite(self, rig, capsys, caplog):
+    def test_a_flaky_only_leg_is_reused(self, rig, capsys, caplog):   # [ORCH-LEAN-GATE-1] G-3 (was: runs the suite)
         _route(rig.repo, {"src/feature/a.ts": "a2\n"})
         _, rec = _pf(rig, capsys)
-        _edit(rig, unit={**rec["unit"], "flaky": []})
+        _edit(rig, unit={**rec["unit"], "flaky": [U1]})
         v, s = _gate(rig, caplog)
-        assert s.unit_runs == [[U1, U2]] and "needed isolation" in _said(caplog, UNIT_NO)[0]
-        assert v.unit.signal != "reused-preflight"
-
-    def test_a_trigger_hit_runs_the_full_suite(self, rig, capsys, caplog):
-        _route(rig.repo, {"src/feature/a.ts": "a2\n"})
-        _pf(rig, capsys)
-        rig.monkeypatch.setitem(orchestrator.ACTIVE_REPO_CONFIG, "unit_full_triggers", ["src/feature/**"])
-        v, s = _gate(rig, caplog)
-        assert s.unit_runs == [UNIT_SUITE] and "(a)" in _said(caplog, UNIT_NO)[0]
-
-    def test_the_every_5th_route_runs_the_full_suite(self, rig, capsys, caplog):
-        _route(rig.repo, {"src/feature/a.ts": "a2\n"})
-        _pf(rig, capsys)
-        f = rig.orch / "state" / f"unit-full-counter-{REPO}.json"
-        f.write_text(json.dumps({"repo": REPO, "since_full": 4}))
-        v, s = _gate(rig, caplog)
-        assert s.unit_runs == [UNIT_SUITE] and "(b) route 5" in _said(caplog, UNIT_NO)[0]
-        assert _counter(rig)["since_full"] == 0
-
-    def test_an_unknown_counter_runs_the_full_suite(self, rig, capsys, caplog):
-        _route(rig.repo, {"src/feature/a.ts": "a2\n"})
-        _pf(rig, capsys)
-        (rig.orch / "state" / f"unit-full-counter-{REPO}.json").write_text("{ nope")
-        v, s = _gate(rig, caplog)
-        assert s.unit_runs == [UNIT_SUITE] and "(b)" in _said(caplog, UNIT_NO)[0]
+        assert s.unit_runs == [] and "flaky there, passed alone" in _said(caplog, UNIT_YES)[0]
+        assert v.unit.signal == "reused-preflight"
 
     def test_a_different_related_set_runs_and_lists_once(self, rig, capsys, caplog):
         _route(rig.repo, {"src/feature/a.ts": "a2\n"})
@@ -300,14 +276,14 @@ class TestP3UnitReuse:
         v, s = _gate(rig, caplog, unit_related=(U1,))
         assert s.unit_runs == [[U1]] and "unit file set" in _said(caplog, UNIT_NO)[0]
         lists = [c for c in s.calls if c.startswith("npx vitest list") and not c.startswith(SIT_LIST)]
-        assert len(lists) == 2 and sum("--changed" in c for c in lists) == 1, lists
+        assert len(lists) == 1 and not any("--changed" in c for c in lists), lists   # [ORCH-LEAN-GATE-1] G-3
 
     def test_a_non_reused_route_lists_the_unit_suite_once(self, rig, caplog):
         _route(rig.repo, {"src/feature/a.ts": "a2\n"})   # no preflight at all
         v, s = _gate(rig, caplog)
         assert s.unit_runs == [[U1, U2]]
         lists = [c for c in s.calls if c.startswith("npx vitest list") and not c.startswith(SIT_LIST)]
-        assert len(lists) == 2, lists
+        assert len(lists) == 1, lists   # [ORCH-LEAN-GATE-1] G-3: the suite listing; the related set is read from files
         assert len(_said(caplog, UNIT_NO)) == 1 and "no preflight record" in _said(caplog, UNIT_NO)[0]
 
     def test_a_direct_run_unit_gate_call_is_todays(self, rig):
@@ -352,6 +328,9 @@ class ListStub:
     def __init__(self, monkeypatch, related=("src/feature/t1.test.ts",)):
         self.real, self.related, self.calls = subprocess.run, related, []
         monkeypatch.setattr(subprocess, "run", self)
+        # [ORCH-LEAN-GATE-1] harness (D-S7CORE36-01 class iii): the related set is the one-hop importer set now
+        monkeypatch.setattr(orchestrator, "_direct_importers", lambda repo, files, changed, roots=():
+                            set(self.related) & set(files), raising=False)
 
     def __call__(self, cmd, *a, **kw):
         if not (isinstance(cmd, str) and cmd.startswith("npx vitest list")):
@@ -409,11 +388,7 @@ class TestP5Triggers:
     def test_the_config_declares_the_scanners(self):
         assert isinstance(CLINICAL.get("unit_always_files"), list) and CLINICAL["unit_always_files"]
         assert CLINICAL["unit_always_files"] == sorted(CLINICAL["unit_always_files"])
-        trig = CLINICAL["unit_full_triggers"]
-        for gone in ("src/lib/**", "server/**", "src/types/**"):
-            assert gone not in trig
-        for t in ("src/test.setup.ts", "server/allowlist*.ts"):
-            assert t in trig
+        assert "unit_full_triggers" not in CLINICAL and "unit_full_every" not in CLINICAL   # [ORCH-LEAN-GATE-1] G-3
 
     def test_a_src_lib_change_is_related_and_carries_the_scanners(self, mp):
         s, diff = _scope(mp, {"src/lib/x.ts": "x2\n"})
@@ -423,16 +398,11 @@ class TestP5Triggers:
         assert orchestrator.tests_reaching(mp.repo, diff).unit == s.files
 
     @pytest.mark.parametrize("path", ["package.json", "src/test.setup.ts", "server/allowlist.writes.ts"])
-    def test_a_shared_trigger_is_the_full_suite(self, mp, path):
+    def test_a_former_trigger_is_related_not_full(self, mp, path):   # [ORCH-LEAN-GATE-1] G-3 (was: the full suite)
         text = json.dumps({"scripts": {"test": "vitest run"}, "dependencies": {"zod": "^3"}}) + "\n" \
             if path == "package.json" else "changed\n"
         s, _ = _scope(mp, {path: text})
-        assert s.files is None and s.reason.startswith("(a)") and path in s.reason, s.reason
-
-    def test_route_5_is_the_full_suite(self, mp):
-        (mp.orch / "state" / f"unit-full-counter-{REPO}.json").write_text(json.dumps({"since_full": 4}))
-        s, _ = _scope(mp, {"src/lib/x.ts": "x2\n"})
-        assert s.files is None and s.reason.startswith("(b)"), s.reason
+        assert s.files is not None and not s.reason.startswith("(a)"), s.reason
 
     def test_the_switch_drops_the_union(self, mp):
         mp.monkeypatch.setenv("ORCH_UNIT_ALWAYS", "off")
@@ -443,9 +413,9 @@ class TestP5Triggers:
         s, _ = _scope(mp, {"docs/readme.md": "d2\n"}, related=())
         assert s.files == (), (s.files, s.reason)
 
-    def test_a_change_vitest_relates_nothing_to_is_the_full_suite_c(self, mp):
+    def test_a_change_nothing_imports_runs_the_scanners_only(self, mp):   # [ORCH-LEAN-GATE-1] G-3 (was: "(c)" full)
         s, _ = _scope(mp, {"src/lib/data.json": "{\"a\": 1}\n"}, related=())
-        assert s.files is None and s.reason.startswith("(c) the related set is empty"), s.reason
+        assert s.files == tuple(IN_SUITE_ALWAYS), (s.files, s.reason)
 
 
 # ═══════════════════════════════════════════════════════
@@ -604,7 +574,7 @@ class TestP8Prompt:
 
     def test_the_prompt_carries_the_typecheck_sentence(self, child, tmp_path, monkeypatch):
         (tmp_path / "proj" / "briefs" / "61-x.md").write_text("#!queue model=m effort=high repo=clinical-mp\n# x\n")
-        monkeypatch.delenv("ORCH_EXEC_PREFLIGHT", raising=False)
+        monkeypatch.setenv("ORCH_EXEC_PREFLIGHT", "on")   # [ORCH-LEAN-GATE-1] G-1: opt-in now
         argv = child(1800)["argv"]
         pre = orchestrator.PREFLIGHT_SENTENCE.format(repo="clinical-mp")
         assert argv[-1] == "Read briefs/61-x.md" + PROMPT_TAIL + " " + TYPECHECK + " " + pre

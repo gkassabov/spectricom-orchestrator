@@ -54,14 +54,16 @@ PREFLIGHT = (" Before you write the handback's final status, run `python3 ~/spec
              "preflight --repo {repo}` and paste its summary; a red there is handled by your brief's rule #8 and STOP "
              "rules like any other red.")
 # [ORCH-ROUTE-TIME-1] G-4: the typecheck sentence the fire prompt carries before the preflight sentence
-TYPECHECK = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to confirm a "
-             "type-error fix; while iterating, run the related tests of the files you changed.")
+TYPECHECK = ("Compile once: run the repo's typecheck (if it has one: npx tsc --noEmit, plus -p server where the "
+             "repo has one) one time after your last code change, and again only to confirm a fix to an error it "
+             "reported; never run npm run build (the gate builds). Run only the test files you added or changed, "
+             "by path; never a suite or a related set (the gate runs those).")   # [ORCH-LEAN-GATE-1] G-1
 
 
 def head_cmd(project, brief_rel, model, effort, repo="clinical-mp") -> str:
     """fire_toni's command at 886014c (HEAD before this route), character for character, plus the preflight
     sentence (backticks escaped inside the double-quoted prompt)."""
-    ask = " " + TYPECHECK + PREFLIGHT.format(repo=repo).replace("`", "\\`")
+    ask = " " + TYPECHECK   # [ORCH-LEAN-GATE-1] G-1: no preflight sentence by default (ORCH_EXEC_PREFLIGHT=on)
     return (f"cd {project} && stdbuf -oL claude --dangerously-skip-permissions --model {model} --effort {effort} "
             f'"Read {brief_rel}{PROMPT_TAIL}{ask}"')
 
@@ -261,8 +263,7 @@ def test_P1_end_to_end_the_child_gets_the_flag_and_not_the_socket(tmp_path, monk
     i = got["argv"].index("--settings")
     assert got["argv"][i + 1] == str(ROOT / "executor" / "settings" / "orchestrator.json")
     assert got["argv"][0] == "--dangerously-skip-permissions" and got["argv"][-1] == ("Read briefs/394-x.md" + PROMPT_TAIL
-                                                                               + " " + TYPECHECK
-                                                                               + PREFLIGHT.format(repo="orchestrator"))
+                                                                               + " " + TYPECHECK)
     assert not set(DROPPED) & set(got["env"]) and "KEEP_ME" in got["env"]
     assert got["npm"] == "true"
 

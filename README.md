@@ -130,27 +130,27 @@ appears in the gate verdict's collection, or in the full gate's state file.
   nearest measured ancestor, or else the previous full gate. It is never written back to the cache. In every
   other case the suite runs as before, and the log line says why. The SIT leg always runs. Kill switch:
   `ORCH_FULLGATE_REUSE=off`.
-- **The unit gate runs the related files on each route** (ORCH-UNIT-RELATED-1). The branch leg runs vitest's
-  own related set: `npx vitest list --changed <merge base> --filesOnly` on the unit config, which lists files
-  without running them, plus the unit test files the branch changes. It runs them as
-  `npm test -- <files>`. Log line: `🎯 Unit gate: related <n>/<total> files — …`. The full suite runs instead,
-  and the log line `🎯 Unit gate: full suite: <reason>` says why, in these cases:
-  - (a) the diff touches a `unit_full_triggers` glob or a `sit_core_files` path;
-  - (b) this is route N since the last full unit run, where N is `unit_full_every` (default 5). The count is
-    kept in `state/unit-full-counter-<repo>.json`. Any full run resets it, whether on a route or in the nightly
-    full gate. An unreadable counter means a full run;
-  - (c) the related set cannot be computed, or it is empty while non-test source changed;
-  - (d) `ORCH_UNIT_RELATED=off`.
-
-  When the diff changes only docs or test files that relate to no unit file, nothing runs, and the verdict says
-  so. The regression rule is unchanged. The baseline is the cached full-suite measurement of the merge base,
-  restricted to the related files. If there is no cache entry, the merge base is measured on the same files. A
-  related-only run is cached only as `scope: "related"`, never as a full baseline, and the landing store and the
-  full gate never read it. A repo whose `test_cmd` is not a plain vitest run (`npm test` →
-  `vitest run [--config X]`) keeps the full suite on every route and logs one line saying so.
-  `unit_full_every: 1` also restores the full suite on every route. The scope also appears in the verdict
-  (`| unit scope: …`) and in `orchestrator-unit-log.json` (`scope`, `scope_reason`, `related_files`,
-  `branch_cmd`).
+- **The per-route gate runs only what the change touches** (ORCH-LEAN-GATE-1, D-S7CORE54-77; it replaces
+  ORCH-UNIT-RELATED-1's triggers and every-5th route). After the build: lint on the changed source files
+  (`lint_changed_cmd` in repos.yaml; an error is FAIL(product)). Unit: the test files the branch adds or changes,
+  the unit test files that DIRECTLY import a changed file (one hop, read from the files — never vitest's
+  transitive `--changed` graph), the declared extras (`unit_related_extra`) and, when non-test source changed, the
+  guard scanners (`unit_always_files`: every one in a risk class of `unit_always_risk_globs`, the rest only at
+  most `unit_always_max_s`, 3 s). SIT: the SIT files the branch adds or changes and
+  those that directly import a changed `server/` file. No trigger (package.json, the lockfile, configs) and no
+  route count runs a full suite; the full suite runs only when the suite cannot be enumerated, the diff is
+  unknown, or `ORCH_UNIT_RELATED=off`. Log line: `🎯 Unit gate: related <n>/<total> files — …`. A red is judged
+  against the known reds on main — the newest full gate's unit failure list and its flaky files
+  (`state/full-gate-<repo>.json`), named in one `📋 Unit gate: known reds = …` line; a red outside it that fails
+  alone runs only its file(s) once at the merge base: red there too is BLOCKED(environment)
+  `already-red-on-main`, green there is FAIL(product) (`ORCH_ALREADY_RED_CHECK=off`: no run, FAIL(product)).
+  No merge base is measured per route. The full SIT and unit suites run nightly (02:30)
+  and before every tester session, unchanged. A repo whose `test_cmd` is not a plain vitest run keeps its full
+  suite and its measured baseline (yorsie, the orchestrator's own pytest). The fire prompt asks the executor to
+  compile once, never `npm run build`, and run only its own new or changed tests; it asks for no preflight
+  (`ORCH_EXEC_PREFLIGHT=on` restores the sentence), and a second `preflight` on one route exits 4
+  (`ORCH_PREFLIGHT_ONCE=off`). The brief's GATE PRE-LIST lists the SIT suite with `--filesOnly` (seconds). The
+  daemon honours a header's `effort=xhigh` only with a `## Executor: … xhigh … Why: …` line, else fires at high.
 - **A re-gate runs only the gates** (ORCH-REGATE-GATE-ONLY-1). A queue file whose header has
   `## Re-gate of: <route branch> <sha>`, plus its Kanban, George-go and Operability lines, builds no executor
   command. `run_batch` checks three things first:
@@ -233,17 +233,16 @@ and branch; its SIT leg is `pass` and needed no isolation; its base is the gate'
 uncommitted outside `briefs/`; the gated tip's non-briefs tree equals the record's; the gate's checkout is clean;
 the record's SIT files are the related set the gate computes; and the record is no older than
 `ORCH_PREFLIGHT_REUSE_MAX_H` hours (default 2). The unit leg is reused under the same conditions, and also needs
-both legs green (`exit` 0), a unit leg with no failures and no isolation pass, and a gate scope that is related
-(not full) and the same files. Either way the gate logs one `♻️  SIT:` / `♻️  unit:` line, either
+a unit leg with no failures (a flaky-only leg counts; ORCH-LEAN-GATE-1 dropped "both legs green") and a gate scope
+that is related (not full) and the same files. A SIT leg green after isolation is reused too. Either way the gate logs one `♻️  SIT:` / `♻️  unit:` line, either
 `reused the executor preflight …` or `preflight not reused — <the first condition that failed>`. If any condition
 fails, the leg runs as it does today. A reused SIT leg writes a sit-log entry with `reused: "preflight"`. A reused
-unit leg adds one to the related-run counter, writes one unit-log entry (`signal: "reused-preflight"`), and
+unit leg writes one unit-log entry (`signal: "reused-preflight"`), and
 stores no cache entry. `full-gate`, the nightly run and the re-gate lane never read the record.
 `ORCH_PREFLIGHT_REUSE=off` turns reuse off. A non-positive `ORCH_PREFLIGHT_REUSE_MAX_H` also turns it off.
-clinical-mp's `unit_full_triggers` are the files every test loads (manifests, the vitest, vite and ts configs,
-`src/test.setup.ts`, `src/test/**`, `server/allowlist*.ts`); they no longer include whole source trees. Its
-`unit_always_files` lists the source-scanner tests, which read the tree and so cannot be related through imports.
-Each one in the suite joins any related set whose import-graph part is non-empty. `ORCH_UNIT_ALWAYS=off` drops
+ORCH-LEAN-GATE-1 removed clinical-mp's `unit_full_triggers` and `unit_full_every`. Its `unit_always_files` lists
+the source-scanner tests (the slow ones outside a risk class run nightly only), which read the tree and so cannot be related through imports; each one in the suite
+joins any route whose diff changes non-test source. `ORCH_UNIT_ALWAYS=off` drops
 them. A full-scope PASS whose only new failures were flaky in isolation now seeds the merged tree's baseline, with
 the flaky files' tests taken out and the files recorded as flaky. It is stored only when the run names every
 failing test. In the executor, `executor/hooks/long_wait.py` refuses a Bash `sleep` of 300 s or more, or one with

@@ -32,7 +32,7 @@ Route timeout and dependency trees (brief header):
                                        (npm ci) / venv instead of linking the main checkout's (L-92)
 """
 
-import os, sys, re, time, json, shlex, shutil, signal, logging, hashlib, subprocess, argparse, tempfile
+import os, sys, re, time, json, shlex, shutil, signal, logging, hashlib, subprocess, argparse, tempfile, posixpath
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict, replace
@@ -261,13 +261,13 @@ SIT_BATCH_FILES_KEY = "sit_batch_files"
 SIT_BATCH_PAUSE_KEY = "sit_batch_pause_s"
 # [ORCH-GATE-COST-1] D3 (D-S7CORE29-02): per merge, a repo with `sit_list_cmd` runs the SIT files RELATED to
 # the branch's diff, not the whole suite (~25 min per merge on clinical-mp, L-150). The related set is the
-# union of (a) the files the installed vitest reports affected by the diff against the merge base — its
-# `list --changed <base>` (4.1.4: "Print only tests that are affected by the changed files"; files only, so
-# nothing is collected or run) appended to the repo's own sit_list_cmd; (b) the SIT files the branch added or
-# changed; (c) `sit_core_files` in repos.yaml (absent ⇒ none). Empty ⇒ the leg is not applicable, said so.
-# A related set that cannot be computed ⇒ the FULL suite, with the reason — never none.
+# union of (a) [ORCH-LEAN-GATE-1] the SIT files that directly import a changed server file (one hop, below); (b) the
+# SIT files the branch added or changed; (c) `sit_core_files` in repos.yaml (absent ⇒ none). Empty ⇒ the leg is not
+# applicable, said so. A diff that cannot be computed ⇒ the FULL suite, with the reason — never none.
 SIT_CORE_FILES_KEY = "sit_core_files"
-SIT_RELATED_ARGS = "--changed {base} --filesOnly"
+# [ORCH-LEAN-GATE-1] a SIT file runs per route when the branch adds or changes it, or when it directly imports a changed
+# file under one of these roots (D-S7CORE54-77 (f)); everything else is the nightly full gate's.
+SIT_DIRECT_ROOTS = ("server/",)
 # The list command's own error banners: vitest exits 0 after "There were unhandled errors during test
 # collection", so the exit code alone cannot say the enumeration failed.
 _SIT_LIST_ERROR_RE = re.compile(r"\b(?:Collect|Startup|Unhandled) Error\b|unhandled errors during test collection"
@@ -1060,7 +1060,7 @@ def fire_toni(batch_file: Path, project: Path=PROJECT_ROOT) -> tuple[int, str]:
     # [ORCH-RELIABILITY-1] F1.2: the executor runs the gate's related set before its handback. Backticks are escaped:
     # the prompt is a double-quoted bash word, and an unescaped one would run the preflight at fire time.
     pf_repo = parse_repo_from_brief(batch_file) or ACTIVE_REPO_NAME
-    preflight_ask = ("" if os.environ.get(PREFLIGHT_VAR, "").strip().lower() == "off" or not pf_repo
+    preflight_ask = ("" if os.environ.get(PREFLIGHT_VAR, "").strip().lower() != "on" or not pf_repo
                      else " " + PREFLIGHT_SENTENCE.format(repo=pf_repo).replace("`", "\\`"))
     preflight_ask = " " + TYPECHECK_SENTENCE + preflight_ask   # [ORCH-ROUTE-TIME-1] T-4: always, before the preflight
     cmd = (
@@ -2437,16 +2437,21 @@ def _parse_sit_listing(text: str) -> tuple:
     return files, per_file
 
 
-def _sit_plan(repo_path: Path) -> Optional[SitPlan]:
+def _sit_plan(repo_path: Path, files_only: bool = False) -> Optional[SitPlan]:
     """[SIT-RATE-1] None ⇒ batching is not configured for this repo (no `sit_list_cmd`) and
     the gate runs exactly as before, in one invocation. Otherwise enumerate the suite with the
     repo's own list command so the batches are cut from the same file set the runner would
     collect — no glob is duplicated here. A list that fails or enumerates nothing is an
     environment error (`sit-list-failed`): the gate would otherwise run unbatched into the
-    very rate limit this exists to avoid."""
+    very rate limit this exists to avoid.
+
+    [ORCH-LEAN-GATE-1] `files_only`: the file list alone (`--filesOnly`, nothing collected, seconds instead of minutes)
+    — for the brief's GATE PRE-LIST, which needs names, not batches."""
     list_cmd = (ACTIVE_REPO_CONFIG.get(SIT_LIST_CMD_KEY) or "").strip()
     if not list_cmd:
         return None
+    if files_only:
+        list_cmd += " --filesOnly"
     plan = SitPlan(batch_files=_unit_repo_timeout(SIT_BATCH_FILES_KEY, SIT_BATCH_FILES))
     raw_pause = ACTIVE_REPO_CONFIG.get(SIT_BATCH_PAUSE_KEY)
     try:  # 0 is a legitimate pause (none); a non-integer is not
@@ -2487,39 +2492,23 @@ def _sit_config_file(list_cmd: str) -> Optional[str]:
 
 
 def _sit_related_files(repo_path: Path, plan: SitPlan, diff: "BranchDiff") -> tuple:
-    """[ORCH-GATE-COST-1] D3: (files, how) — the related set, in the suite's listing order — or (None, why) when
-    it cannot be computed, which means the FULL suite, never none. An empty list is "no SIT file relates".
+    """[ORCH-LEAN-GATE-1] (files, how) — the related set, in the suite's listing order — or (None, why) when the
+    diff is unknown, which means the FULL suite. An empty list is "no SIT file relates".
 
-    (a) the installed vitest's own answer, enumerated, never run: the repo's sit_list_cmd + SIT_RELATED_ARGS
-        (`--changed <merge base>`: `git diff <base>...HEAD`, staged and untracked files, followed through the
-        import graph of every SIT file). A failed or erroring enumeration is a reason, not an empty set.
+    (a) the SIT files that DIRECTLY import a changed file under SIT_DIRECT_ROOTS (`server/`) — one hop
+        (_direct_importers), never vitest's transitive `--changed` graph.
     (b) the SIT files the branch's diff itself adds or changes.
     (c) sit_core_files from repos.yaml — a name the suite does not enumerate is said and skipped.
-    A diff that changes the SIT config named by `--config` is the full suite: no import graph reaches it."""
+    A diff that changes the SIT config named by `--config` is said; the nightly full gate runs the whole suite on it."""
     if diff is None or diff.paths is None or not diff.base:
         return None, f"the branch's diff is unknown ({diff.error if diff else 'not computed'})"
     list_cmd = (ACTIVE_REPO_CONFIG.get(SIT_LIST_CMD_KEY) or "").strip()
     changed = {_norm_test_path(p) for p in diff.paths}
     config = _sit_config_file(list_cmd)
-    if config and _norm_test_path(config) in changed:
-        return None, f"the diff changes the SIT config {config}, which no related set can see"
-    cmd = f"{list_cmd} {SIT_RELATED_ARGS.format(base=shlex.quote(diff.base))}"
-    try:
-        r = subprocess.run(_gate_shell_cmd(cmd, repo_path), shell=True, capture_output=True,
-                           text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return None, f"{cmd!r}: {type(e).__name__}"
-    said = _ANSI_RE.sub("", (r.stdout or "") + "\n" + (r.stderr or ""))
-    if r.returncode != 0 or _SIT_LIST_ERROR_RE.search(said):
-        return None, (f"{cmd!r} exit {r.returncode}: "
-                      f"{((r.stderr or r.stdout or '').strip()[-300:]) or 'no output'}")
-    listed, _ = _parse_sit_listing(r.stdout)
+    cfg_said = (f"; the diff changes the SIT config {config} — the nightly full gate runs the whole suite on it"
+                if config and _norm_test_path(config) in changed else "")
     suite = set(plan.files)
-    affected = [f for f in listed if f in suite]
-    stray = [f for f in listed if f not in suite]
-    if stray:
-        log.warning(f"⚠️  SIT gate: the related enumeration names {len(stray)} file(s) the suite does not "
-                    f"enumerate — not run: {', '.join(stray[:BRIEFS_ONLY_NAMED_FILES])}")
+    affected = [f for f in plan.files if f in _direct_importers(repo_path, plan.files, changed, SIT_DIRECT_ROOTS)]
     touched = [f for f in plan.files if f in changed]
     core_cfg = ACTIVE_REPO_CONFIG.get(SIT_CORE_FILES_KEY) or []
     core_cfg = [core_cfg] if isinstance(core_cfg, str) else list(core_cfg)
@@ -2530,9 +2519,9 @@ def _sit_related_files(repo_path: Path, plan: SitPlan, diff: "BranchDiff") -> tu
                     f"skipped: {', '.join(unknown)}")
     chosen = set(affected) | set(touched) | {f for f in core if f in suite}
     files = [f for f in plan.files if f in chosen]
-    return files, (f"{len(affected)} affected by the diff against merge-base {diff.base[:7]} "
-                   f"(--changed), {len(touched)} changed by the branch, "
-                   f"{len([f for f in core if f in suite])} core ({SIT_CORE_FILES_KEY})")
+    return files, (f"{len(affected)} directly import a changed {'/'.join(SIT_DIRECT_ROOTS)} file (one hop), "
+                   f"{len(touched)} changed by the branch, "
+                   f"{len([f for f in core if f in suite])} core ({SIT_CORE_FILES_KEY})" + cfg_said)
 
 
 # ── [ORCH-SIT-ENUM-PARALLEL-1] 1a · the SIT enumeration beside the build (D-S7CORE33-36 fix #4) ──────────────────
@@ -2570,12 +2559,13 @@ class _SitEnumJob:
     started: float = 0.0
     finished: Optional[float] = None
     future: object = None
+    files_only: bool = False         # [ORCH-LEAN-GATE-1] the pre-list's file-names-only enumeration
 
     def _run(self):
         self.started = time.time()
         try:
             self.tree = _sit_tree_state(self.repo_path)
-            self.plan = _sit_plan(self.repo_path)
+            self.plan = _sit_plan(self.repo_path, files_only=self.files_only)
             if self.plan is not None and not self.plan.error and self.diff is not None:
                 self.related, self.how = _sit_related_files(self.repo_path, self.plan, self.diff)
         except Exception as e:
@@ -4684,19 +4674,13 @@ def _unit_gate_eligible_repos() -> set:
 
 # ── [ORCH-UNIT-RELATED-1] the per-route unit leg runs the files related to the diff (D-S7CORE33-36 fix #1) ─────────
 # 132 min/day went to the full unit suite on every product route (9.7 min, ~1,543 files, median diff 12 files).
-# The branch leg now runs vitest's own related set — `list --changed <merge base>` on the unit config, enumerated
-# and never run, as the SIT leg's D3 set is — plus the test files the branch changes. It runs the FULL suite, and
-# says why, when (a) the diff touches a shared trigger, (b) this is the N-th gated route since the last full unit
-# run, (c) the set cannot be computed (or is empty while non-test source changed), or (d) ORCH_UNIT_RELATED=off.
-# The regression rule is unchanged; only the baseline it reads is restricted to the same files.
+# [ORCH-LEAN-GATE-1] (D-S7CORE54-77) the branch leg runs only what the change touches — test impact analysis, one
+# hop: the test files the branch adds or changes, the suite files that DIRECTLY import a changed file (_direct_
+# importers — never the transitive import graph), the declared extras, and the named fast guard scanners. No trigger
+# and no route count runs the full suite; it runs only when (c) the suite cannot be enumerated or the diff is unknown,
+# or (d) ORCH_UNIT_RELATED=off. A red is judged against the newest full gate's failure list (_unit_known_reds), not a
+# merge base re-measured per route. The full suites run nightly (02:30) and before every tester session.
 UNIT_RELATED_VAR = "ORCH_UNIT_RELATED"            # `off` ⇒ the full suite every route, as before
-UNIT_FULL_TRIGGERS_KEY = "unit_full_triggers"     # repos.yaml globs; a pattern with no `/` matches a name anywhere
-UNIT_FULL_TRIGGERS_DEFAULT = ("package.json", "package-lock.json", "vitest*.config.*", "vite.config.*",
-                              "tsconfig*.json", "**/setupTests.*")
-UNIT_FULL_EVERY_KEY = "unit_full_every"           # repos.yaml: every N-th gated route runs the full suite
-UNIT_FULL_EVERY = 5
-UNIT_FULL_COUNTER_PREFIX = "unit-full-counter-"   # state/unit-full-counter-<repo>.json
-UNIT_RELATED_ARGS = "--changed {base} --filesOnly"
 _UNIT_TEST_FILE_RE = re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$")
 _UNIT_DOC_FILE_RE = re.compile(r"\.(?:md|txt)$", re.IGNORECASE)
 
@@ -4712,35 +4696,40 @@ class UnitScope:
     reason: str = ""
 
 
-def _unit_full_counter_file(repo_name: str) -> Path:
-    return _running_marker_dir() / f"{UNIT_FULL_COUNTER_PREFIX}{_marker_repo_slug(repo_name)}.json"
+# [ORCH-LEAN-GATE-1] one hop: a test file is selected when one of its own module specifiers — `import … from`,
+# `import '…'`, `import('…')`, `export … from`, `require('…')`, `vi.mock('…')` and the other `vi.*('…')` loaders —
+# resolves to a changed file. Only relative specifiers resolve (no path alias is read); a package name never
+# does. A file the test reaches only through another module is NOT selected: the nightly full gate covers that.
+_IMPORT_SPEC_RE = re.compile(r"""(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\(|\bvi\.\w+\s*\()\s*(['"])(\.{1,2}/[^'"\n]*)\1""")
+_IMPORT_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json")
 
 
-def _unit_full_counter_read(repo_name: str) -> Optional[int]:
-    """Related-only routes since the last full unit run; 0 when never written; None when unreadable (⇒ full)."""
-    f = _unit_full_counter_file(repo_name)
-    if not f.exists():
-        return 0
+def _direct_imports(repo_path: Path, test_file: str, also: frozenset = frozenset()) -> set:
+    """The repo-relative files `test_file`'s own relative specifiers resolve to: each tried as written, with each
+    extension (a `.js`/`.jsx` written for a `.ts`/`.tsx` too) and as `<dir>/index.<ext>`. A path in `also` counts as
+    present (a file the branch deleted). Unreadable ⇒ nothing."""
     try:
-        n = json.loads(f.read_text()).get("since_full")
-        return n if isinstance(n, int) and n >= 0 else None
-    except (OSError, ValueError, AttributeError):
-        return None
+        text = (repo_path / test_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    here, out = posixpath.dirname(test_file), set()
+    for _, spec in _IMPORT_SPEC_RE.findall(text):
+        base = posixpath.normpath(posixpath.join(here, spec.split("?", 1)[0]))
+        stem = base.rsplit(".", 1)[0] if base.endswith((".js", ".jsx")) else base
+        for cand in (base, *(stem + e for e in _IMPORT_EXTS), *(f"{base}/index{e}" for e in _IMPORT_EXTS)):
+            if cand in also or (repo_path / cand).is_file():
+                out.add(cand)
+                break
+    return out
 
 
-def _unit_full_counter_record(repo_name: str, full: bool, why: str):
-    """A full unit run (route or nightly) resets the counter; a related-only route adds one. Never raises."""
-    try:
-        n = 0 if full else (_unit_full_counter_read(repo_name) or 0) + 1
-        f = _unit_full_counter_file(repo_name)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"repo": repo_name, "since_full": n, "updated_at": datetime.now().isoformat(),
-                                   "last": ("full: " if full else "related: ") + why}, indent=2))
-        os.replace(tmp, f)
-    except Exception as e:
-        log.warning(f"⚠️  Unit gate: {UNIT_FULL_COUNTER_PREFIX}{repo_name}.json not written ({e}) — the next route "
-                    f"reads the old count")
+def _direct_importers(repo_path: Path, files, changed, roots: tuple = ()) -> set:
+    """[ORCH-LEAN-GATE-1] the files of `files` (test files) that directly import a path in `changed`; with `roots`,
+    only a changed path under one of them counts (the SIT leg: `server/`). One hop, never the import graph."""
+    targets = frozenset(p for p in changed if not roots or any(p.startswith(r) for r in roots))
+    if not targets:
+        return set()
+    return {f for f in files if _direct_imports(repo_path, f, targets) & targets}
 
 
 def _unit_trigger_hit(path: str, pattern: str) -> bool:
@@ -4810,76 +4799,82 @@ def _unit_scope(repo_path: Path, test_cmd: str, diff: "BranchDiff") -> UnitScope
     if diff is None or diff.paths is None or not diff.base:
         return UnitScope(capable=True, reason=f"(c) the branch's diff is unknown "
                                               f"({diff.error if diff is not None else 'not computed'})")
-    raw = ACTIVE_REPO_CONFIG.get(UNIT_FULL_TRIGGERS_KEY)
-    triggers = list(UNIT_FULL_TRIGGERS_DEFAULT if raw is None else ([raw] if isinstance(raw, str) else raw))
-    core = ACTIVE_REPO_CONFIG.get(SIT_CORE_FILES_KEY) or []
-    core = [_norm_test_path(str(c)) for c in ([core] if isinstance(core, str) else core)]
-    paths = [_norm_test_path(p) for p in diff.paths]
-    hits = [f"{p} ({t})" for p in paths for t in triggers if _unit_trigger_hit(p, t)]
-    hits += [f"{p} ({SIT_CORE_FILES_KEY})" for p in paths if p in core]
-    if hits:
-        return UnitScope(capable=True, reason=(f"(a) the diff touches a shared trigger ({UNIT_FULL_TRIGGERS_KEY}): "
-                                               + ", ".join(hits[:BRIEFS_ONLY_NAMED_FILES])
-                                               + (f", … +{len(hits) - BRIEFS_ONLY_NAMED_FILES} more"
-                                                  if len(hits) > BRIEFS_ONLY_NAMED_FILES else "")))
-    every = _unit_repo_timeout(UNIT_FULL_EVERY_KEY, UNIT_FULL_EVERY)
-    since = _unit_full_counter_read(ACTIVE_REPO_NAME)
-    if since is None:
-        return UnitScope(capable=True, reason=f"(b) {_unit_full_counter_file(ACTIVE_REPO_NAME).name} is unreadable — "
-                                              f"the count since the last full unit run is unknown")
-    if since >= every - 1:
-        return UnitScope(capable=True, reason=f"(b) route {since + 1} since the last full unit run "
-                                              f"({UNIT_FULL_EVERY_KEY} {every})")
     files, total, how = _unit_related_files(repo_path, list_cmd, diff)
     if files is None:
         return UnitScope(capable=True, total=total, reason=f"(c) {how}")
     if files:
         return UnitScope(capable=True, files=files, total=total, reason=how)
-    briefs = _active_briefs_subdir()
-    source = [p for p in paths if not (_UNIT_TEST_FILE_RE.search(p) or _UNIT_DOC_FILE_RE.search(p)
-                                       or _under_subdir(p, briefs))]
-    if source:
-        return UnitScope(capable=True, total=total,
-                         reason=(f"(c) the related set is empty while non-test source changed: "
-                                 f"{', '.join(source[:BRIEFS_ONLY_NAMED_FILES])}"
-                                 + (f", … +{len(source) - BRIEFS_ONLY_NAMED_FILES} more"
-                                    if len(source) > BRIEFS_ONLY_NAMED_FILES else "")))
     return UnitScope(capable=True, files=(), total=total,
-                     reason=f"unit: no unit test file relates to this diff ({len(paths)} changed files, no non-test "
-                            f"source) — {how}")
+                     reason=f"unit: no unit test file relates to this diff ({len(diff.paths)} changed files) — {how}; "
+                            f"the full suite runs nightly")
+
+
+def _source_paths(paths) -> list:
+    """The paths of a diff that are neither test files, docs, nor under briefs_subdir — what a guard scanner reads."""
+    briefs = _active_briefs_subdir()
+    return [p for p in paths if not (_UNIT_TEST_FILE_RE.search(p) or _UNIT_DOC_FILE_RE.search(p)
+                                     or _under_subdir(p, briefs))]
 
 
 def _unit_related_files(repo_path: Path, list_cmd: str, diff: "BranchDiff") -> tuple:
-    """[ORCH-UNIT-RELATED-1] (files, suite size, how): vitest's related set for the diff (`list --changed <merge
-    base>`, enumerated, never run) plus the suite files the diff changes, in the suite's listing order; (None, suite
-    size or None, why) when it cannot be computed. _unit_scope's set, and [ORCH-RELIABILITY-1]'s (tests_reaching)."""
+    """[ORCH-LEAN-GATE-1] (files, suite size, how): the suite files the diff changes, those that directly import a
+    changed file (_direct_importers, one hop), the declared extras and — when non-test source changed — the guard
+    scanners (unit_always_files), in the suite's listing order; (None, None, why) when the suite cannot be enumerated.
+    _unit_scope's set, and tests_reaching's (the brief's GATE PRE-LIST)."""
     suite, why = _unit_listing(repo_path, f"{list_cmd} --filesOnly")
     if suite is None or not suite:
         return None, None, f"the unit suite could not be enumerated — {why or 'no file listed'}"
-    affected, why = _unit_listing(repo_path, f"{list_cmd} {UNIT_RELATED_ARGS.format(base=shlex.quote(diff.base))}")
-    if affected is None:
-        return None, len(suite), f"the related set could not be computed — {why}"
     member = set(suite)
     changed = {_norm_test_path(p) for p in diff.paths}
-    chosen = (set(affected) | changed) & member
-    graph = bool(chosen)   # [ORCH-ROUTE-TIME-1] the import-graph set, before any declared addition
+    direct = _direct_importers(repo_path, suite, changed)
+    chosen = (direct | changed) & member
     extra, extra_said = _unit_related_extra(repo_path, changed, member, chosen)   # [ORCH-PREFLIGHT-READMAP-1]
     chosen |= extra
-    always, always_said = _unit_always(member, chosen) if graph else (set(), "")
+    always, always_said = _unit_always(member, chosen) if _source_paths(changed) else (set(), "")
     chosen |= always
     files = tuple(f for f in suite if f in chosen)
-    return files, len(suite), (f"{len(set(affected) & member)} affected by the diff against merge-base "
-                               f"{diff.base[:7]} (--changed), {len(changed & member)} changed by the branch"
-                               + extra_said + always_said)
+    return files, len(suite), (f"{len(direct)} directly import a changed file (one hop), {len(changed & member)} "
+                               f"changed by the branch" + extra_said + always_said)
 
 
 # ── [ORCH-ROUTE-TIME-1] T-2 · the source scanners every related-only run carries (Kanban 698) ────────────────────────
-# A unit test that reads the source tree (readdirSync / globSync / git ls-files) is related to no file by the import
-# graph, so a related-only run never selected it and a nightly full gate was the first to see it red. repos.yaml
-# `unit_always_files` (a list of test files) joins every related set whose import-graph set is non-empty; an empty
-# one keeps _unit_scope's two rules exactly ("(c)" full suite while source changed; nothing for a docs-only diff).
+# A unit test that reads the source tree (readdirSync / globSync / git ls-files) is related to no file by its imports,
+# so a related-only run never selected it and a nightly full gate was the first to see it red. repos.yaml
+# `unit_always_files` (a list of test files) joins every related set when the diff changes non-test source.
+# [ORCH-LEAN-GATE-1] only the fast ones are listed (each at most 3.0 s, measured; the list's comment says when).
 UNIT_ALWAYS_FILES_KEY = "unit_always_files"
 UNIT_ALWAYS_VAR = "ORCH_UNIT_ALWAYS"   # `off` ⇒ no union: the related set is vitest's (and unit_related_extra's)
+# [ORCH-LEAN-GATE-1] TC-6: a guard is kept per route by risk, not by stopwatch. repos.yaml: `unit_always_risk_globs`
+# (risk classes, _unit_trigger_hit patterns) — a listed guard matching one ALWAYS joins; `unit_always_max_s` +
+# `unit_always_slow_s` ({file: measured seconds}) — any other guard measured above the cut runs nightly only.
+UNIT_ALWAYS_MAX_S_KEY = "unit_always_max_s"
+UNIT_ALWAYS_SLOW_KEY = "unit_always_slow_s"
+UNIT_ALWAYS_RISK_KEY = "unit_always_risk_globs"
+
+
+def _unit_always_nightly_only(listed: set) -> tuple:
+    """[ORCH-LEAN-GATE-1] TC-6: (the listed guards that run nightly only, how said). A guard is nightly-only when it is
+    measured above unit_always_max_s AND matches no unit_always_risk_globs pattern. A malformed key keeps every guard
+    (the decision fails toward more testing), said; with a cut set, a missing, empty or non-string risk list is
+    malformed (verifier r3 B1: without it every slow safety guard would go nightly)."""
+    cut, slow, risk = (ACTIVE_REPO_CONFIG.get(k) for k in
+                       (UNIT_ALWAYS_MAX_S_KEY, UNIT_ALWAYS_SLOW_KEY, UNIT_ALWAYS_RISK_KEY))
+    if cut is None:
+        return set(), ""
+    bad = [k for k, v, ok in ((UNIT_ALWAYS_MAX_S_KEY, cut, isinstance(cut, (int, float)) and not isinstance(cut, bool)),
+                              (UNIT_ALWAYS_SLOW_KEY, slow, slow is None or isinstance(slow, dict)),
+                              (UNIT_ALWAYS_RISK_KEY, risk, isinstance(risk, list) and bool(risk)
+                               and all(isinstance(g, str) and g.strip() for g in risk))) if not ok]
+    if bad:
+        log.warning(f"⚠️  Unit gate: repos.yaml {', '.join(bad)} malformed — every listed guard runs")
+        return set(), ""
+    slow = {_norm_test_path(str(f)): v for f, v in (slow or {}).items()}
+    risk = [g.strip() for g in risk]
+    nightly = {f for f in listed if isinstance(slow.get(f), (int, float)) and slow[f] > cut
+               and not any(_unit_trigger_hit(f, g) for g in risk)}
+    kept_slow = sorted(f for f in listed if isinstance(slow.get(f), (int, float)) and slow[f] > cut and f not in nightly)
+    return nightly, (f"; {len(kept_slow)} slow guard(s) kept by risk ({UNIT_ALWAYS_RISK_KEY}), {len(nightly)} slow "
+                     f"non-risk guard(s) nightly only (> {cut}s)")
 
 
 def _unit_always(member: set, chosen: set) -> tuple:
@@ -4893,9 +4888,10 @@ def _unit_always(member: set, chosen: set) -> tuple:
                     f"got {str(raw)[:120]!r}) — ignored")
         return set(), ""
     listed = {_norm_test_path(f.strip()) for f in raw}
-    add = (listed & member) - chosen
+    nightly, nightly_said = _unit_always_nightly_only(listed)   # [ORCH-LEAN-GATE-1] TC-6: by risk, then by time
+    add = ((listed - nightly) & member) - chosen
     return add, (f", + {len(add)} always-run ({UNIT_ALWAYS_FILES_KEY}: {len(listed & member)} of {len(listed)} "
-                 f"listed are in the suite)")
+                 f"listed are in the suite{nightly_said})")
 
 
 # ── [ORCH-PREFLIGHT-READMAP-1] G-C1 · declared extras the import graph cannot see (Kanban 601, 341n6b F-1) ─────────
@@ -4964,46 +4960,67 @@ def _unit_related_extra(repo_path: Path, changed: set, member: set, chosen: set)
         return set(), ""
 
 
-def _unit_baseline_related(repo_path: Path, base_sha: str, test_cmd: str, files: tuple, archive: Path,
-                           repo_name: str) -> tuple:
-    """[ORCH-UNIT-RELATED-1] the merge-base baseline for the related files: (run, source, note), as
-    _unit_baseline_measure_or_reuse returns. The judged FULL-suite measurement of the base's tree, restricted to
-    the files, when there is one; else the base measured on those of the files it has (a related-scoped cache
-    entry); none of them at the base ⇒ an empty baseline — no file there, so no failure there."""
-    ck = _unit_content_key(repo_path, base_sha)
-    hit = _unit_cache_lookup(archive, repo_name, base_sha, test_cmd, content_key=ck) if ck else None
-    if hit and _unit_cache_judged(hit) and (hit.get("scope") or "full") == "full" and hit.get("failures") is not None:
-        at = str(hit.get("sha") or "?")
-        mine = tuple(sorted(set(hit.get("failing_files") or ()) & set(files)))
-        run = UnitSuiteRun(ref=f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]} (cache at {at[:7]}, restricted to the "
-                               f"{len(files)} related files)", exit_code=1 if mine else 0,
-                           duration_s=float(hit.get("duration_s") or 0.0), runner=hit.get("runner"),
-                           failures=len(mine), failing_files=mine, failures_source="derived", count_comparable=False)
-        note = (f"read from cache — the full-suite measurement at {at[:7]} (measured "
-                f"{str(hit.get('measured_at') or '?')[:19]}, {hit.get('failures')} failure(s) over "
-                f"{len(hit.get('failing_files') or ())} file(s)) restricted to the {len(files)} related file(s): "
-                f"{len(mine)} failing; the count is files, not tests, and is not compared")
-        log.info(f"♻️  Unit baseline: CACHE HIT for {base_sha[:7]} by content (measured at {at[:7]}) — restricted to "
-                 f"the {len(files)} related file(s): {', '.join(mine) or 'none failing'}; no baseline run")
-        log.info(f'🛡 baseline-trust: CLEAN — cache hit at {base_sha[:7]}, measured '
-                 f'{str(hit.get("measured_at") or "?")[:19]} on a clock judged plausible (cache entry "clock": '
-                 f'"{hit["clock"]}"), restricted to the related files')
-        return run, "cache", note
-    try:
-        r = subprocess.run(["git", "-C", str(repo_path), "ls-tree", "-r", "--name-only", base_sha, "--", *files],
-                           capture_output=True, text=True, timeout=120)
-        there = set(r.stdout.split("\n")) if r.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
-        there = None
-    at_base = tuple(f for f in files if there is None or f in there)
-    if not at_base:
-        note = f"none of the {len(files)} related file(s) exists at merge-base {base_sha[:7]} — nothing failed there"
-        log.info(f"🧬 Unit baseline: {note}; no baseline run")
-        return (UnitSuiteRun(ref=f"{UNIT_BASELINE_REF_PREFIX} {base_sha[:7]} (no related file there)", exit_code=0,
-                             failures=0, failing_files=(), failures_source="derived", count_comparable=False),
-                "absent-at-base", note)
-    return _unit_baseline_measure_or_reuse(repo_path, base_sha, _unit_confirm_cmd(test_cmd, at_base), archive,
-                                           repo_name, related_files=at_base)
+KNOWN_REDS_SOURCE = "known-reds"   # [ORCH-LEAN-GATE-1] the per-route unit leg's baseline_source
+# [ORCH-LEAN-GATE-1] TC-4: a red outside the known reds that fails alone runs ONLY its file(s) once at the merge base;
+# red there too ⇒ BLOCKED(environment) `already-red-on-main` (main broke, not the route). Only on a red, never cached.
+ALREADY_RED_SIGNAL = "already-red-on-main"
+ALREADY_RED_VAR = "ORCH_ALREADY_RED_CHECK"   # `off` ⇒ no merge-base run; the red is FAIL(product), as before TC-4
+
+
+def _unit_red_at_base(repo_path: Path, base_sha: str, test_cmd: str, files: tuple) -> tuple:
+    """[ORCH-LEAN-GATE-1] TC-4: (the files of `files` that fail at merge base `base_sha` too, note). Only the files that
+    exist at the base run, in one detached-worktree run of just those files; nothing is cached or stored as a baseline.
+    A run that does not measure ⇒ () and said — the red stays the route's (FAIL(product), as before)."""
+    there = tuple(f for f in files if subprocess.run(["git", "-C", str(repo_path), "cat-file", "-e", f"{base_sha}:{f}"],
+                                                     capture_output=True).returncode == 0)
+    if not there:
+        note = f"none of {', '.join(files)} exists at merge-base {base_sha[:7]} — new on this route"
+        log.info(f"🧪 Unit gate: already-red check — {note}")
+        return (), note
+    run = _run_unit_baseline(repo_path, base_sha, _unit_confirm_cmd(test_cmd, there))
+    if not _unit_is_measurement(run) or run.failures is None:
+        note = (f"the merge-base {base_sha[:7]} run of {', '.join(there)} did not measure "
+                f"({run.error or run.collection or 'no summary'}) — the red is judged the route's")
+        log.warning(f"⚠️  Unit gate: already-red check — {note}")
+        return (), note
+    red = tuple(f for f in there if f in set(run.failing_files))
+    note = (f"merge-base {base_sha[:7]} run of {len(there)} file(s) in {run.duration_s:.1f}s — red there too: "
+            f"{', '.join(red) or 'none'}; green there: {', '.join(f for f in there if f not in red) or 'none'}")
+    log.info(f"🧪 Unit gate: already-red check (TC-4) — {note}")
+    return red, note
+
+
+def _unit_known_reds(repo_name: str, files: Optional[tuple]) -> tuple:
+    """[ORCH-LEAN-GATE-1] the per-route unit baseline, never measured: (run, source, note) — the newest full gate's
+    unit failure list (state/full-gate-<repo>.json: its result, else the newest history entry that has one), plus
+    the files that full gate confirmed flaky, restricted to `files` (None ⇒ all). A red outside it that fails alone
+    is FAIL(product). No list ⇒ an empty one, said: every red is judged new."""
+    f = full_gate_state_file(repo_name)
+    st = _read_marker(f) or {}
+    unit = st.get("unit") if isinstance(st.get("unit"), dict) else {}
+    pick = None
+    if isinstance(unit.get("failing_files"), list):
+        pick = (st.get("sha"), st.get("finished_at") or st.get("started_at"), st.get("trigger"),
+                unit["failing_files"], unit.get("flaky") if isinstance(unit.get("flaky"), list) else [])
+    else:
+        for h in reversed(st.get("history") or []):
+            if isinstance(h, dict) and isinstance(h.get("unit_failing_files"), list):
+                pick = (h.get("sha"), h.get("at"), "history", h["unit_failing_files"], [])
+                break
+    if pick is None:
+        known, said = (), f"{f.name} holds no full-gate unit failure list — every red is judged new"
+    else:
+        sha, at, trigger, failing, flaky = pick
+        known = tuple(sorted({_norm_test_path(str(x)) for x in failing + flaky}))
+        said = (f"{f.name}: full gate at {str(sha)[:7]} ({str(at)[:16]}, {trigger}) — {len(failing)} failing + "
+                f"{len(flaky)} flaky file(s)")
+    mine = tuple(x for x in known if files is None or x in set(files))
+    note = f"known reds on {MERGE_TARGET}, not measured per route: {said}; {len(mine)} of them in this run's files"
+    log.info(f"📋 Unit gate: known reds = the newest full-gate failure list ({said}); a red outside it that fails "
+             f"alone is FAIL(product)")
+    return (UnitSuiteRun(ref=f"known reds ({said})", exit_code=1 if mine else 0, failures=len(mine),
+                         failing_files=mine, failures_source="derived", count_comparable=False),
+            KNOWN_REDS_SOURCE, note)
 
 
 def _count_word(branch: int, baseline: int) -> str:
@@ -5031,7 +5048,8 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
 
     [ORCH-UNIT-RELATED-1] `diff` (run_pre_merge_gates' — a direct call passes none and runs the whole suite, exactly
     as before): the branch leg runs the related files (_unit_scope) or the full suite and says why; with related
-    files the baseline is _unit_baseline_related's, and the rule below is the same rule.
+    files the baseline is _unit_known_reds' ([ORCH-LEAN-GATE-1]: the newest full gate's failure list, never a merge
+    base measured per route), and the rule below is the same rule.
 
     [ORCH-ROUTE-TIME-1] `scope`: the _unit_scope run_pre_merge_gates already computed for `diff` (its preflight-reuse
     check), so the unit listing pair runs once a route; None ⇒ computed here, as before.
@@ -5080,9 +5098,8 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     if scope is not None and scope.files:
         branch_cmd = _unit_confirm_cmd(test_cmd, scope.files)
         scope_label = f"related {len(scope.files)}/{scope.total}"
-        log.info(f"🎯 Unit gate: related {len(scope.files)}/{scope.total} files — {scope.reason} (full suite: on a "
-                 f"shared trigger, every {_unit_repo_timeout(UNIT_FULL_EVERY_KEY, UNIT_FULL_EVERY)}th route, and "
-                 f"nightly)")
+        log.info(f"🎯 Unit gate: related {len(scope.files)}/{scope.total} files — {scope.reason} (the full suite runs "
+                 f"nightly and before every tester session, never per route)")
     elif scope is not None:
         scope_label = f"full {scope.total or '?'}"
         log.info(f"🎯 Unit gate: full suite: {scope.reason}")
@@ -5113,8 +5130,6 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
     if tree_why is None and after != tip:
         tree_why = f"HEAD moved during it ({tip[:7]} → {after[:7] or '?'})"
     log.info(f"🧪 Unit gate branch run — {branch_run.describe}")
-    if scope is not None and _unit_is_measurement(branch_run):
-        _unit_full_counter_record(ACTIVE_REPO_NAME, full=scope.files is None, why=f"{label}: {scope.reason}")
     branch_run.clock = _judge_leg("unit-branch", branch_run.clocks, archive,
                                   red=branch_run.exit_code != 0 or bool(branch_run.failures),
                                   completed=branch_run.error is None)
@@ -5169,10 +5184,9 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
 
     # [ORCH-5]: measured once per merge base, then reused. The measurement is still OURS and
     # still on the merge base — it is simply not repeated for a commit that has not changed.
-    if scope is not None and scope.files:
-        # [ORCH-UNIT-RELATED-1] the same files at the merge base: the cached full measurement restricted, or measured
-        baseline_run, baseline_source, baseline_note = _unit_baseline_related(
-            repo_path, base_sha, test_cmd, scope.files, archive, ACTIVE_REPO_NAME)
+    if scope is not None:
+        # [ORCH-LEAN-GATE-1] a per-route leg measures no baseline: the known reds on main (the newest full gate's list)
+        baseline_run, baseline_source, baseline_note = _unit_known_reds(ACTIVE_REPO_NAME, scope.files)
     else:
         baseline_run, baseline_source, baseline_note = _unit_baseline_measure_or_reuse(
             repo_path, base_sha, test_cmd, archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME)
@@ -5265,6 +5279,22 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
             _unit_cache_record_flakes(archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME, base_sha,
                                       test_cmd, flakes, repo_path=repo_path)
 
+    already_red, already_note = (), ""
+    if (regressions and baseline_source == KNOWN_REDS_SOURCE
+            and os.environ.get(ALREADY_RED_VAR, "").strip().lower() != "off"):
+        # [ORCH-LEAN-GATE-1] TC-4: off the known-red list and failing alone — red at the merge base too?
+        already_red, already_note = _unit_red_at_base(repo_path, base_sha, test_cmd, regressions)
+        if already_red and set(already_red) == set(regressions):
+            detail = (f"{', '.join(already_red)} fail(s) at merge-base {base_sha[:7]} too — already red on "
+                      f"{MERGE_TARGET}, not this route's change ({already_note}); off the known-red list ("
+                      f"{baseline_note})" + (f"; flaky in isolation, not blocking: {', '.join(flakes)}" if flakes else ""))
+            log.error(f"⛔ Unit gate: {detail} — BLOCKED(environment) {ALREADY_RED_SIGNAL}, not FAIL(product)")
+            return _finish(UnitGateOutcome(passed=False, signal=ALREADY_RED_SIGNAL, detail=detail, env=True,
+                                           ran=True, branch=branch_run, baseline=baseline_run,
+                                           baseline_note=baseline_note, baseline_source=baseline_source,
+                                           flaky_files=flakes, confirm=confirm_run))
+        regressions = tuple(f for f in regressions if f not in already_red)
+
     if regressions:
         # AC-O6b-01/02: a regression is a named file confirmed still failing in isolation that
         # did not fail at the merge base — that, and only that, produces FAIL(product). The
@@ -5276,6 +5306,8 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
             reasons.append(f"flaky in isolation, not blocking: {', '.join(flakes)}")
         if unloadable:   # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: the real failure wins, the load error is still said
             reasons.append(f"also {_unit_load_said(tuple(unloadable.items()))}")
+        if already_note:   # [ORCH-LEAN-GATE-1] TC-4: what the merge base said
+            reasons.append(f"already-red check: {already_note}")
         detail = (f"unit suite REGRESSED against merge-base {base_sha[:7]} — " + "; ".join(reasons)
                   + f" (baseline {baseline_source})")
         log.error(f"⛔ UNIT BASELINE GATE FAILED — {detail}. BLOCKING: branch stays unmerged.")
@@ -5667,6 +5699,43 @@ def _sit_gate_verdict(so: SitOutcome, repo_path: Path) -> GateVerdict:
     return v
 
 
+# [ORCH-LEAN-GATE-1] (b) repos.yaml `lint_changed_cmd` (e.g. `npx eslint --no-warn-ignored`): run after a green build
+# on the route's changed source files that exist at its tip, never the repo. An error is FAIL(product); warnings do not
+# fail. Absent ⇒ no lint leg (as before).
+LINT_CHANGED_KEY = "lint_changed_cmd"
+_LINT_FILE_RE = re.compile(r"\.(?:[cm]?[jt]sx?)$")
+
+
+def _lint_changed(repo_path: Path, diff: "BranchDiff") -> Optional[GateVerdict]:
+    """None when lint is green, not declared, or nothing to lint (said in one line); else the red verdict."""
+    cmd = (ACTIVE_REPO_CONFIG.get(LINT_CHANGED_KEY) or "").strip()
+    if not cmd or diff is None or not diff.paths:
+        return None
+    briefs = _active_briefs_subdir()
+    files = [p for p in diff.paths
+             if _LINT_FILE_RE.search(p) and not _under_subdir(p, briefs) and (repo_path / p).is_file()]
+    if not files:
+        log.info("🧹 Lint (changed files): nothing to lint — no changed source file at the tip")
+        return None
+    full = f"{cmd} {' '.join(shlex.quote(f) for f in files)}"
+    started = time.time()
+    try:
+        r = subprocess.run(full, shell=True, capture_output=True, text=True, cwd=str(repo_path),
+                           timeout=BUILD_GATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return GateVerdict(GateOutcome.BLOCKED_ENV, "lint", "timeout", f"lint exceeded {BUILD_GATE_TIMEOUT}s")
+    took = time.time() - started
+    if r.returncode == 0:
+        log.info(f"✅ Lint (changed files): {len(files)} file(s) clean ({took:.1f}s) — {cmd}")
+        return None
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+    v = _classify_gate_failure("lint", out, repo_path, r.returncode)
+    if v.outcome is GateOutcome.FAIL_PRODUCT:
+        v.signal, v.detail = "lint", (f"lint errors in the route's changed files ({len(files)} linted, {took:.1f}s): "
+                                      + _ANSI_RE.sub("", out).strip()[-600:])
+    return v
+
+
 def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> GateVerdict:
     """Run the repo's PRE_MERGE_GATES on the route branch checked out at repo_path, BEFORE any
     merge, then the S7-CORE-8 [ORCH-3] unit baseline gate. Returns a three-way GateVerdict:
@@ -5723,11 +5792,23 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
             if not bg.passed:
                 if sit_enum is not None:
                     sit_enum.discard("the build is red")   # the build verdict decides first
-                v = _classify_gate_failure("build", bg.output or bg.error or "", repo_path, bg.exit_code,
-                                           clock=bg.clock)
+                if bg.error == "timeout":   # [ORCH-LEAN-GATE-1] a leg timeout is BLOCKED(environment) (:7255), never product
+                    v = GateVerdict(GateOutcome.BLOCKED_ENV, "build", "timeout",
+                                    f"the build leg was killed at its {BUILD_GATE_TIMEOUT}s budget after "
+                                    f"{bg.duration_s:.0f}s — no exit observed, not a product verdict; re-gate on a "
+                                    f"quiet machine")
+                else:
+                    v = _classify_gate_failure("build", bg.output or bg.error or "", repo_path, bg.exit_code,
+                                               clock=bg.clock)
                 died = _gate_fast_death(bg.exit_code, bg.duration_s, bg.stderr_head, elide=env_name)
                 if v.outcome is GateOutcome.BLOCKED_ENV and died:      # [ORCH-LANE-1] O5: the message only
                     v.detail = f"{v.detail}; the build command {died}"
+                log.error(f"⛔ Pre-merge gate{where}: {v.label}")
+                return v
+            v = _lint_changed(repo_path, diff)   # [ORCH-LEAN-GATE-1] (b) lint on the changed files only
+            if v is not None:
+                if sit_enum is not None:
+                    sit_enum.discard("lint is red")
                 log.error(f"⛔ Pre-merge gate{where}: {v.label}")
                 return v
         elif gate == "sit":
@@ -5803,16 +5884,22 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
 # SIT and unit files the gate's own per-route legs relate to a diff — the same _sit_plan / _sit_related_files calls
 # (a _SitEnumJob, run in place) and the same _unit_scope / _unit_related_files — for the executor's `preflight`
 # (Brief 1) and the brief's generated pre-list (Brief 2). Neither replaces, skips or feeds a gate leg.
-PREFLIGHT_VAR = "ORCH_EXEC_PREFLIGHT"   # `off` ⇒ the executor prompt carries no preflight sentence
+# [ORCH-LEAN-GATE-1] the gate gives the single verdict: the fire prompt asks for no preflight (19 h a week, 1 of 66 caught
+# anything — WASTE-REPORT 2026-11-16). `ORCH_EXEC_PREFLIGHT=on` puts the sentence back; the command itself stays.
+PREFLIGHT_VAR = "ORCH_EXEC_PREFLIGHT"   # `on` ⇒ the executor prompt carries the preflight sentence (default: none)
+PREFLIGHT_ONCE_VAR = "ORCH_PREFLIGHT_ONCE"   # `off` ⇒ a second preflight on the same route runs (default: refused)
 PREFLIGHT_DIR = "preflight"             # state/preflight/<branch>.json (and its SIT archive)
 PREFLIGHT_SENTENCE = ("Before you write the handback's final status, run `python3 ~/spectricom-orchestrator/"
                       "orchestrator.py preflight --repo {repo}` and paste its summary; a red there is handled by your "
                       "brief's rule #8 and STOP rules like any other red.")
-PREFLIGHT_EXIT = {"pass": 0, "fail": 1, "environment": 2, "not computed": 3}
-# [ORCH-ROUTE-TIME-1] T-4: executors re-ran the full typecheck in a loop while iterating; the fire prompt says when it
-# runs. Joined inside fire_toni's preflight_ask placeholder, present whether or not the preflight sentence is.
-TYPECHECK_SENTENCE = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to "
-                      "confirm a type-error fix; while iterating, run the related tests of the files you changed.")
+PREFLIGHT_EXIT = {"pass": 0, "fail": 1, "environment": 2, "not computed": 3, "already ran": 4}
+# [ORCH-ROUTE-TIME-1] T-4 / [ORCH-LEAN-GATE-1]: the executor compiles once and runs only its own tests; the gate builds
+# and runs the touched tests. Joined inside fire_toni's preflight_ask placeholder, present whether or not the
+# preflight sentence is.
+TYPECHECK_SENTENCE = ("Compile once: run the repo's typecheck (if it has one: npx tsc --noEmit, plus -p server where "
+                      "the repo has one) one time after your last code change, and again only to confirm a fix to an "
+                      "error it reported; never run npm run build (the gate builds). Run only the test files you "
+                      "added or changed, by path; never a suite or a related set (the gate runs those).")
 
 
 @dataclass
@@ -5828,14 +5915,15 @@ class PathReach:
     unit_full: Optional[str] = None
 
 
-def tests_reaching(repo_path: Path, diff: BranchDiff) -> PathReach:
-    """[ORCH-RELIABILITY-1] A13: the SIT and unit test files the gate relates to `diff` in `repo_path`."""
+def tests_reaching(repo_path: Path, diff: BranchDiff, files_only: bool = False) -> PathReach:
+    """[ORCH-RELIABILITY-1] A13: the SIT and unit test files the gate relates to `diff` in `repo_path`.
+    [ORCH-LEAN-GATE-1] `files_only`: names only (the pre-list) — the SIT suite is listed with --filesOnly."""
     out = PathReach()
     gates = tuple((PRE_MERGE_GATES.get(ACTIVE_REPO_NAME) or {}).get("gates") or ())
     if "sit" not in gates:
         out.sit, out.sit_why = (), f"{ACTIVE_REPO_NAME or 'this repo'}'s gate has no SIT leg"
     else:
-        job = _SitEnumJob(repo_path=repo_path, diff=diff)
+        job = _SitEnumJob(repo_path=repo_path, diff=diff, files_only=files_only)
         job._run()   # the worker's own body, in place: exactly the serial path's two calls
         if job.error:
             out.sit_why = f"the SIT enumeration raised {job.error}"
@@ -5938,16 +6026,40 @@ def _preflight_unit(repo_path: Path, reach: PathReach, label: str) -> dict:
     return leg
 
 
+def _preflight_already_ran(repo_path: Path, branch: str, diff: BranchDiff) -> Optional[str]:
+    """[ORCH-LEAN-GATE-1] the refusal line when this route already has a preflight record — same repo, branch and merge
+    base, and its tip an ancestor of HEAD (the same route's commits, not a re-cut branch) — else None.
+    ORCH_PREFLIGHT_ONCE=off ⇒ None."""
+    if os.environ.get(PREFLIGHT_ONCE_VAR, "").strip().lower() == "off" or branch == "HEAD" or not diff.base:
+        return None
+    rec, _ = _preflight_record(branch)
+    if not rec or rec.get("repo") != ACTIVE_REPO_NAME or rec.get("branch") != branch or rec.get("base") != diff.base:
+        return None
+    tip = str(rec.get("tip") or "")
+    if not tip or subprocess.run(["git", "-C", str(repo_path), "merge-base", "--is-ancestor", tip, "HEAD"],
+                                 capture_output=True).returncode != 0:
+        return None
+    return (f"🧪 Preflight (executor): not run — this route ran it already at {rec.get('at')} (tip {tip[:7]}: "
+            f"{rec.get('summary') or rec.get('result')}); one preflight per route at most (D-S7CORE54-77). Hand back: "
+            f"the gate runs what the change touches and gives the verdict ({PREFLIGHT_ONCE_VAR}=off runs it again)")
+
+
 def preflight(repo_path: Path, json_path: Optional[Path] = None) -> int:
     """[ORCH-RELIABILITY-1] Brief 1: `orchestrator.py preflight --repo <name>`, run by the executor in its route
     checkout before its handback. The gate's diff (_branch_diff), its related sets (tests_reaching) and its runners
     (run_sit_post_merge with the gate's batching and isolation; the unit branch leg and its isolation re-run) — on
     the related files only, never a full suite. Advice to the executor: the gate still runs every leg itself.
-    Exit 0 both legs green (or briefs-only); 1 a failure; 2 environment; 3 a set that cannot be computed."""
+    Exit 0 both legs green (or briefs-only); 1 a failure; 2 environment; 3 a set that cannot be computed; 4 it already
+    ran on this route ([ORCH-LEAN-GATE-1] one at most — the fire prompt no longer asks for it)."""
     branch = _git_read("git rev-parse --abbrev-ref HEAD", repo_path) or "HEAD"
     label = branch if branch != "HEAD" else (_git_read("git rev-parse --short HEAD", repo_path) or "HEAD")
     diff = _branch_diff(repo_path, None if branch == "HEAD" else branch)
     briefs = _active_briefs_subdir()
+    once = _preflight_already_ran(repo_path, branch, diff) if json_path is None else None
+    if once:   # [ORCH-LEAN-GATE-1] one preflight per route at most: the record of the first is kept for the gate
+        print(once, flush=True)
+        log.info(once)
+        return PREFLIGHT_EXIT["already ran"]
     rec = {"repo": ACTIVE_REPO_NAME, "branch": branch, "at": datetime.now().isoformat(), "base": diff.base,
            "tip": _git_read("git rev-parse HEAD", repo_path) or None,
            "diff": list(diff.paths) if diff.paths is not None else None}
@@ -6105,10 +6217,8 @@ def _sit_preflight_reuse(repo_path: Path, diff: BranchDiff, branch_name: Optiona
     rec, why = _preflight_reuse_check(repo_path, diff, branch_name)
     sit = rec["sit"] if rec else {}
     if why is None:
-        if sit.get("status") != "pass":
+        if sit.get("status") != "pass":   # [ORCH-LEAN-GATE-1] green after isolation is the gate's own PASS too
             why = f"the preflight SIT leg is {sit.get('status')!r}"
-        elif "verdict" in sit:
-            why = f"the preflight SIT leg needed isolation ({sit['verdict']}) — not the gate's own PASS"
         elif not isinstance(sit.get("files"), list):
             why = "the preflight SIT leg names no file list"
     plan, related, note, taken = None, None, None, None
@@ -6153,7 +6263,7 @@ def _sit_preflight_reuse(repo_path: Path, diff: BranchDiff, branch_name: Optiona
 
 def _unit_preflight_reuse(repo_path: Path, branch_name: Optional[str], diff: BranchDiff) -> tuple:
     """T-1: (the unit outcome, its scope) when the executor's preflight ran this exact related set clean green on this
-    tree — the counter +1, one unit-log entry (_unit_done), nothing stored by the landing; else (None, the _unit_scope
+    tree — one unit-log entry (_unit_done), nothing stored by the landing; else (None, the _unit_scope
     the check computed, for run_unit_gate, or None). Silent when the unit leg would not run (run_unit_gate says why)."""
     test_cmd = (ACTIVE_REPO_CONFIG.get("test_cmd") or "").strip()
     if not test_cmd or ACTIVE_REPO_NAME not in _unit_gate_eligible_repos() or not UNIT_GATE_ENABLED or diff is None:
@@ -6161,18 +6271,14 @@ def _unit_preflight_reuse(repo_path: Path, branch_name: Optional[str], diff: Bra
     started = time.time()
     rec, why = _preflight_reuse_check(repo_path, diff, branch_name)
     unit, scope = (rec.get("unit") if rec else None), None
-    if why is None:
-        if rec.get("exit") != 0 or rec.get("result") != "pass":
-            why = (f"the record's result is {rec.get('result')!r} (exit {rec.get('exit')}) — the unit leg is reused "
-                   f"only when both legs were green")
-        elif not isinstance(unit, dict):
+    if why is None:   # [ORCH-LEAN-GATE-1] each leg on its own: a green unit leg is reused whatever the SIT leg said,
+        # and a flaky-only one is the gate's own PASS (a file that passes alone never blocks)
+        if not isinstance(unit, dict):
             why = "the record has no unit leg"
         elif unit.get("status") != "pass":
             why = f"the preflight unit leg is {unit.get('status')!r}"
         elif unit.get("failed") != []:
             why = f"the preflight unit leg names failures: {unit.get('failed')!r}"
-        elif "flaky" in unit:
-            why = f"the preflight unit leg needed isolation (flaky: {unit['flaky']}) — not the gate's own PASS"
         elif not isinstance(unit.get("files"), list) or not unit["files"]:
             why = "the preflight unit leg ran no file"
     if why is None:
@@ -6187,9 +6293,9 @@ def _unit_preflight_reuse(repo_path: Path, branch_name: Optional[str], diff: Bra
         log.info(f"♻️  unit: preflight not reused — {why}; the unit leg runs")
         return None, scope
     at, tip, n = str(rec.get("at")), str(rec.get("tip") or ""), len(scope.files)
-    _unit_full_counter_record(ACTIVE_REPO_NAME, full=False, why=f"{branch_name}: reused preflight")
     log.info(f"♻️  unit: reused the executor preflight ({at}, tip {tip[:7]}) — related {n}/{scope.total} files ran "
-             f"green there on this tree; not run again")
+             f"green there on this tree; not run again"
+             + (f" (flaky there, passed alone: {', '.join(unit['flaky'])})" if unit.get("flaky") else ""))
     o = UnitGateOutcome(passed=True, ran=False, signal=UNIT_REUSED_SIGNAL, scope=f"related {n}/{scope.total}",
                         scope_reason=scope.reason, related_files=tuple(scope.files),
                         branch_cmd=_unit_confirm_cmd(test_cmd, scope.files),
@@ -6241,7 +6347,7 @@ def _prelist_reach(proj: Path, sha: str, paths: list) -> tuple:
             for p in paths:
                 with open(wt / p, "a") as f:
                     f.write("\n")
-            return tests_reaching(wt, BranchDiff(base=sha, tip="HEAD", paths=tuple(paths))), None
+            return tests_reaching(wt, BranchDiff(base=sha, tip="HEAD", paths=tuple(paths)), files_only=True), None
         finally:
             for d in links:
                 d.unlink(missing_ok=True)
@@ -6583,8 +6689,6 @@ def _full_gate_unit(wt: Path, archive: Path, sha: str, ck: Optional[str], ref: s
         return {**out, "outcome": "BLOCKED", "signal": "unmeasurable", "detail": f"the suite did not measure ({why})",
                 "failing_files": None}
     out["failing_files"] = list(run.failing_files)
-    _unit_full_counter_record(ACTIVE_REPO_NAME, full=True, why=f"{label}: the full gate's unit leg "
-                                                               f"({'reused' if reused is not None else 'measured'})")
     # [ORCH-FULLGATE-WT-FSDENY-1] G-A2: files that could not load — never compared, never a later `previous`
     unloadable = _unit_unloadable(run) if load_check else {}
     if unloadable:

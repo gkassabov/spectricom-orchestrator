@@ -156,13 +156,13 @@ class TestPU2RelatedOnWorkspace:
         assert u.runs() == [f"{TEST_CMD} -- {T1} {T2}"], u.runs()
         assert any(m.startswith(f"🎯 Unit gate: related 2/{len(SUITE)} files") for m in _msgs(caplog)), _msgs(caplog)
 
-    def test_a_trigger_diff_is_the_full_suite_with_the_related_set_still_named(self, urig):
+    def test_a_former_trigger_diff_is_the_related_set(self, urig):   # [ORCH-LEAN-GATE-1] G-5e (was: the full suite)
         _branch(urig.repo, {**THREE, "vite.config.ts": "y\n"})
         WsUnit(urig.monkeypatch, urig.repo, related=(T1,))
         diff = orchestrator._branch_diff(urig.repo, "route")
-        assert orchestrator._unit_scope(urig.repo, TEST_CMD, diff).reason.startswith("(a)")
+        assert orchestrator._unit_scope(urig.repo, TEST_CMD, diff).files == (T1,)
         reach = orchestrator.tests_reaching(urig.repo, diff)
-        assert reach.unit == (T1,) and reach.unit_full.startswith("(a)"), (reach.unit, reach.unit_why)
+        assert reach.unit == (T1,) and reach.unit_full is None, (reach.unit, reach.unit_why)
 
 
 # ── PU3 · the SIT listing parses as it did (control) ─────────────────────────────────────────────────────────────────

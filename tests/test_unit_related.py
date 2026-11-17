@@ -9,9 +9,12 @@ computed, or when ORCH_UNIT_RELATED=off. The regression rule is unchanged: a rel
 fails alone on the branch and is not failing in the merge-base baseline (the cached full measurement restricted to
 the related files, else the merge base measured on the same files).
 
-  P2-1  a 3-file diff outside the triggers runs only the related test files                       (TestP2_1*)
-  P2-2  each trigger class forces the full suite with its reason                                  (TestP2_2*)
-  P2-3  the N-th route runs full and resets the counter; the counter is a file                    (TestP2_3*)
+[ORCH-LEAN-GATE-1] (D-S7CORE54-77) supersedes the triggers, the N-th route and the merge-base baseline: the related set
+is the one-hop importer set, nothing forces the full suite per route, and a red is judged against the newest full
+gate's failure list (tests/test_lean_gate.py). The cases below that still hold are kept.
+
+  P2-1  a 3-file diff runs only the related test files                                            (TestP2_1*)
+  P2-2  a former trigger or a source tree is related, not full; off / not-vitest / no diff: full  (TestP2_2*)
   P2-4  a related-only run is never stored as a landed full baseline                              (TestP2_4*)
   (the regression rule on the related set)                                                        (TestRule*)
   P2-5  is tests/test_unit_baseline_gate.py, tests/test_baseline_reuse_1.py, tests/test_gate_cost.py unchanged.
@@ -62,13 +65,18 @@ def _repo(path: Path) -> Path:
 class Unit:
     """subprocess.run for the unit leg: the suite listing, the related listing, and `npm test [-- files]` — the branch
     leg and a confirmation in the checkout (the first run there is the branch leg), a baseline in a detached worktree
-    — each recorded with its cwd; git runs for real. `red` fails on the branch and at the base; `red_alone` alone."""
+    — each recorded with its cwd; git runs for real. `red` fails on the branch and at the base; `red_alone` alone;
+    [ORCH-LEAN-GATE-1] TC-4: `base_red`, when given, is the merge base's own answer (None ⇒ `red`, as before)."""
 
-    def __init__(self, monkeypatch, repo, related=(T1,), red=(), red_alone=(), list_rc=0):
+    def __init__(self, monkeypatch, repo, related=(T1,), red=(), red_alone=(), list_rc=0, base_red=None):
         self.real, self.repo, self.related, self.list_rc = subprocess.run, str(repo), related, list_rc
         self.red, self.red_alone = set(red), set(red_alone)
+        self.base_red = None if base_red is None else set(base_red)
         self.calls, self.branch_seen = [], False
         monkeypatch.setattr(subprocess, "run", self)
+        # [ORCH-LEAN-GATE-1] harness (D-S7CORE36-01 class iii): `related` is now the one-hop importer set
+        monkeypatch.setattr(orchestrator, "_direct_importers",
+                            lambda repo, files, changed, roots=(): set(self.related) & set(files), raising=False)
 
     def __call__(self, cmd, *a, **kw):
         if not (isinstance(cmd, str) and cmd.startswith(("npm ", "npx "))):
@@ -84,7 +92,8 @@ class Unit:
             in_repo = kw.get("cwd") == self.repo
             confirm = in_repo and self.branch_seen
             self.branch_seen = self.branch_seen or in_repo
-            red = sorted(set(files) & (self.red_alone if confirm else self.red))
+            at_base = self.red if in_repo or self.base_red is None else self.base_red
+            red = sorted(set(files) & (self.red_alone if confirm else at_base))
             return subprocess.CompletedProcess(cmd, 1 if red else 0, stderr="", stdout=vitest(
                 red, failed=len(red), total_tests=3 * len(files), total_files=len(files)))
         raise AssertionError(cmd)
@@ -147,13 +156,13 @@ class TestP2_1Related:
         assert any(m.startswith(f"🎯 Unit gate: related 2/{len(SUITE)} files") for m in _msgs(caplog)), _msgs(caplog)
         assert f"related 2/{len(SUITE)} files" in v.unit_collection
 
-    def test_the_listing_is_enumerated_not_run_against_the_merge_base(self, rig):
+    def test_the_suite_is_enumerated_and_nothing_else_is_listed(self, rig):
         _branch(rig.repo, THREE)
         u = Unit(rig.monkeypatch, rig.repo)
         _gate(rig)
         base = _git(rig.repo, "merge-base", "main", "route")
         lists = [c for c, _ in u.calls if c.startswith("npx vitest list")]
-        assert UNIT_LIST in lists and f"npx vitest list --changed {base} --filesOnly" in lists, lists
+        assert lists == [UNIT_LIST], lists   # [ORCH-LEAN-GATE-1] G-2: the suite listing only; no --changed graph
 
     def test_test_files_the_branch_changes_join_the_set(self, rig):
         _branch(rig.repo, {**THREE, T3: "changed test\n"})
@@ -183,59 +192,22 @@ class TestP2_1Related:
 # ═══════════════════════════════════════════════════════
 TRIGGERS = ["package.json", "package-lock.json", "vitest.config.ts", "vite.config.ts", "tsconfig.app.json",
             "src/test/helpers.ts", "src/setupTests.ts", "src/test.setup.ts"]
-# [ORCH-ROUTE-TIME-1] G-1: source trees are no longer triggers — a change under them is related through the import graph
+# [ORCH-ROUTE-TIME-1] G-1: source trees are no longer triggers; [ORCH-LEAN-GATE-1] G-2: nothing is — every path above
+# runs only the files that directly import it (tests/test_lean_gate.py L-2)
 NOT_TRIGGERS = ["src/lib/x.ts", "server/api.ts", "src/types/t.ts"]
 
 
 class TestP2_2Full:
 
-    @pytest.mark.parametrize("path", TRIGGERS)
-    def test_a_clinical_mp_trigger_runs_the_full_suite(self, rig, caplog, path):
-        rig.cfg["unit_full_triggers"] = CLINICAL["unit_full_triggers"]
-        _branch(rig.repo, {**THREE, path: PKG2 if path == "package.json" else "changed\n"})
-        u = Unit(rig.monkeypatch, rig.repo)
-        with caplog.at_level(logging.INFO, logger="orch"):
-            v = _gate(rig)
-        assert u.runs() == [TEST_CMD], u.runs()
-        line = next(m for m in _msgs(caplog) if m.startswith("🎯 Unit gate: full suite: "))
-        assert "(a)" in line and path in line and "unit_full_triggers" in line
-        assert "full suite: (a)" in v.unit_collection
-
-    @pytest.mark.parametrize("path", NOT_TRIGGERS)
+    @pytest.mark.parametrize("path", TRIGGERS + NOT_TRIGGERS)
     def test_a_source_tree_change_is_related_not_full(self, rig, caplog, path):
-        rig.cfg["unit_full_triggers"] = CLINICAL["unit_full_triggers"]
-        _branch(rig.repo, {**THREE, path: "changed\n"})
+        _branch(rig.repo, {**THREE, path: PKG2 if path == "package.json" else "changed\n"})
         u = Unit(rig.monkeypatch, rig.repo)
         with caplog.at_level(logging.INFO, logger="orch"):
             v = _gate(rig)
         assert u.runs() == [f"{TEST_CMD} -- {T1}"], u.runs()
         assert not any(m.startswith("🎯 Unit gate: full suite: ") for m in _msgs(caplog)), _msgs(caplog)
         assert f"related 1/{len(SUITE)} files" in v.unit_collection
-
-    def test_a_sit_core_file_is_a_trigger(self, rig, caplog):
-        rig.cfg["sit_core_files"] = ["sit/core.integration.test.ts"]
-        _branch(rig.repo, {**THREE, "sit/core.integration.test.ts": "core\n"})
-        u = Unit(rig.monkeypatch, rig.repo)
-        with caplog.at_level(logging.INFO, logger="orch"):
-            _gate(rig)
-        assert u.runs() == [TEST_CMD]
-        assert any("(a)" in m and "sit/core.integration.test.ts" in m for m in _msgs(caplog))
-
-    def test_an_enumeration_failure_runs_the_full_suite(self, rig, caplog):
-        _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo, list_rc=1)
-        with caplog.at_level(logging.INFO, logger="orch"):
-            _gate(rig)
-        assert u.runs() == [TEST_CMD]
-        assert any(m.startswith("🎯 Unit gate: full suite: (c)") for m in _msgs(caplog)), _msgs(caplog)
-
-    def test_an_empty_related_set_with_source_changed_runs_the_full_suite(self, rig, caplog):
-        _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo, related=())
-        with caplog.at_level(logging.INFO, logger="orch"):
-            _gate(rig)
-        assert u.runs() == [TEST_CMD]
-        assert any(m.startswith("🎯 Unit gate: full suite: (c)") and "non-test source" in m for m in _msgs(caplog))
 
     def test_off_runs_the_full_suite(self, rig, caplog):
         rig.monkeypatch.setenv("ORCH_UNIT_RELATED", "off")
@@ -264,63 +236,7 @@ class TestP2_2Full:
 
 
 # ═══════════════════════════════════════════════════════
-# P2-3 · every N-th route runs full and resets the counter, which is a file
-# ═══════════════════════════════════════════════════════
-class TestP2_3Counter:
-
-    def test_the_fifth_route_runs_full_and_resets(self, rig, caplog):
-        u = Unit(rig.monkeypatch, rig.repo)
-        seen = []
-        for i in range(1, 7):
-            _branch(rig.repo, {f"src/feature/a.ts": f"a{i}\n"}, name=f"route{i}")
-            u.calls.clear()
-            with caplog.at_level(logging.INFO, logger="orch"):
-                _gate(rig, f"route{i}")
-            seen.append(("full" if u.runs() == [TEST_CMD] else "related", _counter(rig).get("since_full")))
-        assert seen == [("related", 1), ("related", 2), ("related", 3), ("related", 4), ("full", 0),
-                        ("related", 1)], seen
-        assert any(m.startswith("🎯 Unit gate: full suite: (b)") and "unit_full_every 5" in m for m in _msgs(caplog))
-
-    def test_the_counter_survives_a_restart(self, rig):
-        (rig.orch / "state" / f"unit-full-counter-{REPO}.json").write_text(json.dumps({"since_full": 4}))
-        _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo)
-        _gate(rig)
-        assert u.runs() == [TEST_CMD] and _counter(rig)["since_full"] == 0
-
-    def test_unit_full_every_1_is_the_full_suite_every_route(self, rig):
-        rig.cfg["unit_full_every"] = 1
-        _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo)
-        _gate(rig)
-        assert u.runs() == [TEST_CMD]
-
-    def test_an_unreadable_counter_runs_full(self, rig, caplog):
-        (rig.orch / "state" / f"unit-full-counter-{REPO}.json").write_text("{not json")
-        _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo)
-        _gate(rig)
-        assert u.runs() == [TEST_CMD]
-
-    def test_any_full_route_resets_the_counter(self, rig):
-        rig.cfg["unit_full_triggers"] = ["package.json"]
-        (rig.orch / "state" / f"unit-full-counter-{REPO}.json").write_text(json.dumps({"since_full": 2}))
-        _branch(rig.repo, {**THREE, "package.json": PKG2})
-        Unit(rig.monkeypatch, rig.repo)
-        _gate(rig)
-        assert _counter(rig)["since_full"] == 0
-
-    def test_the_nightly_full_gate_resets_the_counter(self, tmp_path, monkeypatch):
-        from tests.test_gate_cost import FullGate
-        g = FullGate(tmp_path, monkeypatch)
-        f = g.orch / "state" / f"unit-full-counter-{REPO}.json"
-        f.write_text(json.dumps({"since_full": 3}))
-        g.run()
-        assert json.loads(f.read_text())["since_full"] == 0
-
-
-# ═══════════════════════════════════════════════════════
-# the regression rule, on the related set
+# the regression rule, on the related set ([ORCH-LEAN-GATE-1] G-2: P2-3's every-N-th counter is gone — L-2)
 # ═══════════════════════════════════════════════════════
 class TestRule:
 
@@ -331,20 +247,10 @@ class TestRule:
             **orchestrator._parse_unit_summary(vitest(list(failing), failed=len(failing), total_tests=30,
                                                       total_files=len(SUITE)))), repo_path=r.repo)
 
-    def test_a_related_file_failing_in_the_cached_full_baseline_is_not_new(self, rig):
-        self._seed_base(rig, [T1, T3])
-        _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo, related=(T1, T2), red=(T1,))
-        v = _gate(rig)
-        assert v.outcome is PASS, v.label
-        assert u.runs() == [f"{TEST_CMD} -- {T1} {T2}"], "no baseline run, no confirm: the cache answered"
-        assert v.unit.baseline_source == "cache" and v.unit.baseline.failing_files == (T1,)
-        assert "restricted to the 2 related files" in v.unit_collection
-
     def test_a_related_file_failing_alone_and_not_in_the_baseline_is_a_regression(self, rig):
         self._seed_base(rig, [])
         _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo, related=(T1, T2), red=(T2,), red_alone=(T2,))
+        u = Unit(rig.monkeypatch, rig.repo, related=(T1, T2), red=(T2,), red_alone=(T2,), base_red=())   # green at base
         v = _gate(rig)
         assert (v.outcome, v.signal) == (PRODUCT, "regression"), v.label
         assert u.runs()[-1] == f"{TEST_CMD} -- {T2}", "confirmed alone, as on the full suite"
@@ -355,14 +261,6 @@ class TestRule:
         Unit(rig.monkeypatch, rig.repo, related=(T1, T2), red=(T2,))
         v = _gate(rig)
         assert v.outcome is PASS and v.unit.flaky_files == (T2,)
-
-    def test_no_cache_measures_the_merge_base_on_the_same_related_files(self, rig):
-        _branch(rig.repo, THREE)
-        u = Unit(rig.monkeypatch, rig.repo, related=(T1, T2), red=(T1,))
-        v = _gate(rig)
-        base_runs = [(c, cwd) for c, cwd in u.calls if c.startswith(TEST_CMD) and cwd != str(rig.repo)]
-        assert base_runs and base_runs[0][0] == f"{TEST_CMD} -- {T1} {T2}", u.calls
-        assert v.unit.baseline_source == "measured" and v.outcome is PASS
 
     def test_a_related_file_new_on_the_branch_has_an_empty_baseline(self, rig):
         new = "src/feature/new.test.ts"
@@ -413,12 +311,7 @@ class TestP2_4Landing:
 
 class TestConfig:
 
-    def test_clinical_mp_declares_the_triggers_and_the_every(self):
-        trig = CLINICAL["unit_full_triggers"]
-        for t in ("package.json", "package-lock.json", "vitest*.config.*", "vite.config.*", "tsconfig*.json",
-                  "src/test/**", "**/setupTests.*", "src/test.setup.ts", "server/allowlist*.ts"):
-            assert t in trig
-        for t in ("src/lib/**", "server/**", "src/types/**"):   # [ORCH-ROUTE-TIME-1] G-1
-            assert t not in trig
+    def test_clinical_mp_declares_no_trigger_and_no_every(self):   # [ORCH-LEAN-GATE-1] G-2
+        assert "unit_full_triggers" not in CLINICAL and "unit_full_every" not in CLINICAL
         assert isinstance(CLINICAL["unit_always_files"], list) and CLINICAL["unit_always_files"]
-        assert CLINICAL["unit_full_every"] == 5 and CLINICAL["full_gate_reuse_max_h"] == 24
+        assert CLINICAL["full_gate_reuse_max_h"] == 24

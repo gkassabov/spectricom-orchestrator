@@ -46,6 +46,9 @@ class Suite:
         self.on_build = None
         self.list_raises = 0          # the next N plain list calls raise (an enumeration exception)
         monkeypatch.setattr(subprocess, "run", self)
+        # [ORCH-LEAN-GATE-1] harness (D-S7CORE36-01 class iii): the related set is the one-hop importer set now
+        monkeypatch.setattr(orchestrator, "_direct_importers", lambda repo, files, changed, roots=():
+                            set(self.related.split()) & set(files), raising=False)
         monkeypatch.setattr("time.sleep", lambda s: None)
 
     def _ev(self, name, cmd=""):
@@ -128,7 +131,7 @@ class TestP1_1Beside:
         assert v.outcome is PASS, v.label
         b0, b1 = s.build_window
         assert s.first("list") < b1, f"the enumeration started {s.first('list') - b1:+.3f}s after the build ended"
-        assert s.first("related") < b1 or s.first("related") - s.first("list") < BUILD_S
+        assert "related" not in s.names(), "[ORCH-LEAN-GATE-1] G-5d: the related set is read from files, not listed"
         assert any(m.startswith("⏩ SIT enumeration ran beside the build (") and "s saved)" in m
                    for m in _msgs(caplog)), _msgs(caplog)
 

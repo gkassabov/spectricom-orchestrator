@@ -168,8 +168,10 @@ def test_an_unfit_env_is_refused_not_fired(child, monkeypatch, caplog):
 # ── AC-FG-03 · the prompt pin ───────────────────────────────────────────────────────────────
 
 # [ORCH-ROUTE-TIME-1] G-4: the typecheck sentence the fire prompt carries before the preflight sentence
-TYPECHECK = ("Run the repo's full typecheck (if it has one) after your last code change, and again only to confirm a "
-             "type-error fix; while iterating, run the related tests of the files you changed.")
+TYPECHECK = ("Compile once: run the repo's typecheck (if it has one: npx tsc --noEmit, plus -p server where the "
+             "repo has one) one time after your last code change, and again only to confirm a fix to an error it "
+             "reported; never run npm run build (the gate builds). Run only the test files you added or changed, "
+             "by path; never a suite or a related set (the gate runs those).")   # [ORCH-LEAN-GATE-1] G-1
 
 
 def test_the_child_is_told_to_stay_in_the_foreground(child):

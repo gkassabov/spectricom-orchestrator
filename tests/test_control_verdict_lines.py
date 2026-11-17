@@ -47,7 +47,7 @@ C = {
     "executor-exit": "_executor_exit_hold",
     # BASELINE-TRUST-1 (route 67): a seventh, one line per baseline the unit gate needs
     # ORCH-UNIT-RELATED-1 (route 341a1): a second speaker, the related-files baseline's restricted cache hit
-    "baseline-trust": ("_unit_baseline_measure_or_reuse", "_unit_baseline_related"),
+    "baseline-trust": "_unit_baseline_measure_or_reuse",   # [ORCH-LEAN-GATE-1] G-5a: _unit_baseline_related removed
     # ORCH-TONI-GUARDS-1 (route 394): an eighth, one line per fire: ON, OFF (TONI_GUARDS=off) or BLOCKED
     "guards": "_toni_guards_apply",
     # ORCH-EXECUTOR-AUTH-PROBE-1: a ninth control, one line per fire
