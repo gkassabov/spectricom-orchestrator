@@ -7363,6 +7363,7 @@ def _executor_exit_hold(ec: int, branch: str, out_log: Optional[str] = None) -> 
 REGATE_VAR = "ORCH_REGATE_GATES_ONLY"      # `off` ⇒ a `## Re-gate of:` file is refused, not fired
 REGATE_REFUSED = "RE-GATE REFUSED"
 _REGATE_NOTE_RE = re.compile(r"^PRE-MERGE GATE: (\S+) — (.*)$")
+_REGATE_OVERRIDE_RE = re.compile(r"^PRE-MERGE GATE OVERRIDE: (\S+) — by (.+?): (.*)$")   # ORCH-QUEUE-PARK-RED-1 G-3
 REGATE: Optional["RegateSpec"] = None      # set by run_batch for the route it runs; read by _run_batch_inner
 
 
@@ -7403,10 +7404,15 @@ def _regate_check(batch_file: Path) -> tuple:
         return None, (f"no recorded gate verdict on {branch}@{tip[:7]}{said} — not BLOCKED(environment), so not "
                       f"re-gated without the executor")
     outcome = _REGATE_NOTE_RE.match(gate).group(1)
+    prior = gate[len("PRE-MERGE GATE: "):]
+    # [ORCH-QUEUE-PARK-RED-1] G-3: a verdict override is appended (queue_daemon.py override — approver and reason), never
+    # written over the gate's line; the newest one decides, and the gate's own verdict is kept beside it.
+    over = [m for m in map(_REGATE_OVERRIDE_RE.match, note) if m]
+    if over:
+        outcome, prior = over[-1].group(1), f"{over[-1].group(0)[len('PRE-MERGE GATE OVERRIDE: '):]} (gate: {prior})"
     if outcome != GateOutcome.BLOCKED_ENV.value:
-        return None, f"the recorded gate verdict on {branch}@{tip[:7]} is {gate[len('PRE-MERGE GATE: '):]} — " \
-                     f"not BLOCKED(environment)"
-    return RegateSpec(branch, tip, gate[len("PRE-MERGE GATE: "):]), None
+        return None, f"the recorded gate verdict on {branch}@{tip[:7]} is {prior} — not BLOCKED(environment)"
+    return RegateSpec(branch, tip, prior), None
 
 
 def _regate_refused(batch_file: Path, why: str) -> Result:

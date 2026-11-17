@@ -53,6 +53,14 @@ else:
 queue = orch / "queue"
 waiting = [f for f in sorted(queue.glob("*.md")) if f.is_file() and f.name != current.get("file")] if queue.is_dir() else []
 print(f"📥 QUEUED {len(waiting)} brief(s) waiting")
+# ORCH-QUEUE-PARK-RED-1: the briefs parked after a FAIL(product), each waiting for George, with its reason
+parked = queue / "held" / "parked"
+for f in sorted(parked.glob("*.md")) if parked.is_dir() else []:
+    try:
+        why = (parked / f"{f.stem}.reason").read_text(errors="replace").strip()
+    except OSError:
+        why = "(no reason file)"
+    print(f"🅿 PARKED {f.name} | waiting for George | {why[:160]}")
 if current.get("file"):
     print(f"▶️  RUNNING {current['file']} | since {current.get('started_at') or '-'}")
 

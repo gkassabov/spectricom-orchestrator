@@ -86,7 +86,8 @@ PAUSE_NOTICE_NAME = "queue-paused.json"
 START_PAUSED_REASON = "start:queue-non-empty"
 USAGE = ("Usage: python3 queue_daemon.py [--start-running] | enqueue <file> | status [--json] | pause | "
          "resume [--reset-consecutive] [--reason <paused_reason>] | config <key> <value> | check | check-logs "
-         "| clear | kill [--reason \"<text>\"] | unkill --reason \"<text>\"\n  With no command it runs the daemon "
+         "| clear | kill [--reason \"<text>\"] | unkill --reason \"<text>\" | override <repo> <route branch> "
+         "--verdict <V> --by <approver> --reason \"<text>\"\n  With no command it runs the daemon "
          "loop: paused at start when work is queued; --start-running fires the queue at once.")
 
 # [ORCH-TONI-GUARDS-1] (S7-CORE-33) The kill switch.
@@ -378,6 +379,146 @@ def depends_on_line(waiting, held) -> str:
     if held:
         parts.append("held in queue/held/depends-on/: " + ", ".join(h["file"] for h in held))
     return "⏳ depends-on " + " · ".join(parts) if parts else ""
+
+
+# [ORCH-QUEUE-PARK-RED-1] SD-2 (George 2026-11-16 17:41 "Agree"; supersedes, for work that neither depends on a red nor
+# shares its files, the "a product red stays paused for George" clause of D-S7CORE53-08 and stop-on-failure,
+# D-S7CORE34-06). The route's own verdict — state.json's record of it, as `orchestrator.py run` wrote it — decides:
+#   FAIL(product), SAFETY    → a SAFETY-tier brief (7 leading zeros, D-S7CORE54-74) is NOT parked: the queue stops, as
+#                              today — the conservative reading of SD-2 until George widens it (verifier M-1).
+#   FAIL(product), a killed  → an error naming `exit -<n>` (a leg killed, e.g. 626b's `build: exit -1` under load,
+#     leg                      2026-11-16) is a machine fault the gate mislabelled: "other", the queue stops (m-6).
+#   FAIL(product)            → the brief is PARKED in queue/held/parked/ with `<stem>.reason`; the queue keeps firing
+#                              queued briefs that neither `## Depends-on:` it (A11 already holds those) nor share an
+#                              ALLOWED path with it (same repo). A second FAIL(product) in a row pauses everything.
+#   BLOCKED(environment)     → ONE automatic gates-only re-check of that route, alone and next: `<stem>-recheck.md`, the
+#                              brief with a `## Re-gate of: <route branch> <tip>` line (ORCH-REGATE-GATE-ONLY-1). A red
+#                              re-check, a meta-fire repo (it cannot re-gate) or a tip that cannot be read pauses.
+#   … already-red-on-main    → pauses everything (main is red; ORCH-LEAN-GATE-1 T-12's signal).
+#   anything else            → pauses everything, as before (no record, tampered, incomplete, conflict, prefire refusal).
+# ORCH_PARK_RED=off ⇒ every red pauses, as before; stop_on_failure=false ⇒ no red pauses, as before.
+PARK_ENV = "ORCH_PARK_RED"
+RECHECK_SUFFIX = "-recheck"
+ROUTE_STATE_NAME = "state.json"          # orchestrator.py's STATE_FILE, ORCH_DIR / "state.json"
+OUTCOME_PRODUCT = "FAIL(product)"
+OUTCOME_ENV = "BLOCKED(environment)"
+ALREADY_RED_SIGNAL = "already-red-on-main"   # orchestrator.ALREADY_RED_SIGNAL (pinned equal by the test)
+RED_PRODUCT, RED_ENV, RED_ON_MAIN, RED_OTHER = "product", "environment", "red-on-main", "other"
+SAFETY_TIER = re.compile(r"0{7}(?!0)")     # a SAFETY-tier brief: exactly 7 leading zeros (D-S7CORE54-74)
+KILLED_LEG = re.compile(r"\bexit -\d+")    # a leg killed (signal, timeout), not an assertion that failed
+
+
+def park_off() -> bool:
+    return os.environ.get(PARK_ENV, "").strip().lower() == "off"
+
+
+def parked_dir() -> Path:
+    """queue/held/parked/, resolved per call (QUEUE_DIR is patched in tests)."""
+    return QUEUE_DIR / "held" / "parked"
+
+
+def parked_briefs() -> list:
+    """The briefs parked after a product red, each with its reason line — read off the disk."""
+    tray = parked_dir()
+    out = []
+    for brief in sorted(tray.glob("*.md")) if tray.is_dir() else []:
+        try:
+            reason = (tray / f"{brief.stem}.reason").read_text(encoding="utf-8").strip()
+        except OSError:
+            reason = None
+        out.append({"file": brief.name, "reason": reason})
+    return out
+
+
+def route_record(batch_name: str, started_at: str) -> Optional[dict]:
+    """The newest result orchestrator.py recorded for `batch_name` that started at or after `started_at` (the daemon's
+    fire time), from ORCH_DIR/state.json — completed, stopped or failed. None when there is none or it cannot be read."""
+    data = _read_json(ORCH_DIR / ROUTE_STATE_NAME)
+    since = str(started_at or "")[:19]
+    best = None
+    for key in ("completed", "stopped", "failed"):
+        for r in data.get(key) or []:
+            if (isinstance(r, dict) and r.get("batch_file") == batch_name and str(r.get("started") or "")[:19] >= since
+                    and (best is None or str(r.get("started")) > str(best.get("started")))):
+                best = r
+    return best
+
+
+def red_kind(record: Optional[dict]) -> str:
+    """What a red route's recorded verdict is, for the queue: product, environment, red-on-main, or other."""
+    if not record or record.get("tampered"):
+        return RED_OTHER
+    status, gate, error = record.get("status"), record.get("gate_outcome"), str(record.get("error") or "")
+    if status == "failed" and gate == OUTCOME_PRODUCT:
+        return RED_OTHER if KILLED_LEG.search(error) else RED_PRODUCT    # m-6: a killed leg stops, never parks
+    if status == "blocked" and gate == OUTCOME_ENV:
+        return RED_ON_MAIN if ALREADY_RED_SIGNAL in error else RED_ENV
+    return RED_OTHER
+
+
+def shared_allowed_paths(a: Path, b: Path) -> Optional[list]:
+    """The ALLOWED paths two briefs share (each side's path or glob naming the other's). None when either has no
+    ALLOWED FILES list — independence cannot be shown, so the caller treats it as shared."""
+    pa, pb = prefire.allowed_paths(a), prefire.allowed_paths(b)
+    if not pa or not pb:
+        return None
+    return sorted({x for x in pa for y in pb
+                   if x == y or prefire.path_matches(x, y) or prefire.path_matches(y, x)})
+
+
+def recheck_text(brief_text: str, branch: str, tip: str, original: str) -> str:
+    """The re-check brief: the original, with `## Re-gate of: <branch> <tip>` and a one-line note after line 1."""
+    first, nl, rest = brief_text.partition("\n")
+    return (f"{first}\n## Re-gate of: {branch} {tip}\n"
+            f"<!-- ORCH-QUEUE-PARK-RED-1 (b): the queue daemon's one automatic gates-only re-check of {original} after "
+            f"BLOCKED(environment), {datetime.now().isoformat(timespec='seconds')}; no executor runs "
+            f"(ORCH-REGATE-GATE-ONLY-1). -->\n{rest}")
+
+
+# Verdict overrides are appended, with approver and reason, never overwritten (G-3; 626b's verdict was rewritten by
+# hand with `git notes add -f` on 2026-11-16). `queue_daemon.py override` appends one line to the route tip's note;
+# orchestrator._regate_check reads the newest such line before the gate's own.
+OVERRIDE_PREFIX = "PRE-MERGE GATE OVERRIDE:"
+OVERRIDE_VERDICTS = (OUTCOME_ENV, OUTCOME_PRODUCT)
+OVERRIDE_APPROVERS = {"george": "George", "gemma": "Gemma"}   # who may re-label a verdict (verifier m-7)
+OVERRIDE_USAGE = ('override <repo> <route branch> --verdict "BLOCKED(environment)"|"FAIL(product)" --by George|Gemma '
+                  '--reason "<why, 3+ words>"')
+
+
+def override_line(verdict: str, by: str, reason: str, at: Optional[str] = None) -> tuple:
+    """(the note line, None) or (None, why it is refused)."""
+    if verdict not in OVERRIDE_VERDICTS:
+        return None, f"verdict must be one of {', '.join(OVERRIDE_VERDICTS)}, not {verdict!r}"
+    approver = OVERRIDE_APPROVERS.get(str(by or "").strip().lower())
+    if approver is None:
+        return None, f"--by must name a known approver ({' or '.join(OVERRIDE_APPROVERS.values())}), not {by!r}"
+    if len(re.findall(r"[A-Za-z0-9]\S*", str(reason or ""))) < 3:
+        return None, "--reason needs at least 3 words"
+    at = at or datetime.now().isoformat(timespec="seconds")
+    one = lambda s: " ".join(str(s).split())
+    return f"{OVERRIDE_PREFIX} {verdict} — by {approver}: {one(reason)} ({at})", None
+
+
+def append_override(repo: str, branch: str, verdict: str, by: str, reason: str) -> tuple:
+    """(0, the line appended) or (1, why refused). `git notes append` on the branch tip, which must already carry the
+    gate's own PRE-MERGE GATE note: an override is added to a recorded verdict, never written in its place."""
+    line, why = override_line(verdict, by, reason)
+    if why:
+        return 1, why
+    r = repo_route(repo)
+    if r is None:
+        return 1, f"repo {repo!r} is not in {REPOS_CONFIG}"
+    git = lambda *a: subprocess.run(["git", "-C", str(r.path), *a], capture_output=True, text=True)
+    tip = git("rev-parse", "--verify", "-q", f"refs/heads/{branch}").stdout.strip()
+    if not tip:
+        return 1, f"no branch {branch} in {r.path}"
+    note = git("notes", "show", tip).stdout
+    if not any(l.startswith("PRE-MERGE GATE: ") for l in note.splitlines()):
+        return 1, f"{branch}@{tip[:7]} carries no recorded gate verdict to override"
+    res = git("notes", "append", "-m", line, tip)
+    if res.returncode != 0:
+        return 1, f"git notes append failed: {res.stderr.strip()[:200]}"
+    return 0, f"{branch}@{tip[:7]}: {line}"
 
 
 def request_control(action: str, reset_consecutive: bool = False, wait_s: float = CONTROL_ACK_WAIT_S,
@@ -805,6 +946,12 @@ class QueueDaemon:
         # a restart never runs a second full gate the same day; and the run in hand, None between runs
         self.full_gate = {}
         self.full_gate_running = None
+        # [ORCH-QUEUE-PARK-RED-1] SD-2: the product reds since the last pass/stop (two in a row stop the queue); the
+        # automatic re-check queued after a BLOCKED(environment) red (fired next, alone); briefs passed over because
+        # they share ALLOWED paths with a parked brief — said once each.
+        self.product_reds = []
+        self.recheck = None
+        self.park_waiting = {}
         self.lock = threading.Lock()
         self._ensure_dirs()
         self._load_state()
@@ -890,6 +1037,8 @@ class QueueDaemon:
                 "waiting": self.waiting,
                 "depends_waiting": self.depends_waiting,   # [ORCH-DEPENDS-ON-1] D4
                 "depends_held": depends_held(),
+                "parked": parked_briefs(),                # [ORCH-QUEUE-PARK-RED-1]
+                "park_waiting": dict(self.park_waiting),
                 "started_at": self.started_at,
                 "current_batch": self.current_batch,
                 "current_elapsed_s": elapsed,
@@ -1123,6 +1272,13 @@ class QueueDaemon:
         names = {b.name for b in queue}
         waiting = {b: s for b, s in self.depends_waiting.items() if b in names}
         self._depends_unmovable &= names
+        # [ORCH-QUEUE-PARK-RED-1] (b): the automatic re-check fires next, before any other brief
+        if self.recheck:
+            if self.recheck in names:
+                return QUEUE_DIR / self.recheck
+            print(f"[QUEUE] re-check {self.recheck} is no longer in queue/ — not fired")
+            self.recheck = None
+        self.park_waiting = {b: w for b, w in self.park_waiting.items() if b in names}
         chosen = None
         for brief in queue:
             try:
@@ -1133,6 +1289,14 @@ class QueueDaemon:
             unmet = [] if unreadable else [d for d in deps if not d.merged]
             if not unmet:
                 waiting.pop(brief.name, None)
+                held_by = self._parked_overlap(brief)          # [ORCH-QUEUE-PARK-RED-1] (a)
+                if held_by:
+                    if self.park_waiting.get(brief.name) != held_by:
+                        print(f"[QUEUE] 🅿 {brief.name}: WAITING — {held_by}; not fired while that brief is parked "
+                              f"(queue/held/parked/); the next independent brief fires")
+                    self.park_waiting[brief.name] = held_by
+                    continue
+                self.park_waiting.pop(brief.name, None)
                 chosen = brief
                 break
             if all(d.queued for d in unmet):
@@ -1148,6 +1312,117 @@ class QueueDaemon:
                 self.depends_waiting = waiting
                 self._save_state()
         return chosen
+
+    def _parked_overlap(self, brief: Path) -> Optional[str]:
+        """[ORCH-QUEUE-PARK-RED-1] (a): why `brief` waits for a parked brief of its own repo — the ALLOWED paths they
+        share, or that either has no ALLOWED FILES list (independence not shown) — or None: it may fire."""
+        tray = parked_dir()
+        if not tray.is_dir():
+            return None
+        repo = _parse_batch_header(brief).get("repo")
+        for p in sorted(tray.glob("*.md")):
+            if _parse_batch_header(p).get("repo") != repo:
+                continue
+            shared = shared_allowed_paths(brief, p)
+            if shared is None:
+                return f"parked {p.name}: an ALLOWED FILES list is missing, so the two are not shown independent"
+            if shared:
+                return f"shares {', '.join(shared[:4])}{' …' if len(shared) > 4 else ''} with parked {p.name}"
+        return None
+
+    def _park(self, brief: Path, record: Optional[dict]) -> bool:
+        """(a): move a FAIL(product) brief to queue/held/parked/ with `<stem>.reason`. False when it would not move."""
+        tray = parked_dir()
+        repo = _parse_batch_header(brief).get("repo")
+        r = repo_route(repo) if repo else None
+        branch = r.branch_for(brief.name) if r else "?"
+        error = " ".join(str((record or {}).get("error") or "").split())[:400]
+        reason = (f"PARKED after FAIL(product) — {error}. Route branch {branch} is kept. Briefs that neither depend on "
+                  f"this one nor share its ALLOWED paths keep firing; those that do wait. Landing it is George's go "
+                  f"(a re-fire or re-land); moving this brief out of queue/held/parked/ releases the waiters.")
+        if not _safe_move(brief, tray / brief.name):
+            return False
+        try:
+            (tray / f"{brief.stem}.reason").write_text(f"{datetime.now().isoformat()} {brief.name}: {reason}\n",
+                                                       encoding="utf-8")
+        except OSError as e:
+            print(f"[QUEUE] could not write {brief.stem}.reason in {tray}: {e}")
+        print(f"[QUEUE] 🅿 PARKED: {brief.name} — FAIL(product); {branch} kept → {tray}/ — independent work keeps "
+              f"firing (SD-2)")
+        return True
+
+    def _queue_recheck(self, src: Path, name: str) -> Optional[str]:
+        """(b): write `<stem>-recheck.md` — the brief with `## Re-gate of: <route branch> <tip>` — into queue/ and mark
+        it to fire next. None when queued; else why no automatic re-check is possible (the caller stops the queue)."""
+        repo = _parse_batch_header(src).get("repo")
+        if _repo_config(repo).get("meta_fire"):
+            return f"repo {repo} is the meta-fire lane, which does not re-gate gates-only (ORCH-REGATE-GATE-ONLY-1)"
+        r = repo_route(repo) if repo else None
+        if r is None:
+            return f"repo {repo!r} is not in {REPOS_CONFIG}"
+        branch = r.branch_for(name)
+        res = subprocess.run(["git", "-C", str(r.path), "rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
+                             capture_output=True, text=True)
+        tip = res.stdout.strip()
+        if not tip:
+            return f"no route branch {branch} in {r.path}"
+        dst = QUEUE_DIR / f"{Path(name).stem}{RECHECK_SUFFIX}.md"
+        if any((d / dst.name).exists() for d in (QUEUE_DIR, QUEUE_FAILED, QUEUE_DONE)):
+            return f"{dst.name} exists already — one automatic re-check per route"
+        try:
+            dst.write_text(recheck_text(src.read_text(encoding="utf-8"), branch, tip, name), encoding="utf-8")
+        except OSError as e:
+            return f"could not write {dst}: {e}"
+        self.recheck = dst.name
+        print(f"[QUEUE] 🔁 {name}: BLOCKED(environment) — one automatic gates-only re-check queued, fired next and "
+              f"alone: {dst.name} (## Re-gate of: {branch} {tip[:7]}); a red re-check stops the queue (SD-2 (b))")
+        return None
+
+    def _after_red(self, brief: Path, entry: dict) -> Optional[str]:
+        """[ORCH-QUEUE-PARK-RED-1] SD-2: a route ended red. Move its brief and return the pause reason, or None to keep
+        firing. The verdict is the route's own record (route_record, red_kind). Called under self.lock."""
+        name = brief.name
+        stop_all = f"stop-on-failure:{name}"
+        if not self.config["stop_on_failure"]:
+            _safe_move(brief, QUEUE_FAILED / name)
+            return None
+        is_regate = prefire.regate_line(brief) is not None if brief.exists() else False
+        if park_off():
+            _safe_move(brief, QUEUE_FAILED / name)
+            return stop_all
+        kind = red_kind(route_record(name, entry.get("started_at")))
+        entry["red"] = kind
+        if self.recheck == name or Path(name).stem.endswith(RECHECK_SUFFIX):
+            self.recheck = None
+            _safe_move(brief, QUEUE_FAILED / name)
+            print(f"[QUEUE] ⛔ the automatic re-check {name} is red too ({kind}) — the queue stops")
+            return f"recheck-red:{name}"
+        if kind == RED_PRODUCT:
+            if SAFETY_TIER.match(name):            # SAFETY tier, 7 zeros (D-S7CORE54-74) — verifier M-1
+                _safe_move(brief, QUEUE_FAILED / name)
+                print(f"[QUEUE] ⛔ {name}: FAIL(product) on a SAFETY-tier brief — not parked; the queue stops")
+                return f"safety-red:{name}"
+            record = route_record(name, entry.get("started_at"))
+            if not self._park(brief, record):
+                _safe_move(brief, QUEUE_FAILED / name)
+                print(f"[QUEUE] {name} could not be parked — the queue stops (fail closed)")
+                return stop_all
+            self.product_reds.append(name)
+            if len(self.product_reds) >= 2:
+                print(f"[QUEUE] ⛔ two product reds in a row ({', '.join(self.product_reds[-2:])}) — the queue stops")
+                return f"two-product-reds:{','.join(self.product_reds[-2:])}"
+            return None
+        _safe_move(brief, QUEUE_FAILED / name)
+        if kind == RED_ON_MAIN:
+            print(f"[QUEUE] ⛔ {name}: BLOCKED(environment) {ALREADY_RED_SIGNAL} — main is red; the queue stops")
+            return f"red-on-main:{name}"
+        if kind == RED_ENV:
+            why = ("it is itself a gates-only re-gate" if is_regate
+                   else self._queue_recheck(QUEUE_FAILED / name, name))
+            if why is None:
+                return None
+            print(f"[QUEUE] {name}: BLOCKED(environment), no automatic re-check — {why}; the queue stops")
+        return stop_all
 
     def _hold_depends_on(self, brief: Path, unmet: list):
         """D4: park a brief whose unmet dependency the queue cannot merge in queue/held/depends-on/, its reason in
@@ -1637,6 +1912,9 @@ class QueueDaemon:
                     _safe_move(next_batch, QUEUE_DONE / batch_name)
                     self.completed.append(entry)
                     self.consecutive_count += 1
+                    self.product_reds = []            # [ORCH-QUEUE-PARK-RED-1] "in a row" ends at a pass
+                    if self.recheck == batch_name:
+                        self.recheck = None
                     print(f"[QUEUE] PASSED: {batch_name} ({duration_s:.0f}s)")
                 elif exit_code == EXIT_STOPPED:
                     # [ORCH-HANDBACK-STOP-STATUS-1] G-6: a fire that merged what `passed` would, whose handback
@@ -1645,15 +1923,24 @@ class QueueDaemon:
                     _safe_move(next_batch, QUEUE_DONE / batch_name)
                     self.stopped.append(entry)
                     self.consecutive_count += 1
+                    self.product_reds = []            # [ORCH-QUEUE-PARK-RED-1]
+                    if self.recheck == batch_name:
+                        self.recheck = None
                     print(f"[QUEUE] STOPPED: {batch_name} (handback STATUS STOP/PARTIAL — read it before closing "
                           f"the Kanban row, rule #15; {duration_s:.0f}s)")
                 else:
+                    # [ORCH-QUEUE-PARK-RED-1] SD-2: park a product red and keep firing independent work; one
+                    # automatic re-check of an environment red; stop on everything else, as before.
+                    pause = self._after_red(next_batch, entry)
+                    # a brief _after_red left in queue/ (it moves, parks or re-checks it) still goes to failed/ —
+                    # never fired twice; a no-op when it has moved (tests/test_queue_retire.py pins this site)
                     _safe_move(next_batch, QUEUE_FAILED / batch_name)
                     self.failed.append(entry)
                     print(f"[QUEUE] FAILED: {batch_name} (exit {exit_code}, {duration_s:.0f}s)")
-                    if self.config["stop_on_failure"]:
-                        print(f"[QUEUE] stop_on_failure=true. Pausing queue.")
-                        self._mark_paused(f"stop-on-failure:{batch_name}")
+                    if pause:
+                        if pause.startswith("stop-on-failure:"):
+                            print(f"[QUEUE] stop_on_failure=true. Pausing queue.")
+                        self._mark_paused(pause)
 
                 # ORCH-STDOUT-1 — post-route oracle. Reports; changes no state and no verdict.
                 for v in check_gate_log_invariants([entry]):
@@ -1919,6 +2206,20 @@ def _control_args(cmd: str, args: list) -> Optional[dict]:
     return opts
 
 
+def _override_args(args: list) -> Optional[tuple]:
+    """`<repo> <branch> --verdict V --by B --reason R` → (repo, branch, V, B, R), or None when malformed."""
+    if len(args) < 2 or args[0].startswith("--") or args[1].startswith("--"):
+        return None
+    repo, branch, rest, opts = args[0], args[1], args[2:], {}
+    while rest:
+        if len(rest) < 2 or rest[0] not in ("--verdict", "--by", "--reason") or rest[0] in opts:
+            return None
+        opts[rest[0]], rest = rest[1], rest[2:]
+    if set(opts) != {"--verdict", "--by", "--reason"}:
+        return None
+    return repo, branch, opts["--verdict"], opts["--by"], opts["--reason"]
+
+
 def main(argv: list) -> int:
     if not argv or argv == ["--start-running"]:
         d = QueueDaemon()
@@ -1937,6 +2238,14 @@ def main(argv: list) -> int:
             print(USAGE, file=sys.stderr)
             return 2
         return kill(reason) if cmd == "kill" else unkill(reason)
+    if cmd == "override":                     # [ORCH-QUEUE-PARK-RED-1] G-3: appended, never overwritten
+        opts = _override_args(argv[1:])
+        if opts is None:
+            print("Usage: python3 queue_daemon.py " + OVERRIDE_USAGE, file=sys.stderr)
+            return 2
+        rc, msg = append_override(*opts)
+        print(("✅ override appended — " if rc == 0 else "⛔ override refused — ") + msg)
+        return rc
     d = QueueDaemon()
     if cmd == "enqueue" and len(argv) > 1:
         r = d.enqueue(argv[1])
@@ -1955,9 +2264,12 @@ def main(argv: list) -> int:
         fg = full_gate_line(st, summary)
         # [ORCH-DEPENDS-ON-1] D4: the briefs the daemon passes over for a queued dependency, and those it held.
         deps = depends_on_line(st.get("depends_waiting"), depends_held())
+        # [ORCH-QUEUE-PARK-RED-1] the briefs parked after a product red, waiting for George
+        parked = parked_briefs()
+        park = ("🅿 parked in queue/held/parked/: " + ", ".join(p["file"] for p in parked)) if parked else ""
         if not argv[1:]:
             print(status_line(st) + (f" | {pause_notice_line(notice)}" if notice else "") + (f" | {fg}" if fg else "")
-                  + (f" | {deps}" if deps else ""))
+                  + (f" | {deps}" if deps else "") + (f" | {park}" if park else ""))
         r = d.get_status()
         r.update({k: st.get(k) for k in DAEMON_OWNED_KEYS})
         r["config"] = {**r["config"], **_executor_of(st)}   # the daemon's executor, not this process's
