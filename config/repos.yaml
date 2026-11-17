@@ -12,6 +12,11 @@ kanban_dir: /mnt/c/Users/gkass/OneDrive/Documents/Spectricom
 kanban_families:
   - SCP_Kanban
   - Yorsie_Kanban
+# ORCH-PREFIRE-DRYRUN-GATE-1 (Kanban 727, D-S7CORE54-63 (3), SD-6(a)): prefire refuses a READY brief with no pasted
+# `## DRY RUN (pasted)` run (DRY), a named verifier report that claims a test outcome with no run beside it (VERIFY),
+# and a missing `~/_eos/…` input or a bad sha256 (INPUTS); `queue_daemon.py enqueue` refuses DRY. `required` turns
+# them on; any other value, or no key, leaves them off. PREFIRE_DRYRUN=off is the kill switch.
+prefire_dryrun: required
 
 # ORCH-CONTROL-SCOPE-1 C7a: the PATH systemd/spectricom-queue-daemon.service runs the daemon with — a
 # user unit sources no .bashrc. nvm's node first (the gates run npm), then ~/.local/bin (`claude`): the

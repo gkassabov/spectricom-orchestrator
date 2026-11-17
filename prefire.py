@@ -71,6 +71,20 @@ ENFORCED:
                       code fence are not judged. George go, Dependency change, ALLOWED FILES and Operability & safety
                       are read in the whole file.  [ORCH-PREFIRE-PARSE-HAZARDS-1]
 
+  DRY dry run      — a brief whose Kanban row reads READY (A1 passed), and every brief queue_daemon.py enqueue copies,
+                      has a '## DRY RUN (pasted)' block outside a code fence holding a run result (an exit code or a
+                      count), no unfilled v1-5 placeholder and no NOT READY.  [ORCH-PREFIRE-DRYRUN-GATE-1] Kanban 727,
+                      D-S7CORE54-63 (3), SD-6(a); retro fix 1.
+  VERIFY            — each report a '## Verify report: <path>[, …]' header line names exists, and a claim that a test
+                      holds / is unchanged / keep-green / green has a run result in its paragraph; a report claiming
+                      any run has a command + exit/count line. CLI: `python3 prefire.py --verify-report <file>…`.
+                      [ORCH-PREFIRE-DRYRUN-GATE-1] retro fix 7.
+  INPUTS            — every `~/_eos/…` path the brief names exists; every 'sha256 <hex>' is 64 hex and matches the
+                      file a path on its line names. Code fences, placeholders and globs aside.
+                      [ORCH-PREFIRE-DRYRUN-GATE-1] retro fix 6. All three judge when config/repos.yaml has
+                      `prefire_dryrun: required` (the live config does; a drift test pins it); PREFIRE_DRYRUN=off skips
+                      them, said on every fire.
+
   Re-gate          — a brief whose header has '## Re-gate of: <route branch> <sha>' is a gates-only route
                       (orchestrator ORCH-REGATE-GATE-ONLY-1: no executor runs): A2's sizing floor is waived and the
                       pass line says so; a malformed line is a refusal. Every other check, OPX lines included, holds.
@@ -1050,6 +1064,267 @@ def dependency_changes(filepath: Path) -> tuple[list[dict], list[str]]:
     return [e for e, _ in good], problems
 
 
+# ── DRY / VERIFY / INPUTS: the author's run, pasted (ORCH-PREFIRE-DRYRUN-GATE-1, Kanban 727) ─────────────────────
+# D-S7CORE54-63 (3), SD-6(a) "now, not after T1" (George 2026-11-16 17:52). RETRO-reruns-2026-11-10-to-15 §6 fixes 1, 6
+# and 7: 16 of 25 re-runs were brief errors a run before READY would have found; a verifier that only read wrote
+# "holds" for a test that went red (675r); a named backup was never made (664r) and a sha256 had 63 hex (L-404).
+# DRY      — a brief whose Kanban row reads READY (A1 passed), and every brief `queue_daemon.py enqueue` copies, has a
+#            '## DRY RUN (pasted)' block (Toni template v1-5) outside a code fence, holding at least one run result
+#            (an exit code or a count), no unfilled template placeholder, and no NOT READY (one under a condition —
+#            "without G-1 → NOT READY" — is the verifier's to judge).
+# VERIFY   — a '## Verify report: <path>[, <path>]' header line names the verifier's report(s); each exists, and a
+#            report that says a test holds / is unchanged / keep-green / green has a run result in that claim's
+#            paragraph, and one that claims any run holds at least one command + exit/count line. Also the CLI:
+#            `python3 prefire.py --verify-report <file>…`.
+# INPUTS   — every `~/_eos/…` input path the brief names exists (code fences, <!-- --> notes, placeholders, globs and
+#            a path called an output aside); a sha256 that looks whole is 64 hex, and matches the file named before it.
+# ON when config/repos.yaml says `prefire_dryrun: required` (top level) — the live config does, and
+# tests/test_prefire_dryrun_gate.py pins that it does; a config without the key (every scratch config the guard tests
+# build) judges as before. PREFIRE_DRYRUN=off skips all three and says so on every fire, like PREFIRE_OPEX.
+DRYRUN_ENV = "PREFIRE_DRYRUN"
+DRYRUN_CONFIG_KEY = "prefire_dryrun"
+DRYRUN_REQUIRED = "required"
+DRYRUN_RULING = "Toni template v1-5, D-S7CORE54-63 (3), SD-6(a)"
+_DRY_HEADING = re.compile(r'^##[ \t]+DRY RUN \(pasted\)[ \t]*$')
+_SECTION_END = re.compile(r'^#{1,2}[ \t]')              # the block runs to the next # or ## heading
+# A run result: an exit code, or a count of what ran ("831 passed", "62 red", "2 files").
+_RESULT = re.compile(r'\bexit(?:[ _]?code)?[ \t:=]*-?\d+\b'
+                     r'|\b\d+\s+(?:passed|failed|failures?|skipped|errors?|tests?|files?|cases?|red|green|hits?)\b'
+                     r'|(?<![\w/.-])\d+/\d+(?![\w/.-])',            # "224/224", "(19/19, 67/67)"
+                     re.IGNORECASE)
+# The v1-5 block's own placeholders, left as written.
+_PLACEHOLDER = re.compile(r'<(?:repo|sha7|id|file sha256|n|f|t|x|s|u|path|files|file:line list|reason|cmd|list)>')
+_NOT_READY = re.compile(r'\bNOT READY\b')
+_VERIFY_LINE = re.compile(r'^##[ \t]*Verify report:[ \t]*(?P<text>.*?)[ \t]*$', re.MULTILINE)
+# "named … as keep-green" is a label the template asks for, not an outcome claim
+_CLAIM = re.compile(r'(?<!\bas )(?<![\w-])(?:holds|unchanged|keep-green|stays green|still green|green)\b', re.IGNORECASE)
+_TEST_REF = re.compile(r'(?:[\w./-]+\.(?:test|spec)\.[cm]?[jt]sx?|\btest_\w+\.py|\btests?/[\w./-]+|\bsit/[\w./-]+)')
+_RUN_CLAIM = re.compile(r'\b(?:ran|re-ran|reran|run in a copy|executed)\b', re.IGNORECASE)
+_COMMAND = re.compile(r'\b(?:pytest|vitest|npx|npm|node|tsc|python3?|py_compile|git apply|bash|sh)\b')
+_QUOTED = re.compile(r'"[^"\n]*"|“[^”\n]*”')
+_EOS_PATH = re.compile(r'(?:~|/home/[\w.-]+)/_eos/[^\s`\'"()\[\]|,;]+')
+_SHA256 = re.compile(r'\bsha256\b[\s:`=]*(?:\(\w+\)[\s:`=]*)?(?P<hex>[0-9a-fA-F]{6,})(?![0-9a-fA-F])', re.IGNORECASE)
+_PATH_GLOB = re.compile(r'[*?{}…<>]|\.\.\.')
+_OUTPUT_WORD = re.compile(r'\b(?:outputs?|saves?|saved|saving|writes?|written|creates?|created)\b', re.IGNORECASE)
+_OUTPUT_AFTER = re.compile(r'[`\'")\s]*(?:is|are)\b[^;·]*?\boutputs?\b', re.IGNORECASE)   # "… is an output"
+_CONDITIONAL = re.compile(r'\b(?:without|unless|until|if|once|otherwise)\b', re.IGNORECASE)
+_LINE_SUFFIX = re.compile(r':\d+(?:[-–]\d+)?$')
+
+
+def dryrun_off() -> bool:
+    """PREFIRE_DRYRUN=off (any case) — the kill switch. Anything else, or unset, is on."""
+    return os.environ.get(DRYRUN_ENV, "").strip().lower() == "off"
+
+
+def dryrun_on(config: Optional[Path] = None) -> bool:
+    """DRY / VERIFY / INPUTS judge: `prefire_dryrun: required` in config/repos.yaml (or `config`, the caller's own copy
+    of it — queue_daemon passes its REPOS_CONFIG), and no PREFIRE_DRYRUN=off."""
+    if dryrun_off():
+        return False
+    if config is None:
+        value = _config_value(DRYRUN_CONFIG_KEY)
+    else:
+        try:
+            value = (yaml.safe_load(Path(config).read_text(encoding="utf-8")) or {}).get(DRYRUN_CONFIG_KEY)
+        except Exception:
+            value = None
+    return str(value or "").strip().lower() == DRYRUN_REQUIRED
+
+
+def _unfenced(text: str):
+    """(line number, line) for every line outside a ``` / ~~~ fence; fence lines themselves are not given."""
+    fenced = False
+    for n, raw in enumerate(text.splitlines(), 1):
+        if _FENCE.match(raw):
+            fenced = not fenced
+            continue
+        if not fenced:
+            yield n, raw
+
+
+def dry_run_blocks(text: str) -> list[list[tuple[int, str]]]:
+    """Every '## DRY RUN (pasted)' block outside a code fence: its lines, (number, text), heading excluded."""
+    blocks: list[list[tuple[int, str]]] = []
+    cur: Optional[list[tuple[int, str]]] = None
+    for n, raw in _unfenced(text):
+        if _DRY_HEADING.match(raw):
+            cur = []
+            blocks.append(cur)
+            continue
+        if cur is not None and _SECTION_END.match(raw):
+            cur = None
+        if cur is not None:
+            cur.append((n, raw))
+    return blocks
+
+
+def dry_run_problems(filepath: Path) -> list[str]:
+    """DRY. [] when the brief has a '## DRY RUN (pasted)' block that holds a run result, no unfilled v1-5 placeholder
+    and no unconditional NOT READY; else one 'DRY ❌ …' refusal per fault."""
+    blocks = dry_run_blocks(_read(filepath))
+    if not blocks:
+        return ["DRY ❌ DRY RUN — no '## DRY RUN (pasted)' block outside a code fence: a brief is not READY, and is not "
+                "enqueued, without the author's pasted run (%s)" % DRYRUN_RULING]
+    lines = [l for b in blocks for l in b]
+    out: list[str] = []
+    holes = ["line %d: %s" % (n, l.strip()[:100]) for n, l in lines if _PLACEHOLDER.search(l)]
+    if holes:
+        out.append("DRY ❌ DRY RUN — template placeholder(s) left unfilled: %s" % " | ".join(holes[:3]))
+    results = [n for n, l in lines if _RESULT.search(l) and not _PLACEHOLDER.search(l)]
+    if not results:
+        out.append("DRY ❌ DRY RUN — the block holds no run result: no line gives an exit code or a count "
+                   "(a reading of the code is not a result — %s)" % DRYRUN_RULING)
+    stop = ["line %d: %s" % (n, l.strip()[:100]) for n, l in lines
+            if _NOT_READY.search(l) and not _CONDITIONAL.search(l)]   # "without G-1 → NOT READY" is a condition
+    if stop:
+        out.append("DRY ❌ DRY RUN — the block says NOT READY: %s" % " | ".join(stop[:3]))
+    return out
+
+
+def dry_run_summary(filepath: Path) -> str:
+    """The pass line's detail: where the block is and how many result lines it holds."""
+    blocks = dry_run_blocks(_read(filepath))
+    lines = [l for b in blocks for l in b]
+    first = lines[0][0] - 1 if lines else 0
+    return "'## DRY RUN (pasted)' at line %d — %d run-result line(s)" % (
+        first, sum(1 for _, l in lines if _RESULT.search(l)))
+
+
+def verify_report_problems(report: Path) -> list[str]:
+    """VERIFY. [] when the verifier's report makes no test-outcome claim it did not run; else 'VERIFY ❌ …' lines.
+    A claim — holds / unchanged / keep-green / green on a line that names a test file — needs a run result (exit code
+    or count) in its own paragraph. A report that claims any run (or makes such a claim) needs at least one line
+    with a command and a result. Words in quotes are a quotation, not a claim."""
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return ["VERIFY ❌ — the verifier report %s cannot be read (%s)" % (report, e.strerror or e)]
+    # paragraphs: split at a blank line or a bullet outside a fence; a fenced paste belongs to the paragraph it follows
+    paras: list[list[tuple[int, str, bool]]] = [[]]
+    fenced = False
+    for n, raw in enumerate(text.splitlines(), 1):
+        if _FENCE.match(raw):
+            fenced = not fenced
+            continue
+        if not fenced and (not raw.strip() or _BULLET.match(raw)):
+            paras.append([])
+        if raw.strip():
+            paras[-1].append((n, raw, fenced))
+    out: list[str] = []
+    claims = 0
+    for para in paras:
+        for n, raw, in_fence in para:
+            bare = _QUOTED.sub(" ", raw)
+            if not in_fence and _CLAIM.search(bare) and _TEST_REF.search(bare):
+                claims += 1
+                if not any(_RESULT.search(l) for _, l, _ in para):
+                    out.append("VERIFY ❌ — %s line %d claims a test outcome with no run result beside it: %s"
+                               % (report.name, n, raw.strip()[:120]))
+    ran = claims or any(_RUN_CLAIM.search(_QUOTED.sub(" ", l)) for _, l in _unfenced(text))
+    evidence = any(_COMMAND.search(l) and _RESULT.search(l) for l in text.splitlines()) or any(
+        any(_COMMAND.search(l) for _, l, _ in para) and any(_RESULT.search(l) for _, l, _ in para) for para in paras)
+    if ran and not evidence:
+        out.append("VERIFY ❌ — %s claims a run but has no command + exit/count line (verifier checklist v1-5: run it "
+                   "or don't claim it)" % report.name)
+    return out
+
+
+def verify_reports(filepath: Path) -> tuple[list[Path], list[str]]:
+    """The reports a '## Verify report:' header line names, and the refusals for a line that names none."""
+    paths: list[Path] = []
+    problems: list[str] = []
+    for m in _VERIFY_LINE.finditer(_read(filepath)[:_HEADER_CHARS]):
+        named = [p.strip(" `*") for p in re.split(r"[,\s]+", m.group("text")) if p.strip(" `*")]
+        named = [p for p in named if "/" in p]
+        if not named:
+            problems.append("VERIFY ❌ — '%s' names no report path" % m.group(0).strip()[:80])
+        paths += [Path(os.path.expanduser(p)) for p in named]
+    return paths, problems
+
+
+def brief_verify_problems(filepath: Path) -> list[str]:
+    """VERIFY for a brief: each report its header names exists and passes verify_report_problems."""
+    paths, out = verify_reports(filepath)
+    for p in paths:
+        if not p.is_file():
+            out.append("VERIFY ❌ — the verifier report %s named on '## Verify report:' does not exist" % p)
+        else:
+            out += verify_report_problems(p)
+    return out
+
+
+def _uncommented(text: str):
+    """(line number, line) outside code fences and outside <!-- … --> author notes (fold and provenance comments)."""
+    in_note = False
+    for n, raw in _unfenced(text):
+        if in_note:
+            if "-->" in raw:
+                in_note = False
+            continue
+        if raw.lstrip().startswith("<!--"):
+            in_note = "-->" not in raw
+            continue
+        yield n, raw
+
+
+def named_input_problems(filepath: Path) -> list[str]:
+    """INPUTS. One 'INPUTS ❌ …' line per `~/_eos/…` input path that does not exist, per sha256 of 17-63 or 65+ hex
+    (one that looks whole and is not 64 — L-404's 63; 16 or fewer is an abbreviation, not judged), and per 64-hex
+    sha256 that does not match the existing file named just before it ("`<path>` sha256 <hex>"). Not judged: code
+    fences, <!-- … --> notes, placeholders and globs, and a path the words beside it call an output ("a STOP saves
+    it as …", "… is an output")."""
+    out: list[str] = []
+    for n, raw in _uncommented(_read(filepath)):
+        found = list(_EOS_PATH.finditer(raw))
+        named: list[tuple[int, Path]] = []                 # (end offset, existing file) — what a sha may name
+        for i, m in enumerate(found):
+            tok = _LINE_SUFFIX.sub("", m.group(0).rstrip(".:"))
+            if _PATH_GLOB.search(tok):
+                continue
+            before = raw[max(found[i - 1].end() if i else 0, m.start() - 40):m.start()]
+            after = raw[m.end():min(found[i + 1].start() if i + 1 < len(found) else len(raw), m.end() + 60)]
+            p = Path(os.path.expanduser(tok))
+            if p.is_file():
+                named.append((m.end(), p))
+            if _OUTPUT_WORD.search(before) or _OUTPUT_AFTER.match(after):
+                continue
+            if not p.exists():
+                out.append("INPUTS ❌ — '%s' (line %d) does not exist (retro fix 6, L-404)" % (tok, n))
+        for m in _SHA256.finditer(raw):
+            hx = m.group("hex")
+            if len(hx) <= 16:
+                continue
+            if len(hx) != 64:
+                out.append("INPUTS ❌ — sha256 '%s…' (line %d) is %d hex, not 64 (L-404)" % (hx[:16], n, len(hx)))
+                continue
+            near = [f for end, f in named if end <= m.start() and m.start() - end <= 12]   # "`<path>` sha256 <hex>"
+            if near and _sha256_of(near[-1]) != hx.lower():
+                out.append("INPUTS ❌ — sha256 %s… (line %d) does not match %s" % (hx[:12], n, near[-1]))
+    return out
+
+
+def _sha256_of(path: Path) -> Optional[str]:
+    import hashlib
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def named_inputs_summary(filepath: Path) -> str:
+    paths = shas = 0
+    for _, raw in _unfenced(_read(filepath)):
+        paths += sum(1 for m in _EOS_PATH.finditer(raw) if not _PATH_GLOB.search(m.group(0)))
+        shas += sum(1 for _ in _SHA256.finditer(raw))
+    return "%d ~/_eos path(s) exist · %d sha256, each 64 hex and matching" % (paths, shas)
+
+
+def enqueue_problems(filepath: Path, config: Optional[Path] = None) -> list[str]:
+    """What `queue_daemon.py enqueue` refuses a brief for: DRY alone (SD-6(a): "or that is being enqueued"), switched
+    by `config` (the daemon's config/repos.yaml). [] when DRY is not on (dryrun_on)."""
+    return dry_run_problems(filepath) if dryrun_on(config) else []
+
+
 # ── HDR: a header line its reader cannot see (ORCH-PREFIRE-PARSE-HAZARDS-1 (iv)) ──────────────────────────────────
 # (the reader's own regex, the window it reads, who reads it) — first matching entry names a line. A line past its
 # window reads as absent, silently: 341b5a's '## Depends-on:' started at char 6495, so its five dependencies were
@@ -1061,6 +1336,7 @@ HEADER_WINDOWS = (
     (_DEPENDS_ON_LINE, _HEADER_CHARS, "prefire"),
     (_MICROFIRE_LINE, _HEADER_CHARS, "prefire"),
     (_REGATE_LINE, _HEADER_CHARS, "prefire"),
+    (_VERIFY_LINE, _HEADER_CHARS, "prefire"),
     (TIMEOUT_MIN_LINE, ADMISSION_HEADER_CHARS, "admission.parse_brief_timeout"),
     (FIRE_MECHANISM_TIMEOUT_LINE, ADMISSION_HEADER_CHARS, "admission.parse_brief_timeout"),
 )
@@ -1096,6 +1372,8 @@ def check(filepath: Path) -> list[str]:
     a1, _ = check_kanban(filepath)
     if a1:
         failures.append(a1)
+    elif dryrun_on():
+        failures += dry_run_problems(filepath)                          # DRY [ORCH-PREFIRE-DRYRUN-GATE-1]
 
     line = _runtime_line(filepath)
     estimate = parse_declared_estimate(filepath)
@@ -1169,6 +1447,9 @@ def check(filepath: Path) -> list[str]:
     failures += [v.line for v in check_opex(filepath) if not v.ok]     # OPX-1/-2/-3 [ORCH-OPEX-PREFIRE-1]
     failures += dependency_changes(filepath)[1]                         # DEPCHANGE [ORCH-NPM-FROZEN-1]
     failures += header_window_problems(filepath)                        # HDR [ORCH-PREFIRE-PARSE-HAZARDS-1]
+    if dryrun_on():
+        failures += brief_verify_problems(filepath)                     # VERIFY [ORCH-PREFIRE-DRYRUN-GATE-1]
+        failures += named_input_problems(filepath)                      # INPUTS [ORCH-PREFIRE-DRYRUN-GATE-1]
 
     return failures
 
@@ -1195,6 +1476,9 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
     if opex_off():
         print("  ⚠⚠ %s=off — OPX-1/-2/-3 (D-S7CORE33-20: Operability & safety, agent policy, George go) "
               "SKIPPED for %s. Unset it to turn the OpEx pre-checks back on." % (OPEX_ENV, filepath.name))
+    if dryrun_off():
+        print("  ⚠⚠ %s=off — DRY / VERIFY / INPUTS (%s: the pasted dry run, the verifier's runs, the named inputs) "
+              "SKIPPED for %s. Unset it to turn them back on." % (DRYRUN_ENV, DRYRUN_RULING, filepath.name))
     opex = [v.line for v in check_opex(filepath) if v.ok]               # OPX-1/-2/-3: one line each; a ❌ is a failure
     opex += ["DEPCHANGE ✅ %s@%s (%s) — George go: '%s'" % (e["pkg"], e["version"], e["kind"],
                                                          q if len(q) <= 60 else q[:59] + "…")
@@ -1219,6 +1503,12 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
             print("  Depends-on: %s" % "; ".join(map(str, deps)))
         for line in opex:
             print("  %s" % line)
+        if dryrun_on():                                                 # [ORCH-PREFIRE-DRYRUN-GATE-1]
+            print("  DRY ✅ %s" % dry_run_summary(filepath))
+            reports, _ = verify_reports(filepath)
+            print("  VERIFY ✅ %s" % (", ".join(r.name for r in reports) + " — every claim has a run beside it"
+                                     if reports else "no '## Verify report:' line — no report judged"))
+            print("  INPUTS ✅ %s" % named_inputs_summary(filepath))
         return True
 
     print("\n%s" % bar)
@@ -1236,6 +1526,15 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
 if __name__ == "__main__":
     import sys
     ok = True
+    if sys.argv[1:2] == ["--verify-report"]:                            # [ORCH-PREFIRE-DRYRUN-GATE-1] VERIFY
+        for arg in sys.argv[2:]:
+            problems = verify_report_problems(Path(arg))
+            print("=== %s: %s" % (Path(arg).name, "VERIFY ✅ every claim has a run beside it" if not problems else
+                                  "VERIFY ⛔ refused"))
+            for line in problems:
+                print("  • %s" % line)
+            ok = ok and not problems
+        raise SystemExit(0 if ok else 1)
     for arg in sys.argv[1:]:
         p = Path(arg)
         print("=== %s" % p.name)

@@ -913,6 +913,11 @@ class QueueDaemon:
             return {"ok": False, "error": f"File not found: {batch_path}"}
         if not src.name.endswith(".md"):
             return {"ok": False, "error": "Only .md batch files accepted"}
+        # [ORCH-PREFIRE-DRYRUN-GATE-1] Kanban 727, SD-6(a): a brief without the author's pasted dry run is not copied
+        # in — prefire's DRY, the same reading the fire applies. PREFIRE_DRYRUN=off skips it (said by the fire).
+        problems = prefire.enqueue_problems(src, REPOS_CONFIG)
+        if problems:
+            return {"ok": False, "error": f"{src.name} not enqueued — " + " · ".join(problems)}
         self._ensure_dirs()
         dst = QUEUE_DIR / src.name
         shutil.copy2(str(src), str(dst))
@@ -1935,7 +1940,9 @@ def main(argv: list) -> int:
     d = QueueDaemon()
     if cmd == "enqueue" and len(argv) > 1:
         r = d.enqueue(argv[1])
-        print(json.dumps(r, indent=2))
+        print(json.dumps(r, indent=2, ensure_ascii=False))
+        if not r["ok"]:
+            return 1                  # [ORCH-PREFIRE-DRYRUN-GATE-1] a refused enqueue is not a success
     elif cmd == "status" and argv[1:] in ([], ["--json"]):
         # [QUEUE-PAUSE-OPAQUE] P-PAUSE: this process is not the daemon. Line 1 and every daemon field
         # below come from what the daemon persisted, never from this object's own "idle".
