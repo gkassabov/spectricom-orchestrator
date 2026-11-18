@@ -89,6 +89,24 @@ ENFORCED:
                       (orchestrator ORCH-REGATE-GATE-ONLY-1: no executor runs): A2's sizing floor is waived and the
                       pass line says so; a malformed line is a refusal. Every other check, OPX lines included, holds.
 
+  APPLY            — a brief whose header has '## Apply patch: <path> <sha256>' lands that saved patch with no executor
+                      (orchestrator ORCH-APPLY-PATCH-1, SD-1 trial: George 2026-11-16 17:40 "approved", conditions
+                      17:52 "Yes"): A2's sizing floor is waived. Refused: a malformed line; a patch carrying the
+                      route's own handback or brief copy; a patch that is missing, under /tmp, /var/tmp, /dev/shm or
+                      $TMPDIR, of another sha256, binary, or unreadable as `diff --git` blocks (a `---`/`+++`/`@@`
+                      header outside a git block's header included); a patch path outside
+                      ALLOWED FILES or on the never-autonomous list (OPX-3 `protected`: protected areas join later,
+                      with George's go by name); a change to an existing test file, or any change to a conftest.py,
+                      a runner config, a setup file (by name, or what a runner config names in `setupFiles` /
+                      `globalSetup`), a snapshot, a fixture, a sit/ file or package.json, that no
+                      GRANT line under the brief's '## RULE #8' (outside an HTML note) carrying
+                      'Granted: George' names (condition 2; a new test file is not a change to a test); no
+                      '## Patch author:' line; and no '## Verify report:' report that names the patch's sha256, a
+                      'Verifier:' other than the author, 'Wrote any of this change: no' and a READY verdict
+                      (condition 1, G-17), or any report on the patch that says NOT READY, or a report with a run
+                      claim and no run (727's check). The orchestrator asks the same question again at the fire
+                      (--force does not skip it), and refuses a brief whose repo is not the fire's.
+
 NOT enforced here: A3-A7, nor SESSION-BOOT's own A9 (System Prompt v5-38) — this A9 is not that one.
 OPX-1/-2/-3 were labelled A12-A14 until ORCH-PREFIRE-RENAME-1: SESSION-BOOT's A12 and A13 are other checks.
 
@@ -101,6 +119,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -218,6 +237,462 @@ def parse_regate(filepath: Path) -> Optional[tuple[str, str]]:
     raw = regate_line(filepath)
     m = _REGATE_VALUE.match(raw.strip()) if raw is not None else None
     return (m.group(1), m.group(2).lower()) if m else None
+
+
+# [ORCH-APPLY-PATCH-1] SD-1 trial (George 2026-11-16 17:40 "approved"; conditions 17:52 "Yes"): `## Apply patch: <path>
+# <sha256>` — the orchestrator applies that exact saved patch to a branch cut from the merge target, fires no executor,
+# runs the normal gate and lands it. Read here and by orchestrator.py (one parser); apply_patch_problems is the one judge.
+_APPLY_LINE = re.compile(r'^##[ \t]*Apply patch:[ \t]*(.*?)[ \t]*$', re.MULTILINE)
+_APPLY_VALUE = re.compile(r'^`?(\S+?)`?\s+`?([0-9a-fA-F]{64})`?$')
+_AUTHOR_LINE = re.compile(r'^##[ \t]*Patch author:[ \t]*(.*?)[ \t]*$', re.MULTILINE)
+_DIFF_GIT = re.compile(r'^diff --git a/(\S+) b/(\S+)$')
+_HUNK = re.compile(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@')
+# a test file or test harness, by path: a tests/ / __tests__/ / __mocks__/ / e2e/ / test-utils/ directory, or a test-named
+# file (test_*.py, *_test.py, conftest.py, *.test.ts, *.spec.tsx, vitest/jest/playwright config); r3 (S7-CORE-56, C2-a):
+# a __snapshots__/ / __fixtures__/ / fixtures/ / sit/ directory, a *.snap file or a *.fixture(s).* file — a snapshot IS an
+# assertion, a fixture is what the assertion reads, and sit/ is clinical-mp's SIT tree (invariants, harness, runner)
+_TEST_PATH = re.compile(r'(?:^|/)(?:tests?|__tests__|__mocks__|__snapshots__|__fixtures__|fixtures|sit|e2e'
+                        r'|test[-_]?utils?|testing)/'
+                        r'|(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.py|conftest\.py|[^/]*\.(?:test|spec)\.[cm]?[jt]sx?'
+                        r'|[^/]*\.snap|[^/]*\.fixtures?\.[^/]*|(?:vitest|jest|playwright)\.[^/]*)$', re.IGNORECASE)
+# r2 (verifier m-1): what decides how EVERY existing test runs — a conftest.py, a runner's config or the package scripts.
+# Added or changed, it needs a grant in the trial. r4 (VERIFY-r3 M-1): `.pytest.ini` too — pytest reads it as it reads
+# `pytest.ini` (_pytest/config/findpaths.py), so a new one could set `addopts = -k "not …"`; r5 (VERIFY-r4 M-1r):
+# `pytest.toml` / `.pytest.toml` too — pytest 9 reads them before `pytest.ini` in every folder.
+_RUNNER_PATH = re.compile(r'(?:^|/)(?:conftest\.py|\.?pytest\.(?:ini|toml)|pyproject\.toml|setup\.cfg|tox\.ini|package\.json'
+                          r'|(?:vitest|vite|jest|playwright)(?:\.[^/]+)?\.config\.[^/]*|[^/]*\.setup\.[cm]?[jt]sx?'
+                          r'|setupTests\.[cm]?[jt]sx?)$', re.IGNORECASE)
+# r3 (n-2): what a repo's runner config names in `setupFiles` runs before every test, whatever its name; S7-CORE-56 (C2-b):
+# every vite / vitest / jest / playwright config at the root or one folder down (`server/vitest.config.ts`,
+# `vitest.sit.config.ts`, `playwright.config.ts`), and `setupFilesAfterEnv`, `globalSetup`, `globalTeardown` too
+_RUNNER_CONFIG_NAME = re.compile(r'^(?:vitest|vite|jest|playwright)(?:\.[^/]+)?\.config\.[cm]?[jt]s$', re.IGNORECASE)
+_SETUP_FILES = re.compile(r'\b(?:setupFiles(?:AfterEnv)?|globalSetup|globalTeardown)\s*:\s*'
+                          r'(\[[^\]]*\]|["\'][^"\']+["\'])')
+# r4 (VERIFY-r3 M-1): a NEW file the runner loads on its own — a `__mocks__/` neighbour (vitest/jest load it for every
+# bare `vi.mock('…')` / `jest.mock('…')` of the module beside it) or an `__init__.py` under a test directory (it
+# changes how pytest names and imports every test beside it) — changes existing tests without touching them
+_MOCKS_DIR = re.compile(r'(?:^|/)__mocks__/', re.IGNORECASE)
+_INIT_PY = re.compile(r'(?:^|/)__init__\.py$', re.IGNORECASE)
+# r4 (VERIFY-r3 m-1): every header line git reads a rename or copy path from — `rename old` / `rename new` are git's
+# older spellings of `rename from` / `rename to` and git still applies them
+_RENAME_LINE = re.compile(r'^(?:rename (from|to|old|new)|copy (from|to)) (.*)$')
+# r4 (VERIFY-r3 m-3): a line indented 4+ columns is an indented code block (or a nested item) — never a grant
+_INDENTED = re.compile(r'^(?: {0,3}\t| {4})')
+# r5 (VERIFY-r4 m-1): a fence line is indented 0-3 spaces (CommonMark); a ``` indented 4+ inside a fence is content.
+# Used by the grant reader only — the shared `_FENCE` is read by the daemon's in-memory allowed_paths /
+# dependency_status, and is left as it is (no daemon restart owed).
+_GRANT_FENCE = re.compile(r'^ {0,3}(?:```|~~~)')
+_ZERO_WIDTH = re.compile('[\u200b-\u200f\u2060\ufeff]')
+_HTML_NOTE = re.compile(r'<!--.*?(?:-->|\Z)', re.DOTALL)    # S7-CORE-56 (C2-c): an unclosed note runs to the end
+_RULE8_HEADING = re.compile(r'^##\s*RULE\s*#\s*8\b', re.IGNORECASE)
+_GRANT_WORD = re.compile(r'\bGRANT\b')                       # upper case: '**Grants:** none' is not a grant line
+# r2 (verifier M-1): a grant counts only on a line that says it was given — `Granted: George` — an allow-list, not a
+# deny-list; the deny words still refuse beside it, and a `Searches:` line never grants.
+_GRANT_GIVEN = re.compile(r'\bGranted:\s*George\b')
+_GRANT_NOT_YET = re.compile(r'\b(?:ASKED|OPEN|PENDING|TBD|OWED|REFUSED|DENIED|NOT\s+GRANTED)\b', re.IGNORECASE)
+_SEARCH_LINE = re.compile(r'^[\s>*_`-]*Searches?\b', re.IGNORECASE)
+_SPAN = re.compile(r'`([^`\n]+)`')
+_STAMP = re.compile(r'^[\s>*_`-]*(Patch sha256|Verifier|Wrote any of this change|Verdict)[*_`]*\s*:[*_`\s]*(.*?)[*_`\s]*$',
+                    re.IGNORECASE)
+_WROTE_NO = re.compile(r'no[.!]?', re.IGNORECASE)            # r2 (m-3): exactly `no`, markdown and a full stop aside
+APPLY_TEMP_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/")   # G-1: never a temporary folder; $TMPDIR too (tests patch these)
+APPLY_TMPDIR_ENV = "TMPDIR"
+APPLY_PREFIX = "APPLY ❌ "
+APPLY_RULING = "SD-1 trial, George 2026-11-16 17:40 / 17:52 (ORCH-APPLY-PATCH-1)"
+
+
+def apply_line(filepath: Path) -> Optional[str]:
+    """The `## Apply patch:` value as written, or None when the brief has no such line."""
+    m = _APPLY_LINE.search(_read(filepath)[:_HEADER_CHARS])
+    return m.group(1) if m else None
+
+
+def parse_apply(filepath: Path) -> Optional[tuple[Path, str]]:
+    """(patch path, ~ expanded; sha256, lower case) from a well-formed `## Apply patch:` line; None when absent or
+    malformed."""
+    raw = apply_line(filepath)
+    m = _APPLY_VALUE.match(raw.strip()) if raw is not None else None
+    return (Path(os.path.expanduser(m.group(1))), m.group(2).lower()) if m else None
+
+
+def patch_author(filepath: Path) -> Optional[str]:
+    """The `## Patch author:` value (markdown stripped), or None when absent or empty."""
+    m = _AUTHOR_LINE.search(_read(filepath)[:_HEADER_CHARS])
+    text = _MD.sub("", m.group(1)).strip() if m else ""
+    return text or None
+
+
+def _who(name: str) -> str:
+    """An agent name as compared: markdown, case, spacing, punctuation, hyphens and zero-width characters aside (r3,
+    n-3: 'Brief-author worker s55-a.' is 'brief author worker s55 a')."""
+    return re.sub(r"[\W_]+", "", _ZERO_WIDTH.sub("", name).lower())
+
+
+def is_test_path(path: str) -> bool:
+    return bool(_TEST_PATH.search(path))
+
+
+def is_runner_config(path: str, setup: tuple = ()) -> bool:
+    """r2 (m-1): a conftest.py, a test runner's config or package.json — it changes how every existing test runs; r3
+    (n-2): a `*.setup.*` / `setupTests.*` file, or any file in `setup` (the repo's own `setupFiles`)."""
+    return bool(_RUNNER_PATH.search(path)) or path in setup
+
+
+def needs_grant(path: str, kind: str, setup: tuple = ()) -> bool:
+    """Condition 2: a change to an existing test file (modified, deleted, renamed away), or any change — new ones too —
+    to a conftest.py / runner config / setup file / package.json. r4 (VERIFY-r3 M-1): a NEW file under a `__mocks__/`
+    directory, or a new `__init__.py` under a test directory, too — the runner loads each on its own."""
+    if is_runner_config(path, setup):
+        return True
+    if kind != "added":
+        return is_test_path(path)
+    return bool(_MOCKS_DIR.search(path)) or (bool(_INIT_PY.search(path)) and is_test_path(path))
+
+
+def _repo_entry(repo: Optional[str]) -> dict:
+    """config/repos.yaml `repos.<repo>`, or {} (unread, unnamed, or not there)."""
+    repos = _config_value("repos")
+    entry = repos.get(repo) if isinstance(repos, dict) and repo else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _runner_configs(project: Path) -> list[Path]:
+    """The vite / vitest / jest / playwright configs at the project root and one folder down (dot-folders and
+    node_modules aside), sorted by path."""
+    out: list[Path] = []
+    try:
+        top = sorted(Path(project).iterdir())
+    except OSError:
+        return out
+    for e in top:
+        if e.is_file() and _RUNNER_CONFIG_NAME.match(e.name):
+            out.append(e)
+    for d in top:
+        if not d.is_dir() or d.name.startswith(".") or d.name == "node_modules":
+            continue
+        try:
+            out += [e for e in sorted(d.iterdir()) if e.is_file() and _RUNNER_CONFIG_NAME.match(e.name)]
+        except OSError:
+            continue
+    return out
+
+
+def setup_files(project: Optional[Path]) -> tuple:
+    """r3 (n-2): every path a runner config of the repo names in `setupFiles`, repo-relative ('./' dropped); () when
+    there is no such config or project. S7-CORE-56 (C2-b): `setupFilesAfterEnv`, `globalSetup`, `globalTeardown`
+    too, in every config `_runner_configs` finds; a path in a config one folder down is listed both relative to that
+    folder and to the root (fails closed: either may be how the runner resolves it). Read-only."""
+    if project is None:
+        return ()
+    found: list[str] = []
+    for cfg in _runner_configs(Path(project)):
+        try:
+            text = cfg.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        sub_dir = cfg.parent.relative_to(Path(project)).as_posix()
+        for m in _SETUP_FILES.finditer(text):
+            for q in re.findall(r'["\']([^"\']+)["\']', m.group(1)):
+                q = q[2:] if q.startswith("./") else q.lstrip("/")
+                cands = [q] if sub_dir in ("", ".") else [posixpath.normpath(sub_dir + "/" + q), q]
+                for c in cands:
+                    if c and not c.startswith("..") and c not in found:
+                        found.append(c)
+    return tuple(found)
+
+
+def temp_roots() -> list[str]:
+    """APPLY_TEMP_ROOTS and $TMPDIR, each as its real path with a trailing '/'."""
+    roots = list(APPLY_TEMP_ROOTS)
+    extra = os.environ.get(APPLY_TMPDIR_ENV, "").strip() if APPLY_TMPDIR_ENV else ""
+    if extra:
+        roots.append(extra)
+    return [os.path.realpath(r).rstrip("/") + "/" for r in roots if r]
+
+
+def patch_files(text: str) -> tuple[list[tuple[str, str]], Optional[str]]:
+    """([(path, kind)], None) — every path a `git diff` patch touches, kind 'added' | 'deleted' | 'modified' (a rename
+    is its old path 'deleted' and its new path 'added'; a copy, the new path 'added'); ([], why) when the patch cannot
+    be judged: no `diff --git` block, a quoted or spaced path (a quoted `rename`/`copy` value too, r4), a binary
+    patch, a/b paths that differ with no rename, or
+    (r2, verifier m-2) a `--- ` / `+++ ` / `@@` header outside a `diff --git` block's own header — hunks are counted by
+    their line numbers, so a traditional block git would also apply cannot hide after a git one."""
+    out: list[tuple[str, str]] = []
+    cur = None                                    # [a, b, kind, rename_from, rename_to, copy_to] of the open block
+    header = False
+    old_left = new_left = 0                       # lines still owed by the open hunk
+
+    def close() -> Optional[str]:
+        if cur is None:
+            return None
+        a, b, kind, rfrom, rto, copy = cur
+        if rfrom or rto:
+            if not (rfrom and rto):
+                return "a rename without both of its paths (%s)" % a
+            out.extend([(rfrom, "deleted"), (rto, "added")])
+        elif copy:
+            out.append((copy, "added"))             # r4: the path git creates is `copy to`'s, not the b/ path
+        elif a != b:
+            return "a block whose a/ and b/ paths differ with no rename (%s, %s)" % (a, b)
+        else:
+            out.append((a, kind))
+        return None
+
+    for raw in text.splitlines():
+        if old_left > 0 or new_left > 0:          # inside a hunk: its body, whatever it says
+            tag = raw[:1]
+            if tag == "\\":
+                continue
+            if tag not in (" ", "-", "+", ""):
+                return [], "a hunk shorter than its header says (%s)" % raw[:80]
+            if tag in (" ", ""):
+                old_left, new_left = old_left - 1, new_left - 1
+            elif tag == "-":
+                old_left -= 1
+            else:
+                new_left -= 1
+            if old_left < 0 or new_left < 0:
+                return [], "a hunk longer than its header says (%s)" % raw[:80]
+            continue
+        if raw.startswith("diff --git "):
+            why = close()
+            if why:
+                return [], why
+            m = _DIFF_GIT.match(raw)
+            if not m:
+                return [], "a quoted or spaced path is not judged: %s" % raw[:120]
+            cur, header = [m.group(1), m.group(2), "modified", None, None, None], True
+            continue
+        if raw.startswith(("GIT binary patch", "Binary files ")):
+            return [], "a binary patch is not judged"
+        h = _HUNK.match(raw)
+        if h:
+            if cur is None:
+                return [], "a hunk outside a `diff --git` block is not judged: %s" % raw[:80]
+            header = False
+            old_left = int(h.group(1)) if h.group(1) is not None else 1
+            new_left = int(h.group(2)) if h.group(2) is not None else 1
+            continue
+        if raw.startswith(("--- ", "+++ ")):
+            if cur is None or not header:
+                return [], "a `%s` header outside a `diff --git` block's header is not judged" % raw[:60]
+            continue
+        if cur is None or not header:
+            continue
+        if raw.startswith("new file mode"):
+            cur[2] = "added"
+        elif raw.startswith("deleted file mode"):
+            cur[2] = "deleted"
+        elif _RENAME_LINE.match(raw):
+            rm = _RENAME_LINE.match(raw)
+            val = rm.group(3)
+            if val.startswith('"'):                 # r4 (VERIFY-r3 m-1): git un-quotes it; the judge would not
+                return [], "a quoted path is not judged: %s" % raw[:120]
+            if rm.group(1) in ("from", "old"):
+                cur[3] = val
+            elif rm.group(1) in ("to", "new"):
+                cur[4] = val
+            elif rm.group(2) == "to":
+                cur[5] = val
+    if old_left > 0 or new_left > 0:
+        return [], "the patch ends inside a hunk"
+    why = close()
+    if why:
+        return [], why
+    if not out:
+        return [], "no `diff --git` block — not a git patch"
+    return out, None
+
+
+def rule8_grants(filepath: Path) -> tuple[list[str], list[str]]:
+    """(granted paths, lines not counted). A grant is a line under the brief's `## RULE #8` heading(s), outside a code
+    fence and not indented 4+ columns (r4, VERIFY-r3 m-3: an indented code block), carrying the upper-case word GRANT AND
+    `Granted: George` (r2, verifier M-1: an allow-list), and none of
+    ASKED / OPEN / PENDING / TBD / OWED / REFUSED / DENIED / NOT GRANTED; a `Searches:` line never grants. Each `code
+    span` on a grant line with a '/' or a file extension is a granted path (a `:<lines>` suffix dropped). A GRANT line
+    not counted is returned in the second list, so a refusal can name it."""
+    # r3 (n-1): an HTML note is not the brief — a GRANT (or a `Granted: George`) inside `<!-- … -->` does not count
+    text = _HTML_NOTE.sub(lambda m: "\n" * m.group(0).count("\n"), _read(filepath))
+    lines = _section(text, _RULE8_HEADING, every=True, fence=_GRANT_FENCE) or []
+    granted: list[str] = []
+    pending: list[str] = []
+    fenced = False
+    for raw in lines:
+        if _GRANT_FENCE.match(raw):
+            fenced = not fenced
+            continue
+        if fenced or not _GRANT_WORD.search(raw) or _SEARCH_LINE.match(raw):
+            continue
+        if _INDENTED.match(raw):                    # r4 (VERIFY-r3 m-3): an indented code block is not the brief
+            pending.append("(indented 4+ columns, not counted) " + raw.strip()[:100])
+            continue
+        if not _GRANT_GIVEN.search(_MD.sub("", raw).replace("_", "")) or _GRANT_NOT_YET.search(raw):
+            pending.append(raw.strip()[:120])
+            continue
+        for span in _SPAN.findall(raw):
+            for w in span.split():
+                w = re.sub(r":\d[\d,\-–]*$", "", w.strip("\"'“”‘’,;").rstrip(".:"))
+                w = w[2:] if w.startswith("./") else w
+                if w and ("/" in w or re.search(r"\.[A-Za-z]\w{0,5}$", w)) and w not in granted:
+                    granted.append(w)
+    return granted, pending
+
+
+def verify_stamp(report: Path) -> dict[str, str]:
+    """The trial stamp of a verifier report: the first 'Patch sha256:' / 'Verifier:' / 'Wrote any of this change:' /
+    'Verdict:' line of each (markdown and a bullet aside), keyed in lower case; outside code fences."""
+    stamp: dict[str, str] = {}
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return stamp
+    for _, raw in _unfenced(text):
+        m = _STAMP.match(raw)
+        if m and m.group(1).lower() not in stamp:
+            stamp[m.group(1).lower()] = m.group(2).strip()
+    return stamp
+
+
+def _stamp_names(stamp: dict[str, str], sha: str) -> bool:
+    return sha in [h.lower() for h in re.findall(r"[0-9a-fA-F]{64}", stamp.get("patch sha256", ""))]
+
+
+def _stamp_problem(stamp: dict[str, str], sha: str, author: Optional[str]) -> Optional[str]:
+    """Why a report does not clear the patch, or None."""
+    if not _stamp_names(stamp, sha):
+        return "names no 'Patch sha256: %s…' (the 64 hex of this patch)" % sha[:12]
+    who = stamp.get("verifier", "")
+    if not _who(who):
+        return "names no 'Verifier:'"
+    if author and _who(who) == _who(author):
+        return "its verifier '%s' is the patch author — condition 1: a fresh verifier reviews it (G-17)" % who[:60]
+    wrote = _MD.sub("", stamp.get("wrote any of this change", "")).strip()
+    if wrote.lower().startswith("yes"):
+        return ("its verifier '%s' wrote part of this change — condition 1: a fresh verifier reviews it (G-17)"
+                % who[:60])
+    if not _WROTE_NO.fullmatch(wrote):
+        return "has no 'Wrote any of this change: no' line (it says '%s'; exactly `no`)" % wrote[:60]
+    verdict = _MD.sub("", stamp.get("verdict", "")).strip().upper()
+    if not verdict.startswith("READY"):
+        return "its verdict is '%s', not READY" % (stamp.get("verdict", "") or "none")[:60]
+    return None
+
+
+def apply_patch_problems(filepath: Path, data: Optional[bytes] = None, project: Optional[Path] = None,
+                         briefs_subdir: Optional[str] = None) -> list[str]:
+    """APPLY. [] when the brief is not an apply-patch brief, or when its `## Apply patch:` patch may land with no
+    executor; else one 'APPLY ❌ …' refusal per fault (fails closed: what cannot be judged is refused). `data`: the
+    patch bytes the caller will apply (r2, m-6: judged and applied from one read); read from the path when None.
+    `project` / `briefs_subdir`: the fire's checkout and briefs folder; from config/repos.yaml for the brief's repo
+    when None (r3, n-2 / n-4)."""
+    raw = apply_line(filepath)
+    if raw is None:
+        return []
+    named = parse_apply(filepath)
+    if named is None:
+        return [APPLY_PREFIX + "'## Apply patch: %s' is not '<path> <sha256 (64 hex)>' (%s)" % (raw[:120], APPLY_RULING)]
+    patch, sha = named
+    if not patch.is_absolute():
+        return [APPLY_PREFIX + "the patch path %s is not absolute (write ~/_eos/… or /home/…)" % patch]
+    real = os.path.realpath(patch)
+    hit = next((t for t in temp_roots() if (real + "/").startswith(t)), None)
+    if hit:
+        return [APPLY_PREFIX + "the patch %s is under /tmp (%s) — a saved change lives in a durable folder, never a "
+                "temporary one (G-1)" % (patch, hit)]
+    if data is None:
+        try:
+            data = patch.read_bytes()
+        except OSError as e:
+            return [APPLY_PREFIX + "the patch %s cannot be read (%s)" % (patch, e.strerror or e)]
+    got = _sha256_bytes(data)
+    if got != sha:
+        return [APPLY_PREFIX + "the patch %s has sha256 %s…, the brief names %s… — not the patch that was verified"
+                % (patch.name, got[:12], sha[:12])]
+    files, why = patch_files(data.decode("utf-8", errors="replace"))
+    if why:
+        return [APPLY_PREFIX + "the patch %s cannot be judged: %s" % (patch.name, why)]
+    out: list[str] = []
+    paths = [p for p, _ in files]
+    repo = queue_header(filepath).get("repo")
+    entry = _repo_entry(repo)
+    if project is None and entry.get("project_dir"):
+        project = Path(os.path.expanduser(str(entry["project_dir"])))
+    briefs = (briefs_subdir or entry.get("briefs_subdir") or "briefs").strip("/")
+    own = [p for p in paths if p in ("%s/%s.handback.md" % (briefs, filepath.stem), "%s/%s" % (briefs, filepath.name))]
+    if own:
+        out.append(APPLY_PREFIX + "the patch carries %s — the route's handback and brief copy are the orchestrator's to "
+                   "write; an apply-patch patch may not carry them (take them out of the patch)" % _list(own))
+    setup = setup_files(project)
+    try:
+        protected = _named(paths, opex_paths("protected", repo))
+    except ValueError as e:
+        protected = None
+        out.append(APPLY_PREFIX + "the protected path list cannot be read: %s (fails closed)" % e)
+    if protected:
+        out.append(APPLY_PREFIX + "the patch touches never-autonomous path(s) %s — protected areas are not in the "
+                   "trial; they join later, with George's go by name (SD-1)" % _list(protected))
+    allowed = allowed_paths(filepath)
+    if allowed is None:
+        out.append(APPLY_PREFIX + "the brief has no ALLOWED FILES section — a patch path cannot be checked against it")
+    else:
+        outside = [p for p in paths if not any(path_matches(p, a) for a in allowed)]
+        if outside:
+            out.append(APPLY_PREFIX + "the patch touches path(s) outside ALLOWED FILES: %s" % _list(outside))
+    granted, pending = rule8_grants(filepath)
+    edited = ["%s (%s)" % (p, k) for p, k in files if needs_grant(p, k, setup) and p not in granted]
+    if edited:
+        out.append(APPLY_PREFIX + "the patch changes test file(s) %s that no GRANT line under '## RULE #8' with "
+                   "'Granted: George' names — condition 2: a test not granted in the brief is not changed%s"
+                   % (_list(edited), "; GRANT line(s) not given: %s" % " | ".join(pending[:2]) if pending else ""))
+    author = patch_author(filepath)
+    if author is None:
+        out.append(APPLY_PREFIX + "no '## Patch author:' line — the verifier cannot be shown to be someone else")
+    reports, bad = verify_reports(filepath)
+    out += [APPLY_PREFIX + b[len("VERIFY ❌ — "):] if b.startswith("VERIFY ❌ — ") else APPLY_PREFIX + b for b in bad]
+    if not reports:
+        out.append(APPLY_PREFIX + "no '## Verify report:' line — SD-1 lands only a change an independent verifier "
+                   "checked")
+    else:
+        whys, clears = [], False
+        for r in reports:
+            if not r.is_file():
+                whys.append("%s does not exist" % r.name)
+                continue
+            stamp = verify_stamp(r)
+            # r2 (m-4): any report on this patch that says NOT READY refuses, whatever another one says
+            if _stamp_names(stamp, sha) and "NOT READY" in _MD.sub("", stamp.get("verdict", "")).upper():
+                out.append(APPLY_PREFIX + "%s says NOT READY on this patch (%s) — a READY report beside it does not "
+                           "outvote it" % (r.name, stamp.get("verdict", "")[:60]))
+            # r2 (m-8): 727's run-claim check at the fire too (--force and PREFIRE_DRYRUN=off skip prefire's)
+            out += [APPLY_PREFIX + v[len("VERIFY ❌ — "):] if v.startswith("VERIFY ❌ — ") else APPLY_PREFIX + v
+                    for v in verify_report_problems(r)]
+            why = _stamp_problem(stamp, sha, author)
+            if why is None:
+                clears = True
+            else:
+                whys.append("%s %s" % (r.name, why))
+        if not clears:
+            out.append(APPLY_PREFIX + "no verifier report clears this patch: %s" % " | ".join(whys[:3]))
+    return out
+
+
+def apply_patch_summary(filepath: Path) -> str:
+    """The pass line's detail for a clean apply-patch brief."""
+    patch, sha = parse_apply(filepath)
+    files, _ = patch_files(patch.read_text(encoding="utf-8", errors="replace"))
+    entry = _repo_entry(queue_header(filepath).get("repo"))
+    setup = setup_files(Path(os.path.expanduser(str(entry["project_dir"]))) if entry.get("project_dir") else None)
+    edits = [p for p, k in files if needs_grant(p, k, setup)]
+    who = next((verify_stamp(r).get("verifier", "") for r in verify_reports(filepath)[0]
+                if r.is_file() and _stamp_problem(verify_stamp(r), sha, patch_author(filepath)) is None), "")
+    return ("%s sha256 %s… — %d file(s), none protected, all in ALLOWED FILES; %d test edit(s), each granted; verifier "
+            "'%s' ≠ author '%s'" % (patch.name, sha[:12], len(files), len(edits), who[:40],
+                                    (patch_author(filepath) or "")[:40]))
+
+
+def _sha256_bytes(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
 
 
 _MICROFIRE_LINE = re.compile(r'^##\s*Micro-fire trigger:\s*(.+)$', re.MULTILINE)
@@ -626,13 +1101,16 @@ def opex_off() -> bool:
     return os.environ.get(OPEX_ENV, "").strip().lower() == "off"
 
 
-def _section(text: str, heading: re.Pattern, every: bool = False) -> Optional[list[str]]:
+def _section(text: str, heading: re.Pattern, every: bool = False, fence: Optional[re.Pattern] = None
+             ) -> Optional[list[str]]:
     """The lines under the first `##` heading `heading` matches (every one's, when `every`), up to the next `#`/`##`
-    heading outside a code fence; None when there is no such heading."""
+    heading outside a code fence; None when there is no such heading. `fence` (default `_FENCE`) is what opens and
+    closes a fence (r5: `rule8_grants` passes `_GRANT_FENCE`)."""
+    fence = fence or _FENCE
     out: Optional[list[str]] = None
     inside = fenced = False
     for raw in text.splitlines():
-        if _FENCE.match(raw):
+        if fence.match(raw):
             fenced = not fenced
         elif not fenced and _SECTION_END.match(raw):
             inside = bool(heading.match(raw)) and (every or out is None)
@@ -1336,6 +1814,8 @@ HEADER_WINDOWS = (
     (_DEPENDS_ON_LINE, _HEADER_CHARS, "prefire"),
     (_MICROFIRE_LINE, _HEADER_CHARS, "prefire"),
     (_REGATE_LINE, _HEADER_CHARS, "prefire"),
+    (_APPLY_LINE, _HEADER_CHARS, "prefire"),
+    (_AUTHOR_LINE, _HEADER_CHARS, "prefire"),
     (_VERIFY_LINE, _HEADER_CHARS, "prefire"),
     (TIMEOUT_MIN_LINE, ADMISSION_HEADER_CHARS, "admission.parse_brief_timeout"),
     (FIRE_MECHANISM_TIMEOUT_LINE, ADMISSION_HEADER_CHARS, "admission.parse_brief_timeout"),
@@ -1382,12 +1862,16 @@ def check(filepath: Path) -> list[str]:
     not_a_trigger = " " + MICROFIRE_NOT_A_TRIGGER if not trigger and microfire_line(filepath) is not None else ""
     regate_raw = regate_line(filepath)
     regate = parse_regate(filepath)
+    applying = apply_line(filepath) is not None
+    failures += apply_patch_problems(filepath)                          # APPLY [ORCH-APPLY-PATCH-1]
 
     if regate_raw is not None and regate is None:
         failures.append("A2 RE-GATE — '## Re-gate of: %s' is not '<route branch> <sha>' (ORCH-REGATE-GATE-ONLY-1)"
                         % regate_raw)
     elif regate is not None:
         pass  # [ORCH-REGATE-GATE-ONLY-1] gates only, no executor: the sizing floor is waived (report says so)
+    elif applying:
+        pass  # [ORCH-APPLY-PATCH-1] a saved patch, no executor: the sizing floor is waived (report says so)
     elif line and estimate is None:
         # [ORCH-PREFIRE-RUNTIME-1] D2: declared, but no route timeout can be read off it. A micro-fire
         # trigger waives the floor, not the timeout.
@@ -1491,6 +1975,9 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
         if regate is not None:
             detail = ("gates-only re-gate of %s %s: A2 sizing floor waived — no executor runs "
                       "(ORCH-REGATE-GATE-ONLY-1)" % regate)
+        elif apply_line(filepath) is not None:
+            detail = ("apply-patch %s: A2 sizing floor waived — no executor runs (ORCH-APPLY-PATCH-1)"
+                      % parse_apply(filepath)[0].name)
         elif est is not None:
             detail = "declared %dm (floor %dm)" % (est, SIZING_FLOOR_MIN)
         else:
@@ -1503,6 +1990,8 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
             print("  Depends-on: %s" % "; ".join(map(str, deps)))
         for line in opex:
             print("  %s" % line)
+        if apply_line(filepath) is not None:                            # [ORCH-APPLY-PATCH-1]
+            print("  APPLY ✅ %s" % apply_patch_summary(filepath))
         if dryrun_on():                                                 # [ORCH-PREFIRE-DRYRUN-GATE-1]
             print("  DRY ✅ %s" % dry_run_summary(filepath))
             reports, _ = verify_reports(filepath)

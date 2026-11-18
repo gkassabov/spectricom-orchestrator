@@ -7457,6 +7457,169 @@ def _regate_bring(proj: Path, branch_name: Optional[str], batch_file: Path, spec
     return None
 
 
+# ═══════════════════════════════════════════════════════
+# [ORCH-APPLY-PATCH-1] LAND THE VERIFIED PATCH; DO NOT BUILD IT AGAIN (SD-1 trial)
+# ═══════════════════════════════════════════════════════
+# George 2026-11-16 17:40 SD-1 "approved" (build each change once), conditions 17:52 "Yes". A queue file with
+# `## Apply patch: <path> <sha256>` builds no executor command: prefire.apply_patch_problems clears it (the sha256, no
+# never-autonomous path, every path in ALLOWED FILES, no ungranted change to a test, a verifier who is not the author
+# and wrote none of it), here as well as in prefire so --force cannot skip it; the route lane cuts its branch from
+# MERGE_TARGET, `git apply --index` lands that exact patch (no fuzz, no 3-way), the orchestrator writes the handback and
+# commits, and from there everything — gates, landing, cache store, notify — is the normal route's. The trial is
+# APPLY_TRIAL_CAP routes, counted as distinct (brief stem, patch sha256) pairs in state/apply-patch-trial.jsonl when a
+# patch is applied (r2, verifier M-3: a reused stem with a new patch is a new route); the cap is this file's constant,
+# so extending it is a route on George's go by name (OPX-3). A `## Re-gate of:` line beside it wins (SD-2's automatic
+# re-check of an applied route re-gates the branch as built; the patch is not applied again). r2: the brief's repo must
+# be the fire's (M-2); the bytes judged are the bytes applied, through stdin (m-6); only the patch, the handback and
+# the brief copy are staged, and nothing else lands (m-5).
+APPLY_VAR = "ORCH_APPLY_PATCH"             # `off` ⇒ an `## Apply patch:` file is refused, not fired
+APPLY_REFUSED = "APPLY-PATCH REFUSED"
+APPLY_TRIAL_CAP = 5                        # SD-1: "the next five small changes off protected areas"
+APPLY_TRIAL_LEDGER = "apply-patch-trial.jsonl"   # under ORCH_DIR / "state"
+APPLY: Optional["ApplySpec"] = None        # set by run_batch for the route it runs; read by _run_batch_inner
+
+
+@dataclass(frozen=True)
+class ApplySpec:
+    patch: Path        # the saved patch named by `## Apply patch:`
+    sha: str           # its sha256, as named and as read
+    files: tuple       # ((path, kind), …) — prefire.patch_files
+    author: str        # `## Patch author:`
+    n: int             # this route's number in the trial
+
+
+def _apply_trial_routes() -> Optional[list]:
+    """The (brief stem, patch sha256) pairs the trial has applied, in order, once each; None when the ledger cannot be
+    read (fail closed)."""
+    ledger = ORCH_DIR / "state" / APPLY_TRIAL_LEDGER
+    if not ledger.exists():
+        return []
+    try:
+        routes: list = []
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                pair = (row["stem"], str(row.get("sha256", "")).lower())
+                if pair not in routes:
+                    routes.append(pair)
+        return routes
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _applypatch_check(batch_file: Path) -> tuple:
+    """(None, None) — not an apply-patch brief; (ApplySpec, None) — cleared; (None, why) — refused, typed. Read-only."""
+    raw = prefire.apply_line(batch_file)
+    if raw is None:
+        return None, None
+    if os.environ.get(APPLY_VAR, "").strip().lower() == "off":
+        return None, f"{APPLY_VAR}=off — an `## Apply patch:` file is refused, not fired"
+    if IS_META_FIRE:
+        return None, ("the meta-fire lane does not land a saved patch in the SD-1 trial — its merge is the worktree "
+                      "branch's --ff-only")
+    named = parse_repo_from_brief(batch_file)          # r2 (M-2): protected paths are judged by the brief's repo
+    if named and named != ACTIVE_REPO_NAME:
+        return None, (f"the brief names repo {named} and this fire is for {ACTIVE_REPO_NAME} — its protected paths "
+                      f"would be judged against the wrong list")
+    parsed = prefire.parse_apply(batch_file)
+    try:
+        data = parsed[0].read_bytes() if parsed else None
+    except OSError:
+        data = None
+    problems = prefire.apply_patch_problems(batch_file, data, project=PROJECT_ROOT,
+                                            briefs_subdir=ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs"))
+    if problems:
+        return None, "; ".join(x[len(prefire.APPLY_PREFIX):] for x in problems[:3])
+    patch, sha = parsed
+    files, _ = prefire.patch_files(data.decode("utf-8", errors="replace"))
+    routes = _apply_trial_routes()
+    if routes is None:
+        return None, f"the trial ledger state/{APPLY_TRIAL_LEDGER} cannot be read — the cap cannot be judged (fails closed)"
+    if (batch_file.stem, sha) in routes:
+        n = routes.index((batch_file.stem, sha)) + 1   # a re-fire of the same patch is the same trial route
+    elif len(routes) >= APPLY_TRIAL_CAP:
+        return None, (f"the SD-1 trial has had its {APPLY_TRIAL_CAP} routes "
+                      f"({', '.join(f'{s}@{h[:7]}' for s, h in routes)}) — George extends it by name (APPLY_TRIAL_CAP)")
+    else:
+        n = len(routes) + 1
+    return ApplySpec(patch, sha, tuple(files), prefire.patch_author(batch_file), n), None
+
+
+def _applypatch_refused(batch_file: Path, why: str) -> Result:
+    log.error(f"⛔ {APPLY_REFUSED} — {batch_file.name}: {why}; nothing fired, nothing merged")
+    log.info(f"🏁 FINAL STATUS: {Status.FAILED.value} | gate: not run ({APPLY_REFUSED} — {why})")
+    now = datetime.now().isoformat()
+    return Result(batch_file=batch_file.name, status=Status.FAILED, started=now, finished=now, duration_s=0.0,
+                  exit_code=2, briefs=0, error=f"{APPLY_REFUSED} — {why}")
+
+
+def _applypatch_bring(proj: Path, branch_name: Optional[str], batch_file: Path, spec: ApplySpec) -> Optional[str]:
+    """On the route's freshly cut branch (from MERGE_TARGET): apply the patch exactly, write the handback, commit, and
+    count the route in the trial ledger. None ⇒ done; else the typed refusal, with the tree back at the branch base."""
+    if not branch_name:
+        return "no route branch was cut for the patch (this lane runs on the current branch)"
+    try:
+        data = spec.patch.read_bytes()
+    except OSError as e:
+        return f"the patch {spec.patch} cannot be read at the fire ({e.strerror or e})"
+    if hashlib.sha256(data).hexdigest() != spec.sha:
+        return f"the patch {spec.patch.name} changed after it was cleared — its sha256 is no longer {spec.sha[:12]}…"
+    base = _git_read("git rev-parse HEAD", proj)
+
+    def undo(why: str, hb_new: Optional[Path] = None) -> str:
+        subprocess.run(["git", "-C", str(proj), "reset", "-q", "--hard", base], capture_output=True)
+        if hb_new is not None:
+            hb_new.unlink(missing_ok=True)
+        return why
+    # r2 (m-6): the bytes hashed are the bytes applied — through stdin, never the path read a second time
+    r = subprocess.run(["git", "-C", str(proj), "apply", "--index", "--whitespace=nowarn", "-"],
+                       input=data, capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or b"").decode("utf-8", errors="replace").strip()[-200:]
+        return undo(f"{spec.patch.name} does not apply clean on {MERGE_TARGET}@{base[:7]} "
+                    f"({err}) — the author re-bases it and the verifier re-checks it")
+    want = {path for path, _ in spec.files}
+    briefs = ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
+    hb = proj / briefs / f"{batch_file.stem}.handback.md"
+    hb_new = None if hb.exists() else hb
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    with hb.open("a") as f:
+        if hb_new is not None:
+            f.write(f"## STATUS: DONE\n\n# {batch_file.stem} — handback (orchestrator)\n")
+        f.write(f"\n## Apply patch (orchestrator, no executor — ORCH-APPLY-PATCH-1, SD-1 trial route "
+                f"{spec.n}/{APPLY_TRIAL_CAP})\n\n"
+                f"- {datetime.now().isoformat(timespec='seconds')}: applied `{spec.patch}` sha256 `{spec.sha}` to "
+                f"`{branch_name}`, cut from {MERGE_TARGET} @ `{base[:12]}`, with `git apply --index` (no fuzz, no "
+                f"3-way). No executor ran; the code is the patch the author's dry run built and the verifier "
+                f"checked.\n- Patch author: {spec.author}\n"
+                f"- Files ({len(spec.files)}): " + ", ".join(f"`{p}` ({k})" for p, k in spec.files) + "\n")
+    # r2 (m-5): stage the handback and the brief copy by name — never `git add -A` — then check what is staged is
+    # exactly the cleared paths plus those two: a stray file in the checkout is not swept into the landing.
+    extras = {f"{briefs}/{batch_file.stem}.handback.md", f"{briefs}/{batch_file.name}"}
+    subprocess.run(["git", "-C", str(proj), "add", "--", *[e for e in sorted(extras) if (proj / e).exists()]],
+                   capture_output=True)
+    staged = set(_git_read("git diff --cached --name-only --no-renames", proj).split())
+    if staged - extras != want - extras or want & extras:      # r3 (n-4): the judge refuses a carried handback first
+        return undo(f"the applied paths are not the cleared ones (applied {sorted(staged - extras - want) or '-'}, "
+                    f"missing {sorted(want - staged) or '-'}, carried {sorted(want & extras) or '-'})", hb_new)
+    c = subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m",
+                        f"apply-patch: {batch_file.stem} — {spec.patch.name} sha256 {spec.sha[:12]} "
+                        f"(ORCH-APPLY-PATCH-1, SD-1 trial {spec.n}/{APPLY_TRIAL_CAP})"], capture_output=True, text=True)
+    if c.returncode != 0:
+        return undo(f"the applied patch could not be committed: {(c.stderr or c.stdout).strip()[-200:]}", hb_new)
+    try:
+        ledger = ORCH_DIR / "state" / APPLY_TRIAL_LEDGER
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        with ledger.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"stem": batch_file.stem, "patch": str(spec.patch), "sha256": spec.sha,
+                                "repo": ACTIVE_REPO_NAME, "branch": branch_name, "base": base,
+                                "at": datetime.now().isoformat(timespec="seconds")}) + "\n")
+    except OSError as e:
+        return undo(f"the trial ledger could not be written ({e.strerror or e}) — the cap cannot be kept (fails "
+                    f"closed)")
+    return None
+
+
 def _executor_auth_check(batch_file: Path) -> Optional[Result]:
     """[ORCH-EXECUTOR-AUTH-PROBE-1] G-C3: one `🛡 executor-auth:` line per fire. None ⇒ fire; a Result ⇒ refused before
     any branch or worktree is cut (exit 2, Status.FAILED, no gate — a prefire refusal's shape, never FAIL(product)).
@@ -7499,9 +7662,22 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
     REGATE, why = _regate_check(batch_file)
     if why:
         return _regate_refused(batch_file, why)
+    # [ORCH-APPLY-PATCH-1] an `## Apply patch:` file: cleared here (no executor) or refused, before anything is cut
+    global APPLY
+    APPLY = None
+    if REGATE is None:
+        APPLY, why = _applypatch_check(batch_file)
+        if why:
+            return _applypatch_refused(batch_file, why)
     if REGATE is not None:
         log.info(f"🔁 Re-gate (gates only): {REGATE.branch}@{REGATE.sha[:7]} — prior verdict {REGATE.prior}; no "
                  f"executor runs ({REGATE_VAR}=off refuses such a file)")
+        if prefire.apply_line(batch_file) is not None:
+            log.info("🩹 the `## Apply patch:` line is not applied again — the re-gate brings the route branch as built")
+    elif APPLY is not None:
+        log.info(f"🩹 Apply patch (no executor): {APPLY.patch.name} sha256 {APPLY.sha[:12]} — {len(APPLY.files)} "
+                 f"file(s); SD-1 trial route {APPLY.n}/{APPLY_TRIAL_CAP}; author {APPLY.author} ({APPLY_VAR}=off "
+                 f"refuses such a file)")
     else:
         # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C3: the executor's login, before any branch or worktree is cut
         refused = _executor_auth_check(batch_file)
@@ -7579,6 +7755,7 @@ def run_batch(batch_file: Path, worktree: Optional[Path]=None) -> Result:
                                   **({"route_wt": route_wt} if route_wt is not None else {}))
     finally:
         REGATE = None   # [ORCH-REGATE-GATE-ONLY-1] this route's only: never seen by the next one
+        APPLY = None    # [ORCH-APPLY-PATCH-1] likewise
         clear_running()
         # [ORCH-4]: release THIS repo's lock. Another repo's concurrent fire keeps its own.
         _clear_running_marker(ACTIVE_REPO_NAME)
@@ -7621,6 +7798,9 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # [ORCH-CONTROL-SCOPE-1] C4: `route_wt` is set when proj IS a route worktree (run_batch made it). The
     # route lane runs unchanged in it — branch cut, executor, commit, gate — except that it never checks
     # out MERGE_TARGET, and the merge is _land_from_route_worktree.
+    if APPLY is not None and worktree is not None:   # [ORCH-APPLY-PATCH-1] r2 (m-9): never the executor's lane
+        return _applypatch_refused(batch_file, "an apply-patch route runs only in the route lane (a worktree was "
+                                               "handed in) — nothing fired")
     briefs_subdir = ACTIVE_REPO_CONFIG.get("briefs_subdir", "briefs")
     target = proj / briefs_subdir / batch_file.name
     if not batch_file.is_relative_to(proj):
@@ -7687,8 +7867,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # name, its SHA, and the repo's HEAD ref — at the moment control passes to the executor.
     # Meta-fire lane excluded on purpose: S5 is report-only for this route.
     regate = REGATE if worktree is None else None   # [ORCH-REGATE-GATE-ONLY-1]
-    if regate is not None:
-        why = _regate_bring(proj, branch_name, batch_file, regate)
+    applied = APPLY if worktree is None and regate is None else None   # [ORCH-APPLY-PATCH-1]
+    if regate is not None or applied is not None:
+        why = (_regate_bring(proj, branch_name, batch_file, regate) if regate is not None
+               else _applypatch_bring(proj, branch_name, batch_file, applied))
         if why:
             _leave_route_branch(proj, route_wt, detach=True)
             if branch_name:
@@ -7696,7 +7878,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
             if not batch_file.is_relative_to(proj) and not _git_read(f"git ls-files -- {shlex.quote(str(target))}",
                                                                      proj):
                 target.unlink(missing_ok=True)   # the copy this run made; nothing of the re-gate stays behind
-            return _regate_refused(batch_file, why)
+            return _regate_refused(batch_file, why) if regate is not None else _applypatch_refused(batch_file, why)
         handoff, ec, out_log = None, 0, ""     # no executor was handed anything
     else:
         if target.resolve() != batch_file.resolve():   # [ORCH-RELIABILITY-1] F2.1: the route's copy, never the queue's
@@ -7742,7 +7924,7 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     # [ORCH-TIMEOUT-HOLD-1] a non-zero exit is held on the exit code alone: the closing words of an
     # executor that was killed, or that failed, are not asked (the guard is not engaged).
     hold = None
-    if tamper is None and status == Status.PASSED and regate is None:   # a re-gate has no executor to judge
+    if tamper is None and status == Status.PASSED and regate is None and applied is None:   # no executor to judge
         hold = (_executor_exit_hold(ec, branch_name or f"{BRANCH_PREFIX}-{batch_file.stem}", out_log)
                 or _handback_hold(out_log))
     # [ORCH-HANDBACK-STOP-STATUS-1] G-2: the handback FILE's first status line, read once here; acted on only
@@ -7791,8 +7973,9 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     elif branch_name and worktree is None:
         try:
             if status == Status.PASSED:
-                # Commit all changes on feature branch
-                subprocess.run("git add -A", shell=True, cwd=str(proj), capture_output=True)
+                # Commit all changes on feature branch — not on an applied route: its one commit is made
+                if applied is None:   # [ORCH-APPLY-PATCH-1] r2 (m-5): nothing beyond the patch is swept in
+                    subprocess.run("git add -A", shell=True, cwd=str(proj), capture_output=True)
 
                 diff_check = subprocess.run(
                     "git diff --cached --quiet",
