@@ -520,11 +520,11 @@ class TestL10GuardsByRisk:
         monkeypatch.setattr(orchestrator, "ACTIVE_REPO_CONFIG", CLINICAL)
         listed = {orchestrator._norm_test_path(f) for f in CLINICAL["unit_always_files"]}
         kept = set(REVIEW_NAMED) | set(VERIFIER_ADDED)
-        assert len(listed) == 93 and kept <= listed
+        assert len(listed) == 98 and kept <= listed   # 93 + 716 OPEN (k)
         nightly, _ = orchestrator._unit_always_nightly_only(listed)
         assert not (nightly & kept), sorted(nightly & kept)
         assert len(nightly) == 3 and all(CLINICAL["unit_always_slow_s"][f] > 3.0 for f in nightly)
-        assert len(listed - nightly) == 90
+        assert len(listed - nightly) == 95   # 90 + 716 OPEN (k)
 
 
 # ═══════════════════════════════════════════════════════

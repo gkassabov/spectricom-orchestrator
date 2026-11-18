@@ -124,10 +124,13 @@ repos:
     # non-risk ones run nightly. A guard not in unit_always_slow_s counts as fast. Candidates:
     # git -C ~/spectricom-clinical-mp grep -l -E "readdirSync|scanTree|globSync|fast-glob|ls-files" main --
     # '*.test.ts' '*.test.tsx' ':!sit/integration' (93 at e7a99957).
+    # 716 OPEN (k) (S7-CORE-56, 2026-11-18): + O engine purity / ships-empty scans and the 3-runtime golden vectors (5 files).
     unit_always_files:
       - "scripts/__tests__/backfill-unsigned-note-tag.test.ts"
       - "scripts/__tests__/curation-boundary.test.ts"
       - "scripts/__tests__/curation-cli.test.ts"
+      - "scripts/observability-ci/__tests__/empty-default.test.ts"
+      - "scripts/observability-ci/__tests__/purity-scan.test.ts"
       - "server/__tests__/respond.test.ts"
       - "server/__tests__/small-fixes-19-link-owner.test.ts"
       - "src/__tests__/no-clinical-literals.test.ts"
@@ -198,6 +201,9 @@ repos:
       - "src/lib/llm/__tests__/no-paid-in-dev.test.ts"
       - "src/lib/llm/prompts.renal-caution.test.ts"
       - "src/lib/narration/__tests__/narration-source-scan.test.ts"
+      - "src/lib/observability/conformance/__tests__/jsdom.test.ts"
+      - "src/lib/observability/conformance/__tests__/main.test.ts"
+      - "src/lib/observability/conformance/__tests__/worker.test.ts"
       - "src/lib/portal/__tests__/member-portal-truth-1.test.ts"
       - "src/lib/portal/__tests__/member-voided-readers-guard.test.ts"
       - "src/lib/practice-config/__tests__/flagRegistry.test.ts"
@@ -235,6 +241,7 @@ repos:
       "src/lib/copilot/replay/__tests__/copilot-replay.test.ts": 9.3
       "src/components/encounter-compose/layouts/__tests__/ai-draft-ux-1.test.tsx": 9.4
       "src/lib/clinical/__tests__/clinician-reasons.test.ts": 11.1
+      "src/lib/observability/conformance/__tests__/jsdom.test.ts": 3.3
       "src/lib/clinical/time-dimension/date-semantics-invariants.test.ts": 20.1
     # TC-6 risk classes (a pattern with no `/` matches the file name anywhere; `dir/**` everything under dir):
     # release, clinical, tasks (safety), LLM, copilot, crisis, agentic-ops, the server, member guards, allow-lists,
@@ -248,6 +255,8 @@ repos:
       - "src/lib/copilot/**"
       - "src/lib/crisis/**"
       - "src/lib/agentic-ops/**"
+      - "src/lib/observability/conformance/**"                    # 716 OPEN (k): determinism vectors
+      - "scripts/observability-ci/**"                             # 716 OPEN (k): engine purity / ships-empty
       - "server/**"
       - "**/*member*guard*"
       - "**/*allowlist*"
