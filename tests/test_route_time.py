@@ -53,7 +53,7 @@ NPM_FROZEN = ROOT / "executor" / "hooks" / "npm_frozen.py"
 TYPECHECK = ("Compile once: run the repo's typecheck (if it has one: npx tsc --noEmit, plus -p server where the "
              "repo has one) one time after your last code change, and again only to confirm a fix to an error it "
              "reported; never run npm run build (the gate builds). Run only the test files you added or changed, "
-             "by path; never a suite or a related set (the gate runs those).")   # [ORCH-LEAN-GATE-1] G-1
+             "by path; never a suite or a related set (the gate runs those). Never put a cd in a command: the shell already starts at the repo root, and the npm-frozen guard refuses any npx/npm command that contains a cd (G-ORCH-1, George 2026-11-18).")   # [ORCH-LEAN-GATE-1] G-1
 PREFLIGHT_DENY = "Edit(~/spectricom-orchestrator/state/preflight/**)"
 # [698t] the deny list every settings file held before 698 (7b6cc99, all six identical), frozen here so P-9 never
 # reads `main`: true on 698's branch only, it failed every later orchestrator route's build gate (705, 13:16).

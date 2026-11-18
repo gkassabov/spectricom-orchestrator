@@ -57,7 +57,7 @@ PREFLIGHT = (" Before you write the handback's final status, run `python3 ~/spec
 TYPECHECK = ("Compile once: run the repo's typecheck (if it has one: npx tsc --noEmit, plus -p server where the "
              "repo has one) one time after your last code change, and again only to confirm a fix to an error it "
              "reported; never run npm run build (the gate builds). Run only the test files you added or changed, "
-             "by path; never a suite or a related set (the gate runs those).")   # [ORCH-LEAN-GATE-1] G-1
+             "by path; never a suite or a related set (the gate runs those). Never put a cd in a command: the shell already starts at the repo root, and the npm-frozen guard refuses any npx/npm command that contains a cd (G-ORCH-1, George 2026-11-18).")   # [ORCH-LEAN-GATE-1] G-1
 
 
 def head_cmd(project, brief_rel, model, effort, repo="clinical-mp") -> str:
