@@ -126,9 +126,11 @@ def test_P4_control_the_lists_are_exactly_base_plus_the_o_globs():
     data = json.loads(prefire.OPEX_PATHS.read_text(encoding="utf-8"))
     assert data["agent_runtime"]["clinical-mp"] == AR_BASE + AR_NEW
     assert data["protected"]["clinical-mp"] == PR_BASE + PR_NEW
-    assert data["agent_runtime"]["orchestrator"] == ["orchestrator.py", "executor/**"]
+    assert data["agent_runtime"]["orchestrator"] == ["orchestrator.py", "executor/**",
+                                                    "queue_daemon.py"]   # G-621-1 (Kanban 621)
     assert data["protected"]["orchestrator"] == ["executor/**", "orchestrator.py", "prefire.py",
-                                                 "prefire_opex_paths.json", "queue_daemon.py", "admission.py"]
+                                                 "prefire_opex_paths.json", "queue_daemon.py", "admission.py",
+                                                 "canon_assert.py", "config/**"]   # G-621-1
     assert len(data["protected"]["*"]) == 16 and data["protected"]["*"][0] == "*.env*"
     assert data["_about"].startswith("[ORCH-OPEX-PREFIRE-1] D-S7CORE33-20 (Codex v2-57). The paths prefire")
 

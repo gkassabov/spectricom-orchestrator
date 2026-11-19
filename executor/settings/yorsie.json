@@ -29,6 +29,17 @@
       "Edit(//**/.github/workflows/**)",
       "Edit(//**/.husky/**)",
       "Edit(//**/.vscode/tasks.json)",
+      "Edit(~/spectricom-orchestrator/KILL)",
+      "Edit(~/spectricom-orchestrator/queue/**)",
+      "Edit(~/spectricom-orchestrator/logs/**)",
+      "Edit(~/spectricom-orchestrator/state/**)",
+      "Edit(~/spectricom-orchestrator/executor/**)",
+      "Edit(~/spectricom-orchestrator/config/**)",
+      "Edit(~/spectricom-orchestrator/prefire_opex_paths.json)",
+      "Edit(~/spectricom-orchestrator/rate-caps.json)",
+      "Edit(~/spectricom-orchestrator/rate-limits.json)",
+      "Edit(~/spectricom-orchestrator/queue-state.json)",
+      "Edit(~/spectricom-orchestrator/running*.json)",
       "Edit(~/spectricom-orchestrator/state/preflight/**)"
     ]
   },
@@ -58,6 +69,17 @@
           {
             "type": "command",
             "command": "f=\"${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/long_wait.py\"; { [ -r \"$f\" ] && command -v python3 >/dev/null; } || { echo \"🛡 long wait: the hook could not run (no $f or no python3) — the Bash call is denied (fails closed). Stop and say so in the handback.\" >&2; exit 2; }; python3 \"$f\" || exit 2"
+          }
+        ]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/config_change.sh\"; [ -r \"$f\" ] || { echo \"🛡 config change: the hook could not run (no $f) — the change is blocked (fails closed).\" >&2; exit 2; }; bash \"$f\" || exit 2"
           }
         ]
       }

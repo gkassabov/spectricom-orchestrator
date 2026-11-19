@@ -588,13 +588,19 @@ class TestP8Prompt:
 # ═══════════════════════════════════════════════════════
 # P-9 (RED) · the state/preflight/ Edit deny
 # ═══════════════════════════════════════════════════════
+CONTROL_PLANE_DENY_621 = [f"Edit(~/spectricom-orchestrator/{p})" for p in (   # ORCH-GUARD-HARDEN-1
+    "KILL", "queue/**", "logs/**", "state/**", "executor/**", "config/**", "prefire_opex_paths.json",
+    "rate-caps.json", "rate-limits.json", "queue-state.json", "running*.json")]
+
+
 class TestP9Deny:
 
     @pytest.mark.parametrize("repo", REPOS)
     def test_every_settings_file_denies_edits_to_the_record(self, repo):
         deny = json.loads((SETTINGS / f"{repo}.json").read_text())["permissions"]["deny"]
         assert deny.count(PREFLIGHT_DENY) == 1 and deny[-1] == PREFLIGHT_DENY
-        assert deny[:-1] == PRE_698_DENY, "every pre-existing entry unchanged and in order"
+        # G-621-1 (Kanban 621): the control-plane denies sit between the pre-698 list and the preflight entry
+        assert deny[:-1] == PRE_698_DENY + CONTROL_PLANE_DENY_621, "every pre-existing entry unchanged and in order"
         import re
         assert re.fullmatch(r"(Read|Edit)\((~/|//|\*\*/)[^()\s]+\)", PREFLIGHT_DENY)
 

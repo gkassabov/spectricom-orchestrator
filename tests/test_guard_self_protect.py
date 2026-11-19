@@ -90,9 +90,11 @@ def test_PA5_control_what_the_new_globs_do_match(path, glob):
 
 def test_PA5_control_the_lists_are_exactly_the_target_and_valid_json():
     data = json.loads(prefire.OPEX_PATHS.read_text(encoding="utf-8"))
-    assert data["protected"]["orchestrator"] == ["executor/**", "orchestrator.py"] + GUARDS
+    assert data["protected"]["orchestrator"] == ["executor/**", "orchestrator.py"] + GUARDS + [
+        "canon_assert.py", "config/**"]   # G-621-1 (Kanban 621)
     assert data["agent_runtime"]["clinical-mp"][4:6] == ["server/simulation/**", "src/lib/agentic-ops/**"]
-    assert data["agent_runtime"]["orchestrator"] == ["orchestrator.py", "executor/**"]
+    assert data["agent_runtime"]["orchestrator"] == ["orchestrator.py", "executor/**",
+                                                    "queue_daemon.py"]   # G-621-1 (Kanban 621)
     assert data["protected"]["_orchestrator"].endswith(
         "prefire.py, prefire_opex_paths.json, queue_daemon.py and admission.py are the guards and the fire loop: a "
         "brief changes them only on George's go (OC-4, D-S7CORE51-20).")

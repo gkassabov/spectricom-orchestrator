@@ -17,10 +17,12 @@
     ],
     "orchestrator": [
       "orchestrator.py",
-      "executor/**"
+      "executor/**",
+      "queue_daemon.py"
     ],
     "_clinical-mp": "server/observability/** and the four scripts/observability/ entry points are the code an O identity runs on (AP-OBS-ENGINE; AC-OPS27-06 (i)). scripts/observability-ci/, scripts/obs-emit/ and server/__tests__/obs-emit/ are not: no O identity runs them.",
-    "_orchestrator": "orchestrator.py is the whole file: the fire path (fire_toni) cannot be told apart from the rest of it by file name."
+    "_orchestrator": "orchestrator.py is the whole file: the fire path (fire_toni) cannot be told apart from the rest of it by file name.",
+    "_orchestrator_621": "queue_daemon.py is the fire loop: it starts every executor fire, so it is agent-runtime code (ORCH-GUARD-HARDEN-1, Kanban 621)."
   },
   "protected": {
     "_about": "A14 (OPX-3): never-autonomous paths. A brief naming one carries a George go (`## George go:` line, or a `## Briefs:` / `## Spec reference:` line matching George[^\\n]{0,80}\\b(go|GO|agreed|Agree)\\b).",
@@ -73,8 +75,11 @@
       "prefire.py",
       "prefire_opex_paths.json",
       "queue_daemon.py",
-      "admission.py"
+      "admission.py",
+      "canon_assert.py",
+      "config/**"
     ],
-    "_orchestrator": "orchestrator.py holds the merge code (merge_branch, run_batch's merge). prefire.py, prefire_opex_paths.json, queue_daemon.py and admission.py are the guards and the fire loop: a brief changes them only on George's go (OC-4, D-S7CORE51-20)."
+    "_orchestrator": "orchestrator.py holds the merge code (merge_branch, run_batch's merge). prefire.py, prefire_opex_paths.json, queue_daemon.py and admission.py are the guards and the fire loop: a brief changes them only on George's go (OC-4, D-S7CORE51-20).",
+    "_orchestrator_621": "canon_assert.py checks canon before a fire, and config/** holds the repo, gate and handback-guard configuration every fire runs under: a brief changes them only on George's go (ORCH-GUARD-HARDEN-1, Kanban 621)."
   }
 }
