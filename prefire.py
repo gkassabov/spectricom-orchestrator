@@ -804,6 +804,11 @@ def parse_test_scope(filepath: Path) -> tuple[Optional[str], str]:
         return "targeted", line
     if _TEST_SCOPE_FULL.fullmatch(text):
         return "full", line
+    # [ORCH-QUEUE-LOOSEN-1] (4) D-S7CORE58: any other `targeted…` line is read as targeted with a warning — unless it
+    # names a full suite on the same line (A10's patterns), which stays a refusal. 11-20: 791 / 792's
+    # "targeted (one file)" refused the brief and paused the queue for a label.
+    if text.lower().startswith("targeted") and not any(p.search(text) for p in _A10_SUITES):
+        return "targeted", "%s — ⚠️ A9 read as `targeted (D-S7CORE30-05)`; write that exact text" % line
     return None, "'%s' is neither that nor `full — <D-S7COREnn-nn>`" % line
 
 

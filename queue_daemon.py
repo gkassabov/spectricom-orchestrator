@@ -400,7 +400,9 @@ def depends_on_line(waiting, held) -> str:
 #                              brief with a `## Re-gate of: <route branch> <tip>` line (ORCH-REGATE-GATE-ONLY-1). A red
 #                              re-check, a meta-fire repo (it cannot re-gate) or a tip that cannot be read pauses.
 #   … already-red-on-main    → pauses everything (main is red; ORCH-LEAN-GATE-1 T-12's signal).
-#   anything else            → pauses everything, as before (no record, tampered, incomplete, conflict, prefire refusal).
+#   a prefire refusal        → [ORCH-QUEUE-LOOSEN-1] (1) nothing ran: the brief is SET ASIDE in queue/held/prefire/ with
+#                              `<stem>.reason`; the queue keeps firing (D-S7CORE58, George 2026-11-20 15:33 "yes all").
+#   anything else            → pauses everything, as before (no record, tampered, incomplete, conflict).
 # ORCH_PARK_RED=off ⇒ every red pauses, as before; stop_on_failure=false ⇒ no red pauses, as before.
 PARK_ENV = "ORCH_PARK_RED"
 RECHECK_SUFFIX = "-recheck"
@@ -409,6 +411,8 @@ OUTCOME_PRODUCT = "FAIL(product)"
 OUTCOME_ENV = "BLOCKED(environment)"
 ALREADY_RED_SIGNAL = "already-red-on-main"   # orchestrator.ALREADY_RED_SIGNAL (pinned equal by the test)
 RED_PRODUCT, RED_ENV, RED_ON_MAIN, RED_OTHER = "product", "environment", "red-on-main", "other"
+RED_PREFIRE = "prefire"                  # [ORCH-QUEUE-LOOSEN-1] (1) refused by HOOK-1 before anything was cut
+PREFIRE_REFUSED = "pre-fire assertions failed"   # orchestrator.run_batch's error for a HOOK-1 refusal (pinned by the test)
 SAFETY_TIER = re.compile(r"0{7}(?!0)")     # a SAFETY-tier brief: exactly 7 leading zeros (D-S7CORE54-74)
 KILLED_LEG = re.compile(r"\bexit -\d+")    # a leg killed (signal, timeout), not an assertion that failed
 
@@ -420,6 +424,11 @@ def park_off() -> bool:
 def parked_dir() -> Path:
     """queue/held/parked/, resolved per call (QUEUE_DIR is patched in tests)."""
     return QUEUE_DIR / "held" / "parked"
+
+
+def prefire_held_dir() -> Path:
+    """[ORCH-QUEUE-LOOSEN-1] (1) queue/held/prefire/: briefs HOOK-1 refused at fire, resolved per call."""
+    return QUEUE_DIR / "held" / "prefire"
 
 
 def parked_briefs() -> list:
@@ -456,6 +465,8 @@ def red_kind(record: Optional[dict]) -> str:
     status, gate, error = record.get("status"), record.get("gate_outcome"), str(record.get("error") or "")
     if status == "failed" and gate == OUTCOME_PRODUCT:
         return RED_OTHER if KILLED_LEG.search(error) else RED_PRODUCT    # m-6: a killed leg stops, never parks
+    if status == "failed" and not gate and error.startswith(PREFIRE_REFUSED):
+        return RED_PREFIRE                                               # ORCH-QUEUE-LOOSEN-1 (1): nothing was cut
     if status == "blocked" and gate == OUTCOME_ENV:
         return RED_ON_MAIN if ALREADY_RED_SIGNAL in error else RED_ENV
     return RED_OTHER
@@ -1520,6 +1531,8 @@ class QueueDaemon:
             _safe_move(brief, QUEUE_FAILED / name)
             print(f"[QUEUE] ⛔ the automatic re-check {name} is red too ({kind}) — the queue stops")
             return f"recheck-red:{name}"
+        if kind == RED_PREFIRE:
+            return self._set_aside_prefire(brief, name, stop_all)
         if kind == RED_PRODUCT:
             if SAFETY_TIER.match(name):            # SAFETY tier, 7 zeros (D-S7CORE54-74) — verifier M-1
                 _safe_move(brief, QUEUE_FAILED / name)
@@ -1546,6 +1559,24 @@ class QueueDaemon:
                 return None
             print(f"[QUEUE] {name}: BLOCKED(environment), no automatic re-check — {why}; the queue stops")
         return stop_all
+
+    def _set_aside_prefire(self, brief: Path, name: str, stop_all: str) -> Optional[str]:
+        """[ORCH-QUEUE-LOOSEN-1] (1) HOOK-1 refused the brief at fire — no branch, no worktree, no gate: nothing to
+        judge and nothing another brief could depend on having landed. Set it aside in queue/held/prefire/ with its
+        reason and keep firing (11-20: 791's stale brief paused the whole queue ~30 min). Fails closed: a brief that
+        cannot be moved pauses, as before. Fix the brief and re-enqueue it (enqueue re-runs prefire)."""
+        tray = prefire_held_dir()
+        if not _safe_move(brief, tray / name):
+            print(f"[QUEUE] {name}: pre-fire refused and it could not be set aside in {tray} — the queue stops")
+            return stop_all
+        try:
+            (tray / f"{Path(name).stem}.reason").write_text(
+                f"{datetime.now().isoformat()} {name}: pre-fire assertions refused it at fire (HOOK-1) — fix the brief, "
+                f"then `python3 queue_daemon.py enqueue <fixed brief>`\n", encoding="utf-8")
+        except OSError as e:
+            print(f"[QUEUE] could not write {Path(name).stem}.reason in {tray}: {e}")
+        print(f"[QUEUE] ⏭ {name}: pre-fire refused — SET ASIDE in {tray}/ (nothing was cut); the queue keeps firing")
+        return None
 
     def _hold_depends_on(self, brief: Path, unmet: list):
         """D4: park a brief whose unmet dependency the queue cannot merge in queue/held/depends-on/, its reason in
@@ -1605,7 +1636,11 @@ class QueueDaemon:
           · it applies only while the daemon's paused_reason (None when not paused) equals the one it
             was issued under — or, when it names one (`--reason`), the one it names;
           · a stop-on-failure pause is lifted only by a request issued after that pause began;
-          · a request with no issued state (from a CLI that predates this) cannot be judged: expired."""
+          · a request with no issued state (from a CLI that predates this) cannot be judged: expired.
+        [ORCH-QUEUE-LOOSEN-1] (2) a `--reason` with whitespace in it is free text (a note: who said go, and why), not a
+        pause reason — the daemon writes none with a space it would be asked to match (`operator`, `kind:detail`). It
+        lifts whatever pause holds, provided it was issued after that pause began (the L-45 rule, kept) and the pause
+        is not one only George lifts by name (safety-red:, executor-auth:). 11-20: "George go … go resume" expired."""
         now = self.paused_reason if self.status == "paused" else None
         named = req.get("reason")
         if "issued_status" not in req:
@@ -1615,6 +1650,13 @@ class QueueDaemon:
             issued = (f"{req.get('issued_status')}" + (f" ({ipr})" if ipr else "") + (f" on {batch}" if batch else "")
                       + (f" (--reason {named})" if named else ""))
             ok = (named if named else ipr) == now
+            if (not ok and named and now and any(c.isspace() for c in named)
+                    and not now.startswith(("safety-red:", "executor-auth:"))):
+                try:
+                    ok = datetime.fromisoformat(str(req.get("requested_at"))) >= datetime.fromisoformat(str(self.paused_at))
+                except ValueError:
+                    ok = False
+                issued += "" if ok else " before that pause began"
         if ok and now and now.startswith("stop-on-failure:"):
             try:
                 ok = datetime.fromisoformat(str(req.get("requested_at"))) >= datetime.fromisoformat(str(self.paused_at))

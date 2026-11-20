@@ -134,8 +134,8 @@ def test_P1_full_naming_a_george_decision_passes_a9(tmp_path, dash):
     "## Test scope: full — D-S7CORE30",
     "## Test scope: full — D-S7CORE30-99 because George said",
     "## Test scope: full — see D-S7CORE30-99",
-    "## Test scope: targeted",
-    "## Test scope: targeted (D-S7CORE30-04)",
+    # ORCH-QUEUE-LOOSEN-1 (794, D-S7CORE58): "targeted" and "targeted (D-S7CORE30-04)" are now read as targeted with a
+    # warning (tests/test_queue_loosen.py); a targeted line naming a full suite is still refused here.
     "## Test scope: targeted (D-S7CORE30-05) but run npm test",
     "## Test scope:",
 ])
