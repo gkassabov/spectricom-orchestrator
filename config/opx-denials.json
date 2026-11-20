@@ -1,0 +1,8 @@
+{
+  "_comment": "ORCH-OPX-DENIALS-1 (route 760; 622 slice 2 of 2; RM-OPS-24P-F-01). Read by executor/hooks/denial_log.py. burst.n and burst.window_s both set (n a positive integer, window_s positive seconds) ⇒ at least n permissions.deny denials within the last window_s seconds write KILL. Either null ⇒ off. Unset until George sets them (OPX-3, config/**).",
+  "version": 1,
+  "burst": {
+    "n": null,
+    "window_s": null
+  }
+}

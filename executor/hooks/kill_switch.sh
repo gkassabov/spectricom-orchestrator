@@ -13,8 +13,23 @@
 # State dir: $TONI_GUARDS_HOME, else $HOME/spectricom-orchestrator (queue_daemon.ORCH_DIR, where `kill` writes).
 # fire_toni drops TONI_GUARDS_HOME from the fire's env, so a real fire always reads the daemon's dir. It is set
 # only by the tests and the canary.
+#
+# [ORCH-OPX-DENIALS-1] (Kanban 760) Every denial is also logged, best effort, as one NDJSON line in
+# <state dir>/logs/opx/denials.ndjson (source "kill-hook"; read by scripts/opx5.py). The log line is written before
+# the denial is said; a log that cannot be written changes nothing — the call is denied all the same.
+
+log_denial() {
+    [ -n "${dir:-}" ] && [ -d "$dir" ] || return 0
+    local why
+    why=$(printf '%s' "$1" | tr -d '"\\' | tr '\n' ' ')
+    { mkdir -p "$dir/logs/opx" &&
+      printf '{"at":"%s","source":"kill-hook","reason":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$why" \
+        >> "$dir/logs/opx/denials.ndjson"; } 2>/dev/null || true
+    return 0
+}
 
 deny() {
+    log_denial "$1"
     echo "🛡 KILL switch: $1 — every tool call is denied (ORCH-TONI-GUARDS-1). Do not retry this or any other" \
          "tool. End your turn now and say that the orchestrator's kill switch stopped you." >&2
     exit 2

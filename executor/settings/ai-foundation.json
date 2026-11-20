@@ -83,6 +83,26 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/denial_log.py\"; [ -r \"$f\" ] && command -v python3 >/dev/null && python3 \"$f\"; exit 0"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"${TONI_GUARDS_HOME:-$HOME/spectricom-orchestrator}/executor/hooks/denial_log.py\"; [ -r \"$f\" ] && command -v python3 >/dev/null && python3 \"$f\"; exit 0"
+          }
+        ]
+      }
     ]
   }
 }
