@@ -579,10 +579,15 @@ class Status(str, Enum):
     # [ORCH-HANDBACK-STOP-STATUS-1] Ran clean and merged what `passed` would merge, but its own handback's
     # first STATUS line says STOP / PARTIAL. Only ever a demoted PASSED. See handback_status().
     STOPPED="stopped"
+    # [ORCH-MERGE-HOLD-1] (route 757, 621 slice 2) Neither `passed` nor `failed`: the gates were green, but the route's
+    # diff touches a path config/merge-hold.json lists, so it is held for a human merge — nothing merged, branch kept.
+    HELD="held"
 
 # [ORCH-HANDBACK-STOP-STATUS-1] G-5: the `run` / `queue` exit code of a STOPPED route (0-4 are taken).
 # queue_daemon.py mirrors it (pinned equal by tests/test_handback_stop_status.py).
 EXIT_STOPPED = 5
+# [ORCH-MERGE-HOLD-1] the exit code of a HELD route (0-5 are taken); queue_daemon.py mirrors it (tests/test_merge_hold.py).
+EXIT_HELD = 6
 
 @dataclass
 class Brief:
@@ -1374,7 +1379,7 @@ def _gate_status_label(gate_error: Optional[str], gate_outcome: Optional[str],
 
 def notify(result: Result):
     e = "✅" if result.status == Status.PASSED else ("🚧" if result.status == Status.BLOCKED else
-        ("🚨" if result.status == Status.TAMPERED else ("🛑" if result.status == Status.STOPPED else "❌")))
+        ("🚨" if result.status == Status.TAMPERED else ("🛑" if result.status == Status.STOPPED else ("⏸" if result.status == Status.HELD else "❌"))))
     status_label = "passed (no changes)" if result.no_changes and result.status == Status.PASSED else result.status.value
     msg = f"{e} {result.batch_file} — {status_label} | {result.briefs} briefs | {result.duration_s:.0f}s"
     if result.tampered:
@@ -1425,7 +1430,7 @@ def notify(result: Result):
 # ═══════════════════════════════════════════════════════
 def load_state() -> dict:
     if STATE_FILE.exists(): return json.loads(STATE_FILE.read_text())
-    return {"queue":[], "completed":[], "failed":[], "stopped":[], "watched":{}}
+    return {"queue":[], "completed":[], "failed":[], "stopped":[], "held":[], "watched":{}}
 def save_state(s):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(s, indent=2, default=str))
@@ -1736,6 +1741,76 @@ def _gate_parallel_branch(wt: Path, br: str) -> "GateVerdict":
 # Now the route runs, is gated and merges in <worktree_base>/<route>. The main checkout's branch is never
 # switched, and MERGE_TARGET moves there only by fast-forward, after a PASS.
 ROUTE_NOT_LANDED_VERDICT = "NOT LANDED"
+
+# ═══════════════════════════════════════════════════════
+# [ORCH-MERGE-HOLD-1] (route 757; 621 slice 2 of 2; RM-OPS-01-F-02 + RM-OPS-03-F-01; T-OPX-02; C-OPX02)
+# A GREEN ROUTE THAT TOUCHES THE SUPPLY CHAIN OR THE CONTROL PLANE IS HELD FOR A HUMAN MERGE
+# ═══════════════════════════════════════════════════════
+# A route whose diff against MERGE_TARGET touches a path config/merge-hold.json lists (lockfiles, dependency manifests,
+# .npmrc, workflows, .claude, .mcp.json, hooks — the list is data) is not merged even when every gate is green: the
+# branch is kept, a `MERGE HOLD:` line is appended to its tip's note, and the route ends HELD (EXIT_HELD) — the daemon
+# says so and fires the next brief, it does not pause. George or Gemma release it with
+# `queue_daemon.py release-hold <repo> <route branch> --by George|Gemma --reason "<why>"`, which appends a
+# `MERGE HOLD RELEASE:` line to the same note and queues a gates-only re-gate of that tip (ORCH-REGATE-GATE-ONLY-1);
+# the re-gate lands it through the normal landing — gates first, never a bare merge. A missing or invalid list holds
+# every green route (fail closed, as config/handback-guard.json does for the handback guard).
+MERGE_HOLD_FILE = ORCH_DIR / "config" / "merge-hold.json"
+MERGE_HOLD_VERDICT = "HELD FOR HUMAN MERGE"
+MERGE_HOLD_PREFIX = "MERGE HOLD:"
+MERGE_HOLD_RELEASE_PREFIX = "MERGE HOLD RELEASE:"
+
+
+def load_merge_hold(path: Optional[Path] = None) -> tuple:
+    """(the listed path patterns, None) or (None, why the list cannot be read). Strict: a JSON object whose `paths`
+    is a non-empty list of non-empty strings; anything else is unreadable (the caller holds every green route)."""
+    p = path if path is not None else MERGE_HOLD_FILE
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return None, f"{p.name} unreadable ({type(e).__name__})"
+    paths = data.get("paths") if isinstance(data, dict) else None
+    if not isinstance(paths, list) or not paths or not all(isinstance(x, str) and x.strip() for x in paths):
+        return None, f"{p.name} has no non-empty `paths` list of path patterns"
+    return [x.strip() for x in paths], None
+
+
+def merge_hold_paths(changed: list, patterns: list) -> list:
+    """The changed paths any listed pattern names (prefire.path_matches: a pattern with no '/' matches any one name in
+    the path; one with a '/' matches the path or a directory it sits under). Pure; sorted, each once."""
+    return sorted({c for c in changed if c and any(prefire.path_matches(c, pat) for pat in patterns)})
+
+
+def _merge_hold_released(proj: Path, branch: str) -> Optional[str]:
+    """The newest `MERGE HOLD RELEASE:` line on the route's held tip — the branch's own tip, or, in a gates-only
+    re-gate, the tip it re-gates (REGATE.sha); None when there is none."""
+    tips = [t for t in (REGATE.sha if REGATE is not None else None,
+                        _git_read(f"git rev-parse --verify -q {shlex.quote('refs/heads/' + branch)}", proj)) if t]
+    for tip in tips:
+        lines = _git_read(f"git notes show {tip}", proj).splitlines()
+        released = [l for l in lines if l.startswith(MERGE_HOLD_RELEASE_PREFIX)]
+        if released:
+            return released[-1]
+    return None
+
+
+def _merge_hold_verdict(proj: Path, branch: str) -> Optional[str]:
+    """None — the route may land; else the `MERGE HOLD:` line naming why it is held. Read-only. The diff is the
+    route's own against MERGE_TARGET (`git diff --name-only MERGE_TARGET...HEAD`, the branch checked out at `proj`).
+    A released hold (`_merge_hold_released`) lands; an unreadable list or diff holds (fail closed)."""
+    if _merge_hold_released(proj, branch) is not None:
+        return None
+    patterns, why = load_merge_hold()
+    if why:
+        return f"{MERGE_HOLD_PREFIX} {why} — every green route is held until it is fixed"
+    r = subprocess.run(f"git diff --name-only {MERGE_TARGET}...HEAD", shell=True, capture_output=True, text=True,
+                       cwd=str(proj))
+    if r.returncode != 0:
+        return f"{MERGE_HOLD_PREFIX} the route's diff against {MERGE_TARGET} could not be read — held (fail closed)"
+    held = merge_hold_paths(r.stdout.splitlines(), patterns)
+    if not held:
+        return None
+    shown = ", ".join(held[:8]) + (f" (+{len(held) - 8} more)" if len(held) > 8 else "")
+    return f"{MERGE_HOLD_PREFIX} {shown} — listed in config/merge-hold.json; a human merges it"
 
 
 def _create_route_worktree(batch_file: Path) -> tuple[Optional[Path], str]:
@@ -7412,6 +7487,14 @@ def _regate_check(batch_file: Path) -> tuple:
     over = [m for m in map(_REGATE_OVERRIDE_RE.match, note) if m]
     if over:
         outcome, prior = over[-1].group(1), f"{over[-1].group(0)[len('PRE-MERGE GATE OVERRIDE: '):]} (gate: {prior})"
+    # [ORCH-MERGE-HOLD-1] (757): a HELD tip (gates PASS, a `MERGE HOLD:` line) that George or Gemma released (a
+    # `MERGE HOLD RELEASE:` line, queue_daemon.py release-hold) is re-gated and, green again, lands; unreleased, refused.
+    if outcome == GateOutcome.PASS.value and any(l.startswith(MERGE_HOLD_PREFIX) for l in note):
+        released = [l for l in note if l.startswith(MERGE_HOLD_RELEASE_PREFIX)]
+        if not released:
+            return None, (f"{branch}@{tip[:7]} is {MERGE_HOLD_VERDICT} and not released — "
+                          f"queue_daemon.py release-hold first")
+        return RegateSpec(branch, tip, f"{prior} ({released[-1]})"), None
     if outcome != GateOutcome.BLOCKED_ENV.value:
         return None, f"the recorded gate verdict on {branch}@{tip[:7]} is {prior} — not BLOCKED(environment)"
     return RegateSpec(branch, tip, prior), None
@@ -8052,6 +8135,20 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                             f"Inspect: cd {proj} && git log --oneline {MERGE_TARGET}..{branch_name} "
                             f"&& git diff {MERGE_TARGET}...{branch_name}"
                         )
+                    elif (held := _merge_hold_verdict(proj, branch_name)) is not None:
+                        # [ORCH-MERGE-HOLD-1] (757): green, but the diff touches a listed path — held for a human
+                        # merge. The gate's own PASS and the hold are appended to the tip's note (never written over),
+                        # so a release can re-gate exactly this tip; nothing merged; the branch kept; no pause.
+                        for line in (f"PRE-MERGE GATE: {gate_outcome} — {verdict.label}", held):
+                            subprocess.run(["git", "notes", "append", "-m", line, "HEAD"], capture_output=True, cwd=str(proj))
+                        _leave_route_branch(proj, route_wt)
+                        status = Status.HELD
+                        gate_error = f"{MERGE_HOLD_VERDICT} — {held}"
+                        log.warning(
+                            f"⏸ {MERGE_HOLD_VERDICT} — gates {gate_outcome}, {MERGE_TARGET} NOT merged. Branch preserved: "
+                            f"{branch_name}. {held}. Release: python3 queue_daemon.py release-hold {ACTIVE_REPO_NAME} "
+                            f"{branch_name} --by George|Gemma --reason \"<why>\""
+                        )
                     elif route_wt is not None:
                         # [ORCH-CONTROL-SCOPE-1] C4: green gate only, merged FROM the route worktree.
                         route_tip = _git_read("git rev-parse HEAD", proj) or None
@@ -8228,14 +8325,19 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
 # ═══════════════════════════════════════════════════════
 def _record_result(state: dict, r: Result) -> None:
     """[ORCH-HANDBACK-STOP-STATUS-1] G-5: state.json's list for one result — completed / stopped / failed."""
-    key = {Status.PASSED: "completed", Status.STOPPED: "stopped"}.get(r.status, "failed")
+    key = {Status.PASSED: "completed", Status.STOPPED: "stopped", Status.HELD: "held"}.get(r.status, "failed")   # [ORCH-MERGE-HOLD-1]
     state.setdefault(key, []).append(asdict(r))
 
 
 def _exit_code_of(results: list) -> int:
-    """0 — every result passed; EXIT_STOPPED — every one passed or stopped, at least one stopped; else 1."""
+    """0 — every result passed; EXIT_STOPPED — every one passed or stopped, at least one stopped; EXIT_HELD — every one
+    passed, stopped or held, at least one held ([ORCH-MERGE-HOLD-1]: a hold outranks a stop — nothing of it merged);
+    else 1."""
     if all(r.status == Status.PASSED for r in results):
         return 0
+    if all(r.status in (Status.PASSED, Status.STOPPED, Status.HELD) for r in results) and any(
+            r.status == Status.HELD for r in results):
+        return EXIT_HELD
     if all(r.status in (Status.PASSED, Status.STOPPED) for r in results):
         return EXIT_STOPPED
     return 1

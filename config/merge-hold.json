@@ -1,0 +1,25 @@
+{
+  "_comment": "ORCH-MERGE-HOLD-1 (route 757; 621 slice 2 of 2; RM-OPS-01-F-02 + RM-OPS-03-F-01; T-OPX-02; C-OPX02). Read by orchestrator.load_merge_hold. A green route whose diff against its merge target touches a path one of these patterns names (prefire.path_matches: a pattern with no '/' matches any one name in the path; one with a '/' matches the path or a directory it sits under) is HELD for a human merge — branch kept, nothing merged, exit EXIT_HELD; released with `queue_daemon.py release-hold <repo> <route branch> --by George|Gemma --reason \"…\"`. The list is data: a new pattern is an edit here (OPX-3, config/**). A missing or invalid file holds every green route (fail closed).",
+  "version": 1,
+  "paths": [
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "requirements.txt",
+    "requirements-*.txt",
+    "pyproject.toml",
+    "poetry.lock",
+    "Pipfile",
+    "Pipfile.lock",
+    ".github/workflows/**",
+    ".claude/**",
+    ".mcp.json",
+    ".husky/**",
+    ".githooks/**"
+  ]
+}

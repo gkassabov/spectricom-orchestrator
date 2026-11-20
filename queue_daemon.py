@@ -62,6 +62,9 @@ REPOS_CONFIG = ORCH_DIR / "config" / "repos.yaml"
 # orchestrator.py; tests/test_handback_stop_status.py pins the two equal). Ran clean, merged as `passed` would,
 # but the handback's status line says STOP / PARTIAL.
 EXIT_STOPPED = 5
+# [ORCH-MERGE-HOLD-1] (route 757): orchestrator.py's EXIT_HELD, mirrored (pinned equal by tests/test_merge_hold.py) — a
+# green route held for a human merge: its brief goes to queue/held/merge-hold/, no pause, nothing merged.
+EXIT_HELD = 6
 
 # S7-CORE-16 [QUEUE-PAUSE-OPAQUE]. The CLI is another process: it cannot touch the daemon's memory, so
 # it leaves a request in the CONTROL FILE (state/queue-control.json, a monotonic `id`) and the daemon
@@ -87,7 +90,8 @@ START_PAUSED_REASON = "start:queue-non-empty"
 USAGE = ("Usage: python3 queue_daemon.py [--start-running] | enqueue <file> | status [--json] | pause | "
          "resume [--reset-consecutive] [--reason <paused_reason>] | config <key> <value> | check | check-logs "
          "| clear | kill [--reason \"<text>\"] | unkill --reason \"<text>\" | override <repo> <route branch> "
-         "--verdict <V> --by <approver> --reason \"<text>\"\n  With no command it runs the daemon "
+         "--verdict <V> --by <approver> --reason \"<text>\" | release-hold <repo> <route branch> --by <approver> "
+         "--reason \"<text>\"\n  With no command it runs the daemon "
          "loop: paused at start when work is queued; --start-running fires the queue at once.")
 
 # [ORCH-TONI-GUARDS-1] (S7-CORE-33) The kill switch.
@@ -436,7 +440,7 @@ def route_record(batch_name: str, started_at: str) -> Optional[dict]:
     data = _read_json(ORCH_DIR / ROUTE_STATE_NAME)
     since = str(started_at or "")[:19]
     best = None
-    for key in ("completed", "stopped", "failed"):
+    for key in ("completed", "stopped", "held", "failed"):
         for r in data.get(key) or []:
             if (isinstance(r, dict) and r.get("batch_file") == batch_name and str(r.get("started") or "")[:19] >= since
                     and (best is None or str(r.get("started")) > str(best.get("started")))):
@@ -519,6 +523,100 @@ def append_override(repo: str, branch: str, verdict: str, by: str, reason: str) 
     if res.returncode != 0:
         return 1, f"git notes append failed: {res.stderr.strip()[:200]}"
     return 0, f"{branch}@{tip[:7]}: {line}"
+
+
+# [ORCH-MERGE-HOLD-1] (route 757; 621 slice 2) A green route whose diff touches a path config/merge-hold.json lists ends
+# HELD (EXIT_HELD): its brief waits in queue/held/merge-hold/ with `<stem>.reason`, the branch kept, a `MERGE HOLD:` line
+# on its tip's note; the queue fires the next brief (no pause). `release-hold` — George or Gemma, with a reason — appends
+# `MERGE HOLD RELEASE:` to that note and queues `<stem>-release.md`, a gates-only re-gate of exactly that tip
+# (ORCH-REGATE-GATE-ONLY-1), fired next; green again, it lands through the normal landing. Nothing here merges.
+MERGE_HOLD_PREFIX = "MERGE HOLD:"                 # orchestrator.MERGE_HOLD_PREFIX (pinned equal by the test)
+MERGE_HOLD_RELEASE_PREFIX = "MERGE HOLD RELEASE:"  # orchestrator.MERGE_HOLD_RELEASE_PREFIX (pinned equal)
+RELEASE_SUFFIX = "-release"
+RELEASE_USAGE = 'release-hold <repo> <route branch> --by George|Gemma --reason "<why, 3+ words>"'
+
+
+def merge_hold_dir() -> Path:
+    """queue/held/merge-hold/, resolved per call (QUEUE_DIR is patched in tests)."""
+    return QUEUE_DIR / "held" / "merge-hold"
+
+
+def held_briefs() -> list:
+    """The briefs held for a human merge, each with its reason line — read off the disk."""
+    tray = merge_hold_dir()
+    out = []
+    for brief in sorted(tray.glob("*.md")) if tray.is_dir() else []:
+        try:
+            reason = (tray / f"{brief.stem}.reason").read_text(encoding="utf-8").strip()
+        except OSError:
+            reason = None
+        out.append({"file": brief.name, "reason": reason})
+    return out
+
+
+def release_line(by: str, reason: str, at: Optional[str] = None) -> tuple:
+    """(the note line, None) or (None, why it is refused) — the approver and reason rules of `override`."""
+    approver = OVERRIDE_APPROVERS.get(str(by or "").strip().lower())
+    if approver is None:
+        return None, f"--by must name a known approver ({' or '.join(OVERRIDE_APPROVERS.values())}), not {by!r}"
+    if len(re.findall(r"[A-Za-z0-9]\S*", str(reason or ""))) < 3:
+        return None, "--reason needs at least 3 words"
+    at = at or datetime.now().isoformat(timespec="seconds")
+    return f"{MERGE_HOLD_RELEASE_PREFIX} by {approver}: {' '.join(str(reason).split())} ({at})", None
+
+
+def release_hold(repo: str, branch: str, by: str, reason: str) -> tuple:
+    """(0, what was done) or (1, why refused). The branch tip must carry a `MERGE HOLD:` line and its brief must be in
+    queue/held/merge-hold/. Appends the release line (never overwrites), then writes `<stem>-release.md` — the brief with
+    `## Re-gate of: <branch> <tip>` — into queue/ and moves the held brief to queue/done/. Nothing is merged here."""
+    line, why = release_line(by, reason)
+    if why:
+        return 1, why
+    r = repo_route(repo)
+    if r is None:
+        return 1, f"repo {repo!r} is not in {REPOS_CONFIG}"
+    held = next((b for b in sorted(merge_hold_dir().glob("*.md")) if r.branch_for(b.name) == branch), None) \
+        if merge_hold_dir().is_dir() else None
+    if held is None:
+        return 1, f"no brief in {merge_hold_dir()} whose route branch is {branch}"
+    git = lambda *a: subprocess.run(["git", "-C", str(r.path), *a], capture_output=True, text=True)
+    tip = git("rev-parse", "--verify", "-q", f"refs/heads/{branch}").stdout.strip()
+    if not tip:
+        return 1, f"no branch {branch} in {r.path}"
+    if not any(l.startswith(MERGE_HOLD_PREFIX) for l in git("notes", "show", tip).stdout.splitlines()):
+        return 1, f"{branch}@{tip[:7]} carries no `{MERGE_HOLD_PREFIX}` line — not a held route"
+    dst = QUEUE_DIR / f"{held.stem}{RELEASE_SUFFIX}.md"
+    if any((d / dst.name).exists() for d in (QUEUE_DIR, QUEUE_FAILED, QUEUE_DONE)):
+        return 1, f"{dst.name} exists already — one release per held tip"
+    res = git("notes", "append", "-m", line, tip)
+    if res.returncode != 0:
+        return 1, f"git notes append failed: {res.stderr.strip()[:200]}"
+    text = recheck_text(held.read_text(encoding="utf-8"), branch, tip, held.name).replace(
+        "the queue daemon's one automatic gates-only re-check", "the merge-hold release (ORCH-MERGE-HOLD-1) — a gates-only re-gate", 1)
+    try:
+        dst.write_text(text, encoding="utf-8")
+    except OSError as e:
+        return 1, f"the release line was appended, but {dst} could not be written: {e}"
+    _safe_move(held, QUEUE_DONE / held.name)
+    try:
+        (merge_hold_dir() / f"{held.stem}.reason").unlink()
+    except OSError:
+        pass
+    return 0, f"{branch}@{tip[:7]}: {line}; queued {dst.name} (## Re-gate of: {branch} {tip[:7]})"
+
+
+def _release_args(args: list) -> Optional[tuple]:
+    """`<repo> <branch> --by B --reason R` → (repo, branch, B, R), or None when malformed."""
+    if len(args) < 2 or args[0].startswith("--") or args[1].startswith("--"):
+        return None
+    repo, branch, rest, opts = args[0], args[1], args[2:], {}
+    while rest:
+        if len(rest) < 2 or rest[0] not in ("--by", "--reason") or rest[0] in opts:
+            return None
+        opts[rest[0]], rest = rest[1], rest[2:]
+    if set(opts) != {"--by", "--reason"}:
+        return None
+    return repo, branch, opts["--by"], opts["--reason"]
 
 
 def request_control(action: str, reset_consecutive: bool = False, wait_s: float = CONTROL_ACK_WAIT_S,
@@ -904,6 +1002,7 @@ class QueueDaemon:
         self.completed = []
         self.failed = []
         self.stopped = []              # [ORCH-HANDBACK-STOP-STATUS-1] G-6: exit EXIT_STOPPED routes
+        self.held = []                 # [ORCH-MERGE-HOLD-1] exit EXIT_HELD routes
         self.consecutive_count = 0
         self.started_at = None
         self.config = {
@@ -968,6 +1067,7 @@ class QueueDaemon:
                 self.completed = data.get("completed", [])
                 self.failed = data.get("failed", [])
                 self.stopped = data.get("stopped", [])
+                self.held = data.get("held", [])
                 self.refused = data.get("refused", [])
                 self.persisted_executor = _executor_of(data)
                 self.persisted_repo = (data.get("config") or {}).get("repo")
@@ -1001,6 +1101,7 @@ class QueueDaemon:
                 "completed": self.completed[-30:],
                 "failed": self.failed[-15:],
                 "stopped": self.stopped[-15:],
+                "held": self.held[-15:],
                 "refused": self.refused[-15:],
                 "config": self.config,
                 "consecutive_count": self.consecutive_count,
@@ -1048,12 +1149,15 @@ class QueueDaemon:
                 "completed": self.completed[-10:],
                 "failed": self.failed[-5:],
                 "stopped": self.stopped[-5:],
+                "held": self.held[-5:],
+                "merge_held": held_briefs(),              # [ORCH-MERGE-HOLD-1]
                 "refused": self.refused[-5:],
                 "config": self.config,
                 "consecutive_count": self.consecutive_count,
                 "completed_total": len(self.completed),
                 "failed_total": len(self.failed),
-                "stopped_total": len(self.stopped)
+                "stopped_total": len(self.stopped),
+                "held_total": len(self.held)
             }
 
     def enqueue(self, batch_path):
@@ -1928,6 +2032,28 @@ class QueueDaemon:
                         self.recheck = None
                     print(f"[QUEUE] STOPPED: {batch_name} (handback STATUS STOP/PARTIAL — read it before closing "
                           f"the Kanban row, rule #15; {duration_s:.0f}s)")
+                elif exit_code == EXIT_HELD:
+                    # [ORCH-MERGE-HOLD-1]: green, held for a human merge — the brief to queue/held/merge-hold/ with its
+                    # reason; no pause, no red in a row; a held re-gate (a release red-gated) is handled as a red below.
+                    entry["status"] = "held"
+                    tray = merge_hold_dir()
+                    tray.mkdir(parents=True, exist_ok=True)
+                    record = route_record(batch_name, entry.get("started_at")) or {}
+                    why = str(record.get("error") or "held for a human merge (config/merge-hold.json)")
+                    if not _safe_move(next_batch, tray / batch_name):
+                        _safe_move(next_batch, QUEUE_DONE / batch_name)
+                    try:
+                        (tray / f"{Path(batch_name).stem}.reason").write_text(
+                            f"{end_time.isoformat()} {batch_name}: {why}\n", encoding="utf-8")
+                    except OSError as e:
+                        print(f"[QUEUE] could not write the hold reason for {batch_name}: {e}")
+                    self.held.append(entry)
+                    self.consecutive_count += 1
+                    self.product_reds = []
+                    if self.recheck == batch_name:
+                        self.recheck = None
+                    print(f"[QUEUE] ⏸ HELD: {batch_name} — green, held for a human merge ({why[:200]}); release with "
+                          f"python3 queue_daemon.py {RELEASE_USAGE} — the queue keeps firing ({duration_s:.0f}s)")
                 else:
                     # [ORCH-QUEUE-PARK-RED-1] SD-2: park a product red and keep firing independent work; one
                     # automatic re-check of an environment red; stop on everything else, as before.
@@ -2246,6 +2372,14 @@ def main(argv: list) -> int:
         rc, msg = append_override(*opts)
         print(("✅ override appended — " if rc == 0 else "⛔ override refused — ") + msg)
         return rc
+    if cmd == "release-hold":                 # [ORCH-MERGE-HOLD-1] appended, then a gates-only re-gate queued
+        opts = _release_args(argv[1:])
+        if opts is None:
+            print("Usage: python3 queue_daemon.py " + RELEASE_USAGE, file=sys.stderr)
+            return 2
+        rc, msg = release_hold(*opts)
+        print(("✅ hold released — " if rc == 0 else "⛔ release refused — ") + msg)
+        return rc
     d = QueueDaemon()
     if cmd == "enqueue" and len(argv) > 1:
         r = d.enqueue(argv[1])
@@ -2267,6 +2401,9 @@ def main(argv: list) -> int:
         # [ORCH-QUEUE-PARK-RED-1] the briefs parked after a product red, waiting for George
         parked = parked_briefs()
         park = ("🅿 parked in queue/held/parked/: " + ", ".join(p["file"] for p in parked)) if parked else ""
+        merge_held = held_briefs()                # [ORCH-MERGE-HOLD-1]
+        if merge_held:
+            park += (" | " if park else "") + "⏸ held for a human merge: " + ", ".join(p["file"] for p in merge_held)
         if not argv[1:]:
             print(status_line(st) + (f" | {pause_notice_line(notice)}" if notice else "") + (f" | {fg}" if fg else "")
                   + (f" | {deps}" if deps else "") + (f" | {park}" if park else ""))
