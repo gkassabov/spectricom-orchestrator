@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import admission   # [ORCH-CAPACITY-1] C1: whether a route may start now; C4: the wall it runs under
 import executor_auth   # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C2: is the executor logged in, once per fire after admission
 import prefire     # [ORCH-DEPENDS-ON-1] D4: a brief's `## Depends-on:` routes, judged as A11 judges them
+import ledger_chain      # [ORCH-LEDGER-CHAIN-1] (623): kill, unkill, override and release-hold append to logs/ledger.jsonl
 # QUEUE-RETIRE-1: one implementation of the trunk invariant, shared by the boot path and the
 # tests. It lives with the other boot asserts; nothing here reimplements it.
 from canon_assert import (DEFAULT_EXECUTOR_EFFORT, DEFAULT_EXECUTOR_MODEL, EXECUTOR_ENV,
@@ -503,6 +504,18 @@ def override_line(verdict: str, by: str, reason: str, at: Optional[str] = None) 
     return f"{OVERRIDE_PREFIX} {verdict} — by {approver}: {one(reason)} ({at})", None
 
 
+def _ledger(kind: str, **fields) -> None:
+    """[ORCH-LEDGER-CHAIN-1] (623): one control record; a record that cannot be written is said, never fatal."""
+    try:
+        rec = ledger_chain.append(kind, d=ledger_chain.ledger_dir(LOG_DIR), **fields)
+    except Exception as e:
+        rec, why = None, str(e)
+    else:
+        why = f"{ledger_chain.ledger_path(ledger_chain.ledger_dir(LOG_DIR))} not writable"
+    if rec is None:
+        print(f"⚠️ ledger: {kind} record not appended ({why})")
+
+
 def append_override(repo: str, branch: str, verdict: str, by: str, reason: str) -> tuple:
     """(0, the line appended) or (1, why refused). `git notes append` on the branch tip, which must already carry the
     gate's own PRE-MERGE GATE note: an override is added to a recorded verdict, never written in its place."""
@@ -522,6 +535,7 @@ def append_override(repo: str, branch: str, verdict: str, by: str, reason: str) 
     res = git("notes", "append", "-m", line, tip)
     if res.returncode != 0:
         return 1, f"git notes append failed: {res.stderr.strip()[:200]}"
+    _ledger("override", repo=repo, branch=branch, tip=tip, verdict=verdict, by=by, reason=" ".join(str(reason).split()))
     return 0, f"{branch}@{tip[:7]}: {line}"
 
 
@@ -591,6 +605,8 @@ def release_hold(repo: str, branch: str, by: str, reason: str) -> tuple:
     res = git("notes", "append", "-m", line, tip)
     if res.returncode != 0:
         return 1, f"git notes append failed: {res.stderr.strip()[:200]}"
+    _ledger("release-hold", repo=repo, branch=branch, tip=tip, by=by, reason=" ".join(str(reason).split()),
+            batch=held.name)   # [ORCH-LEDGER-CHAIN-1]: the release line is on the note now, whatever follows
     text = recheck_text(held.read_text(encoding="utf-8"), branch, tip, held.name).replace(
         "the queue daemon's one automatic gates-only re-check", "the merge-hold release (ORCH-MERGE-HOLD-1) — a gates-only re-gate", 1)
     try:
@@ -958,6 +974,8 @@ def kill(reason: str, grace_s: Optional[float] = None) -> int:
                  f"{', '.join(map(str, left))}" if left else f" — SIGTERM; all gone within {grace:g}s")
     _kill_say(f"🛡 KILL — {reason}: {state}; {what}. Nothing fires until "
               f"`python3 queue_daemon.py unkill --reason \"<text>\"`")
+    _ledger("kill", reason=reason, written=prior is None and rc == 0, kept_prior=prior is not None,
+            fires=[f["batch"] for f in fires], groups=groups)   # [ORCH-LEDGER-CHAIN-1]
     return rc
 
 
@@ -979,6 +997,7 @@ def unkill(reason: str) -> int:
     _kill_say(f"🛡 UNKILL — {reason}: {p} removed (it said: {prior.get('reason') or NO_REASON}, since "
               f"{prior.get('at') or '?'}). The daemon fires again at its next poll; a stop-on-failure pause still "
               f"needs `resume`")
+    _ledger("unkill", reason=reason, lifted_reason=prior.get("reason"), lifted_at=prior.get("at"))   # [ORCH-LEDGER-CHAIN-1]
     return 0
 
 

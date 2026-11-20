@@ -63,3 +63,11 @@ def _executor_auth_ok(request, monkeypatch):
         return
     monkeypatch.setattr(executor_auth, "probe", lambda *a, **k: executor_auth.AuthProbe(
         True, "ok", "logged in (tests: stubbed by conftest)", None))
+
+
+@pytest.fixture(autouse=True)
+def _ledger_isolated(tmp_path_factory, monkeypatch):
+    """ORCH-LEDGER-CHAIN-1 (S7-CORE-57, route 623): every gate verdict, hold, merge, kill, unkill, override and
+    release appends to logs/ledger.jsonl. No test may append to the ledger of the checkout it runs in (the live one,
+    when the suite runs from ~/spectricom-orchestrator): every test writes to its own temporary ledger dir."""
+    monkeypatch.setenv("SPECTRICOM_LEDGER_DIR", str(tmp_path_factory.mktemp("ledger")))

@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import prefire  # HOOK-1: pre-fire assertions (SESSION-BOOT A1/A2/A8)
 import admission  # [ORCH-CAPACITY-1] C1: whether a route may start now — the daemon's fire loop asks it too
 import executor_auth  # [ORCH-EXECUTOR-AUTH-PROBE-1] G-C3/G-C4: is the executor logged in (called through the module)
+import ledger_chain  # [ORCH-LEDGER-CHAIN-1] (623): every gate verdict, hold and merge appends to logs/ledger.jsonl
 # ORCH-STALEBASE-1: the branch-side invariant, asserted at the branch cut. One implementation,
 # shared with the tests; canon_assert imports nothing from here.
 # ORCH-CONFLICT-1: the landed invariant, asserted at the route lane's FINAL STATUS site.
@@ -1212,6 +1213,37 @@ def _git_read(cmd: str, cwd: Path) -> str:
         return ""
 
 
+# ── [ORCH-LEDGER-CHAIN-1] (route 623) the control ledger's orchestrator writers ──
+# One record per gate verdict, hold and merge, appended where the route's outcome is final (the FINAL STATUS site),
+# where a parallel worker is gated and merged, and where the self-mod lane merges. A record that cannot be written is
+# a warning, never a changed outcome (OPEN (b)).
+def _ledger(kind: str, **fields) -> Optional[dict]:
+    try:
+        rec = ledger_chain.append(kind, d=ledger_chain.ledger_dir(LOG_DIR), repo=ACTIVE_REPO_NAME, **fields)
+    except Exception as e:   # a programming error in a call site must not change a route's outcome either
+        log.warning(f"⚠️ ledger: {kind} record not appended ({e})")
+        return None
+    if rec is None:
+        log.warning(f"⚠️ ledger: {kind} record not appended ({ledger_chain.ledger_path(ledger_chain.ledger_dir(LOG_DIR))} not writable)")
+    return rec
+
+
+def _ledger_route_outcome(batch: str, branch: Optional[str], lane: str, status: "Status", gate_outcome: Optional[str],
+                          error: Optional[str], hold_verdict: Optional[str], merged: bool,
+                          route_tip: Optional[str], target_tip: Optional[str]) -> list:
+    """The route's records, in order: its gate verdict (when a gate ran), its hold (the handback guard's or the merge
+    hold), its merge (when it landed). Returns the records written."""
+    common = {"batch": batch, "branch": branch, "lane": lane, "status": status.value}
+    out = []
+    if gate_outcome is not None:
+        out.append(_ledger("gate", **common, outcome=gate_outcome, detail=(error or "")[:300] or None))
+    if hold_verdict is not None:
+        out.append(_ledger("hold", **common, verdict=hold_verdict, detail=(error or "")[:300] or None))
+    if merged:
+        out.append(_ledger("merge", **common, route_tip=route_tip, target=MERGE_TARGET, target_tip=target_tip))
+    return [r for r in out if r is not None]
+
+
 def _snapshot_heads(proj: Path) -> dict:
     """Every local branch -> its SHA. The S3 baseline: anything that moves here and is
     not the route's own branch is a commit the route did not own."""
@@ -1706,7 +1738,10 @@ def merge_branch(br: str) -> bool:
     r = subprocess.run(f"cd {PROJECT_ROOT} && git merge {br} --no-edit",
         shell=True, capture_output=True, text=True)
     if r.returncode == 0:
-        log.info(f"Merged {br}"); return True
+        log.info(f"Merged {br}")
+        _ledger("merge", branch=br, lane="parallel-worker", target=MERGE_TARGET,
+                target_tip=_git_read("git rev-parse HEAD", PROJECT_ROOT) or None)   # [ORCH-LEDGER-CHAIN-1]
+        return True
     log.error(f"Merge conflict on {br} — MANUAL RESOLUTION NEEDED"); return False
 
 
@@ -1730,6 +1765,8 @@ def _gate_parallel_branch(wt: Path, br: str) -> "GateVerdict":
         subprocess.run(f'git notes add -m "PRE-MERGE GATE: {v.outcome.value} — {v.gate}: {v.signal}"',
                        shell=True, capture_output=True, cwd=str(wt))
         log.error(f"⛔ {v.outcome.value} — {MERGE_TARGET} NOT merged. Branch preserved: {br}. {v.label}")
+    _ledger("gate", branch=br, lane="parallel-worker", outcome=v.outcome.value,
+            detail=None if v.outcome is GateOutcome.PASS else (v.label or "")[:300])   # [ORCH-LEDGER-CHAIN-1]
     return v
 
 
@@ -2026,6 +2063,8 @@ def _self_mod_auto_merge(orch_dir: Path, branch_name: str, gate_outcome: Optiona
     )
     if r.returncode == 0:
         log.info(f"✅ Self-mod auto-merge: brought {count} commits to main")
+        _ledger("merge", batch=batch_file.name if batch_file is not None else None, branch=branch_name, lane="meta",
+                commits=count, target="main", target_tip=_git_read(f"git -C {orch_dir} rev-parse main", orch_dir) or None)
         if batch_file is not None:
             retire_batch_file(batch_file)
         return True
@@ -8300,6 +8339,18 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     log.info(f"🏁 FINAL STATUS: {status.value} | gate: "
              f"{_gate_status_label(gate_error, gate_outcome, gate_collection, unit_collection, tamper and tamper.label, incomplete, hold.verdict if hold else INCOMPLETE_VERDICT)}"
              f"{stop_tag}")
+    # [ORCH-LEDGER-CHAIN-1] (623): the route's gate verdict, hold and merge, after every lane and the landed invariant —
+    # so `merge` is written only for a route lane whose tip is on MERGE_TARGET (the invariant demotes one that is not).
+    # The meta lane's merge is written where it happens, in run_batch (_self_mod_auto_merge).
+    lane = "route" if worktree is None else ("meta" if IS_META_FIRE else "parallel")
+    merged = (lane == "route" and tamper is None and bool(branch_name) and status in (Status.PASSED, Status.STOPPED)
+              and not no_change_run and route_tip is not None)
+    _ledger_route_outcome(
+        batch_file.name, branch_name, lane, status,
+        gate_outcome if not (hold is not None and gate_outcome == hold.verdict) else None,
+        stop_error or gate_error,
+        hold.verdict if hold is not None else (MERGE_HOLD_VERDICT if status is Status.HELD else None),
+        merged, route_tip, _git_read(f"git rev-parse {MERGE_TARGET}", proj) if merged else None)
     result = Result(batch_file=batch_file.name, status=status,
         started=started.isoformat(), finished=finished.isoformat(),
         duration_s=dur, exit_code=ec, briefs=len(briefs),
