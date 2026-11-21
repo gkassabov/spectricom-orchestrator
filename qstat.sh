@@ -68,21 +68,36 @@ if current.get("file"):
 # each repo config/repos.yaml schedules with no result yet, and a nightly run the daemon has in hand.
 shown, running = set(), ((st or {}).get("full_gate_running") or {})
 icons = {"PASS": "✅", "NEW FAILURES": "❌", "BLOCKED": "🚧"}
-for f in sorted((orch / "state").glob("full-gate-*.json")) if (orch / "state").is_dir() else []:
-    try:
-        d = json.loads(f.read_text())
-    except (OSError, ValueError):
-        continue
-    repo = d.get("repo") or f.stem[len("full-gate-"):]
-    shown.add(repo)
-    out = d.get("outcome") or "?"
-    print(f"🌙 FULL-GATE {repo} | {icons.get(out, '⚪')} {out} | {str(d.get('finished_at') or '-')[:16]} | "
-          f"sha {str(d.get('sha') or '-')[:7]} | {d.get('trigger') or '-'}")
 try:
     import yaml
     repos = (yaml.safe_load((orch / "config" / "repos.yaml").read_text()) or {}).get("repos") or {}
 except Exception:
     repos = {}
+# QSTAT-FULL-GATE-TRUTH-1 (Kanban 808): a nightly repo's last result older than this is said STALE under its line, and an
+# unreadable state file is said as such — before, the first read green for ever and the second as "never run".
+STALE_AFTER_H = 26
+from datetime import datetime
+for f in sorted((orch / "state").glob("full-gate-*.json")) if (orch / "state").is_dir() else []:
+    repo = f.stem[len("full-gate-"):]
+    try:
+        d = json.loads(f.read_text())
+    except (OSError, ValueError) as e:
+        shown.add(repo)
+        print(f"🌙 FULL-GATE {repo} | ⚠️ unreadable state file {f.name} ({type(e).__name__})")
+        continue
+    repo = d.get("repo") or repo
+    shown.add(repo)
+    out = d.get("outcome") or "?"
+    print(f"🌙 FULL-GATE {repo} | {icons.get(out, '⚪')} {out} | {str(d.get('finished_at') or '-')[:16]} | "
+          f"sha {str(d.get('sha') or '-')[:7]} | {d.get('trigger') or '-'}")
+    nightly = (repos.get(repo) or {}).get("full_gate_nightly") if isinstance(repos.get(repo), dict) else None
+    try:
+        age_h = (datetime.now() - datetime.fromisoformat(str(d.get("finished_at")))).total_seconds() / 3600
+    except (TypeError, ValueError):
+        age_h = None
+    if nightly and age_h is not None and age_h > STALE_AFTER_H:
+        print(f"   ⚠️ STALE — {repo}'s last full gate finished {age_h / 24:.1f} days ago (nightly {nightly}; "
+              f"over {STALE_AFTER_H} h)")
 for name, r in sorted(repos.items()):
     if isinstance(r, dict) and r.get("full_gate_nightly") and name not in shown:
         print(f"🌙 FULL-GATE {name} | ⚪ never run | nightly {r['full_gate_nightly']}")
