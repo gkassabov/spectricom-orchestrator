@@ -8213,12 +8213,24 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                             f"git rev-parse {MERGE_TARGET}",
                             shell=True, capture_output=True, text=True, cwd=str(proj)
                         ).stdout.strip()
-                        subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True, cwd=str(proj))
-                        r = subprocess.run(
+                        # [ORCH-MERGE-CHECKOUT-SILENT-1] (Kanban 802): the checkout's exit is read. Refused (route
+                        # 628, 2026-11-19: an authoring worktree held MERGE_TARGET) → the merge never runs — it
+                        # would run on the route branch itself, "Already up to date", exit 0 — and the run is
+                        # NOT LANDED, naming the checkout that holds MERGE_TARGET; the branch is kept.
+                        co = subprocess.run(f"git checkout {MERGE_TARGET}", shell=True, capture_output=True,
+                                            text=True, cwd=str(proj))
+                        r = (subprocess.run(
                             f"git merge {branch_name} --no-edit",
                             shell=True, capture_output=True, text=True, cwd=str(proj)
-                        )
-                        if r.returncode == 0:
+                        ) if co.returncode == 0 else None)
+                        if r is None:
+                            holder = _checkout_holding(MERGE_TARGET, proj)
+                            where = f"it is checked out at {holder}" if holder else "no checkout holds it"
+                            status = Status.FAILED
+                            gate_error = (f"{ROUTE_NOT_LANDED_VERDICT} — could not check out {MERGE_TARGET} to merge "
+                                          f"{branch_name} ({where}): {co.stderr.strip()[-300:]}; gate was {gate_outcome}")
+                            log.error(f"❌ {gate_error}. {MERGE_TARGET} NOT merged. Branch preserved: {branch_name}.")
+                        elif r.returncode == 0:
                             post_merge_tip = subprocess.run(
                                 f"git rev-parse {MERGE_TARGET}",
                                 shell=True, capture_output=True, text=True, cwd=str(proj)
@@ -8232,6 +8244,8 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                                     f"{branch_name}. NOT deleting branch — manual recovery needed."
                                 )
                                 status = Status.FAILED
+                                gate_error = (f"{ROUTE_NOT_LANDED_VERDICT} — {MERGE_TARGET} tip unchanged "
+                                              f"({pre_merge_tip[:7]}) after merging {branch_name}; gate was {gate_outcome}")
                             else:
                                 log.info(f"🔀 Merged {branch_name} → {MERGE_TARGET} ({pre_merge_tip[:7]} → {post_merge_tip[:7]})")
                                 # QUEUE-RETIRE-1 / D-S7CORE14-02: retire the originating brief
