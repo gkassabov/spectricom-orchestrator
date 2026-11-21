@@ -264,6 +264,7 @@ SIT_BATCH_PAUSE_KEY = "sit_batch_pause_s"
 # (the browser SITs) took 492.5 s on 2026-11-19 and passed 600 s on 11-20 and 11-21 — each time the suite's other 22
 # batches never ran (timeout-advisory ends the leg).
 SIT_BATCH_TIMEOUT_KEY = "sit_batch_timeout_s"
+SIT_TIMED_OUT_FILES_SHOWN = 3   # [SIT-BATCH-TIMEOUT-CONTINUES-1] files named per timed-out batch in its line
 # [ORCH-GATE-COST-1] D3 (D-S7CORE29-02): per merge, a repo with `sit_list_cmd` runs the SIT files RELATED to
 # the branch's diff, not the whole suite (~25 min per merge on clinical-mp, L-150). The related set is the
 # union of (a) [ORCH-LEAN-GATE-1] the SIT files that directly import a changed server file (one hop, below); (b) the
@@ -2759,6 +2760,9 @@ class _SitBatchedRun:
     batches: int = 0
     mismatch: Optional[str] = None
     clock: Optional[ClockViolation] = None   # [GATE-CLOCK-1] the first implausible batch leg
+    # [SIT-BATCH-TIMEOUT-CONTINUES-1] (Kanban 805): each batch that exceeded its budget, said with its files; the
+    # other batches still ran, and the reconciliation is against the files that were not in a timed-out batch.
+    timed_out: list = field(default_factory=list)
 
 
 def _add_count(agg: dict, key: str, val: Optional[int], unknown: set):
@@ -2791,8 +2795,21 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
             time.sleep(plan.pause_s)
         cmd = f"{sit_cmd} -- {' '.join(shlex.quote(f) for f in files)}"
         started = time.time()
-        r, clock = _run_leg(kind, archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path), files=len(files),
-                            shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=plan.timeout_s)
+        try:
+            r, clock = _run_leg(kind, archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path), files=len(files),
+                                shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=plan.timeout_s)
+        except subprocess.TimeoutExpired as e:
+            # [SIT-BATCH-TIMEOUT-CONTINUES-1]: one batch over its budget no longer ends the leg (11-20 / 11-21: batch 1
+            # timed out and batches 2-23 never ran). It is said by name and its files leave the reconciliation.
+            out.clock = out.clock or getattr(e, "gate_clock", None)
+            shown = ", ".join(files[:SIT_TIMED_OUT_FILES_SHOWN]) + (" …" if len(files) > SIT_TIMED_OUT_FILES_SHOWN else "")
+            out.timed_out.append({"batch": i, "files": list(files),
+                                  "said": f"batch {i}/{len(batches)} ({len(files)} files: {shown}) exceeded its "
+                                          f"{plan.timeout_s}s budget"})
+            out.stdout += f"── SIT batch {i}/{len(batches)} ({len(files)} files) ── TIMED OUT after {plan.timeout_s}s\n"
+            log.error(f"🟠 SIT batch {i}/{len(batches)}: TIMED OUT after {time.time() - started:.1f}s "
+                      f"(budget {plan.timeout_s}s) — {shown}; the other batches still run")
+            continue
         out.clock = out.clock or clock
         d = time.time() - started
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
@@ -2825,10 +2842,18 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
     out.tallies = {k: (None if f"t_{k}" in unknown else agg.get(f"t_{k}", 0))
                    for k in ("failed", "skipped", "todo")}
     got_f, got_t = out.counts["test_files_total"], out.counts["tests_total"]
-    if got_f != len(plan.files):
-        notes.append(f"batches collected {got_f} files, the suite enumerates {len(plan.files)}")
-    if plan.tests_expected is not None and got_t != plan.tests_expected:
-        notes.append(f"batches collected {got_t} tests, the suite enumerates {plan.tests_expected}")
+    # [SIT-BATCH-TIMEOUT-CONTINUES-1]: what the batches that finished were handed — the suite less the timed-out files.
+    gone = {f for t in out.timed_out for f in t["files"]}
+    want_f = len([f for f in plan.files if f not in gone])
+    want_t = plan.tests_expected
+    if gone and want_t is not None:
+        want_t = (want_t - sum(plan.tests_per_file.get(f, 0) for f in gone)) if plan.tests_per_file else None
+    if got_f != want_f:
+        notes.append(f"batches collected {got_f} files, the suite enumerates {want_f}"
+                     + (f" outside the timed-out batches" if gone else ""))
+    if want_t is not None and got_t != want_t:
+        notes.append(f"batches collected {got_t} tests, the suite enumerates {want_t}"
+                     + (f" outside the timed-out batches" if gone else ""))
     out.mismatch = "; ".join(notes) or None
     return out
 
@@ -3045,6 +3070,20 @@ def run_sit_post_merge(repo_path: Path, archive_path: Optional[Path] = None,
             raw = b.red_output or (b.stdout + "\n" + b.stderr)
             counts, tallies, batches, batch_mismatch = b.counts, b.tallies, b.batches, b.mismatch
             clock = b.clock
+            if b.timed_out and b.returncode == 0 and batch_mismatch is None:
+                # [SIT-BATCH-TIMEOUT-CONTINUES-1]: the advisory as before, now with what timed out and what the rest said;
+                # a red batch beside it is judged below as any red run (the timed-out batch is in the log and stdout).
+                duration = time.time() - started
+                rest = len(b.timed_out)
+                detail = (f"{'; '.join(t['said'] for t in b.timed_out)}; the other {b.batches - rest} batches: "
+                          f"{_describe_collection(counts)}, green")
+                log.error(f"🟠 SIT TIMEOUT — {detail} — ADVISORY (not blocking); surfacing for review.")
+                _log_sit_outcome(archive, repo_path, True, -1, duration, None, error="timeout-advisory", scope=scope,
+                                 enumeration=enum_note)
+                return SitOutcome(passed=True, exit_code=-1, error="timeout-advisory", detail=detail,
+                                  duration_s=duration, scope=scope, enumeration=enum_note, batches=batches, **counts)
+            if b.timed_out:
+                log.error(f"🟠 SIT: {'; '.join(t['said'] for t in b.timed_out)} — judged with the red batches below")
         duration = time.time() - started
         # S6S47: baseline-aware. Block only on NEW failures, not pre-existing
         # known-failing specs (BUG-018/BUG-026). Parse failing spec basenames
