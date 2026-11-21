@@ -444,6 +444,55 @@ def parked_briefs() -> list:
     return out
 
 
+# [ORCH-QSTAT-PARTIAL-1] (Kanban 512): what a finished route did, read from its own log — the last `🏁 FINAL STATUS:`
+# line, its gate text, the handback STATUS line and whether a merge line is there — never from the exit code alone. 341f1
+# merged PARTIAL (gate PASS) and read "STOPPED, nothing merged"; 341f3 (gate BLOCKED(environment)) read "FAILED".
+ROUTE_LOG_TAIL_BYTES = 262144
+_FINAL_STATUS_RE = re.compile(r"🏁 FINAL STATUS: (\w+)(?: \| gate: ([^|\n]*))?")
+_HANDBACK_STATUS_RE = re.compile(r"^\s*handback STATUS: (.+?)(?: —.*)?$", re.M)
+_MERGED_RE = re.compile(r"🔀 Merged \S+ → \S+ \(|Self-mod auto-merge: brought \d+ commits")
+
+
+def route_outcome(log_file) -> str:
+    """One of: merged · merged (partial) · merged (handback <status>) · stopped, nothing merged (handback <status>) ·
+    blocked (environment) · blocked (<gate>) · failed · incomplete, nothing merged · held for a human merge ·
+    passed (nothing merged) · tampered · unknown (<why>). Reads the log's last ROUTE_LOG_TAIL_BYTES; changes nothing."""
+    if not log_file:
+        return "unknown (no log file recorded)"
+    try:
+        with open(log_file, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - ROUTE_LOG_TAIL_BYTES))
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError as e:
+        return f"unknown (log unreadable: {type(e).__name__})"
+    finals = _FINAL_STATUS_RE.findall(text)
+    if not finals:
+        return "unknown (no FINAL STATUS line)"
+    status, gate = finals[-1][0], (finals[-1][1] or "").strip()
+    merged = bool(_MERGED_RE.search(text))
+    handbacks = _HANDBACK_STATUS_RE.findall(text)
+    handback = handbacks[-1].strip() if handbacks else ""
+    if status == "passed":
+        return "merged" if merged else "passed (nothing merged)"
+    if status == "stopped":
+        if merged:
+            return "merged (partial)" if handback.upper().startswith("PARTIAL") else f"merged (handback {handback or 'STOP'})"
+        return f"stopped, nothing merged (handback {handback or 'STOP'})"
+    if status == "blocked":
+        return "blocked (environment)" if not gate or "environment" in gate else f"blocked ({gate[:80]})"
+    if status == "held":
+        return "held for a human merge"
+    if status == "incomplete":
+        return "incomplete, nothing merged"
+    return status
+
+
+def with_outcomes(entries: list) -> list:
+    """`entries` (completed / failed / stopped / held records) each with its `outcome` (route_outcome of its log)."""
+    return [{**e, "outcome": route_outcome(e.get("log_file"))} for e in entries]
+
+
 def route_record(batch_name: str, started_at: str) -> Optional[dict]:
     """The newest result orchestrator.py recorded for `batch_name` that started at or after `started_at` (the daemon's
     fire time), from ORCH_DIR/state.json — completed, stopped or failed. None when there is none or it cannot be read."""
@@ -1176,10 +1225,10 @@ class QueueDaemon:
                 "current_elapsed_fmt": f"{elapsed/60:.1f}m" if elapsed else None,
                 "queue": [{"name": f.name, "size": f.stat().st_size} for f in queue_files],
                 "queue_count": len(queue_files),
-                "completed": self.completed[-10:],
-                "failed": self.failed[-5:],
-                "stopped": self.stopped[-5:],
-                "held": self.held[-5:],
+                "completed": with_outcomes(self.completed[-10:]),   # [ORCH-QSTAT-PARTIAL-1] each with its outcome
+                "failed": with_outcomes(self.failed[-5:]),   # [ORCH-QSTAT-PARTIAL-1] each with its outcome
+                "stopped": with_outcomes(self.stopped[-5:]),   # [ORCH-QSTAT-PARTIAL-1] each with its outcome
+                "held": with_outcomes(self.held[-5:]),   # [ORCH-QSTAT-PARTIAL-1] each with its outcome
                 "merge_held": held_briefs(),              # [ORCH-MERGE-HOLD-1]
                 "refused": self.refused[-5:],
                 "config": self.config,
