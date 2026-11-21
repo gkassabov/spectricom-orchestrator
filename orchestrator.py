@@ -260,6 +260,10 @@ SIT_BATCH_PAUSE_S = 90
 SIT_LIST_CMD_KEY = "sit_list_cmd"
 SIT_BATCH_FILES_KEY = "sit_batch_files"
 SIT_BATCH_PAUSE_KEY = "sit_batch_pause_s"
+# [SIT-BATCH-BUDGET-1] (Kanban 804): the one-batch budget is per repo too (default SIT_TIMEOUT). clinical-mp's batch 1
+# (the browser SITs) took 492.5 s on 2026-11-19 and passed 600 s on 11-20 and 11-21 — each time the suite's other 22
+# batches never ran (timeout-advisory ends the leg).
+SIT_BATCH_TIMEOUT_KEY = "sit_batch_timeout_s"
 # [ORCH-GATE-COST-1] D3 (D-S7CORE29-02): per merge, a repo with `sit_list_cmd` runs the SIT files RELATED to
 # the branch's diff, not the whole suite (~25 min per merge on clinical-mp, L-150). The related set is the
 # union of (a) [ORCH-LEAN-GATE-1] the SIT files that directly import a changed server file (one hop, below); (b) the
@@ -2510,6 +2514,7 @@ class SitPlan:
     tests_expected: Optional[int] = None
     batch_files: int = SIT_BATCH_FILES
     pause_s: int = SIT_BATCH_PAUSE_S
+    timeout_s: int = SIT_TIMEOUT           # [SIT-BATCH-BUDGET-1] one batch's budget
     error: Optional[str] = None
     detail: Optional[str] = None
     tests_per_file: dict = field(default_factory=dict)   # [ORCH-GATE-COST-1] D3: a related set's expected tests
@@ -2566,7 +2571,8 @@ def _sit_plan(repo_path: Path, files_only: bool = False) -> Optional[SitPlan]:
         return None
     if files_only:
         list_cmd += " --filesOnly"
-    plan = SitPlan(batch_files=_unit_repo_timeout(SIT_BATCH_FILES_KEY, SIT_BATCH_FILES))
+    plan = SitPlan(batch_files=_unit_repo_timeout(SIT_BATCH_FILES_KEY, SIT_BATCH_FILES),
+                   timeout_s=_unit_repo_timeout(SIT_BATCH_TIMEOUT_KEY, SIT_TIMEOUT))
     raw_pause = ACTIVE_REPO_CONFIG.get(SIT_BATCH_PAUSE_KEY)
     try:  # 0 is a legitimate pause (none); a non-integer is not
         plan.pause_s = SIT_BATCH_PAUSE_S if raw_pause in (None, "") else max(0, int(raw_pause))
@@ -2786,7 +2792,7 @@ def _run_sit_batched(sit_cmd: str, repo_path: Path, plan: SitPlan,
         cmd = f"{sit_cmd} -- {' '.join(shlex.quote(f) for f in files)}"
         started = time.time()
         r, clock = _run_leg(kind, archive or SIT_ARCHIVE_DIR, _gate_shell_cmd(cmd, repo_path), files=len(files),
-                            shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+                            shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=plan.timeout_s)
         out.clock = out.clock or clock
         d = time.time() - started
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
@@ -6736,7 +6742,8 @@ def _full_gate_sit(wt: Path, archive: Path, previous: Optional[dict],
     elif so.error:
         # a machinery error, an empty collection — and a timeout, which the per-merge leg lets through as
         # advisory: here it is a suite that did not finish, so nothing about it is known
-        why = f"timeout — a batch exceeded its {SIT_TIMEOUT}s budget" if so.error == "timeout-advisory" else so.error
+        why = (f"timeout — a batch exceeded its {_unit_repo_timeout(SIT_BATCH_TIMEOUT_KEY, SIT_TIMEOUT)}s budget"
+               if so.error == "timeout-advisory" else so.error)
         out.update(outcome="BLOCKED", signal=so.error, detail=so.detail or why, failing_files=None)
     else:
         v = _classify_gate_failure("sit", so.output or "", wt, so.exit_code, tests_failed=so.tests_failed,
@@ -7132,7 +7139,7 @@ def _full_gate_dry_run(ref: str, sha: str, ck: Optional[str], refusal: Optional[
             print(f"  SIT: sit[full {len(plan.files)} files] — {len(plan.files)} files"
                   f"{'' if plan.tests_expected is None else f' / {plan.tests_expected} tests'} enumerated in {where}; "
                   f"{len(plan.batches)} batches of ≤{plan.batch_files}, {plan.pause_s}s pause between, "
-                  f"{SIT_TIMEOUT}s per batch")
+                  f"{plan.timeout_s}s per batch")
     else:
         print(f"  SIT: not gated for {ACTIVE_REPO_NAME} (PRE_MERGE_GATES)")
     # [ORCH-FULLGATE-LOCAL-FILES-1] D2: each listed local file, present or missing — never opened
