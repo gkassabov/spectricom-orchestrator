@@ -97,6 +97,9 @@ repos:
     # browser SITs (member-portal-via-bff: 35 full page loads on a cold Vite, 207.6 s for one test on 11-21 at 783f24d0):
     # 492.5 s on 11-19, over 600 on 11-20 and 11-21 — and a timed-out batch ends the leg, so 22 batches never ran.
     sit_batch_timeout_s: 1200
+    # BUILD-GATE-BUDGET-1 (S7-CORE-59): the build leg's budget (default BUILD_GATE_TIMEOUT 600). `tsc --noEmit && npm run
+    # build` took 6.7 and 7.9 min on 2026-11-21 and was killed at 600 s three times that evening (825), each a re-gate.
+    build_timeout_s: 1200
     # ORCH-GATE-COST-1 (S7-CORE-30, D-S7CORE29-02): per merge, SIT runs the files RELATED to the branch's diff —
     # the installed vitest's own `list --changed <merge base>` (files only, nothing run), plus the SIT files the
     # branch changes, plus an optional core set:

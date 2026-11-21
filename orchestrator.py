@@ -242,6 +242,10 @@ BUILD_GATE_ENABLED = os.environ.get("DISABLE_BUILD_GATE", "") == ""
 SIT_BLOCKING = os.environ.get("DISABLE_SIT_BLOCKING", "") == ""
 BUILD_GATE_CMD = "npx tsc --noEmit && npm run build"
 BUILD_GATE_TIMEOUT = 600  # 10 min
+# [BUILD-GATE-BUDGET-1] (S7-CORE-59): the build leg's budget is per repo too (default BUILD_GATE_TIMEOUT), as 804 made
+# the SIT batch's. clinical-mp's build (`tsc --noEmit && npm run build`) took 6.7 min (822) and 7.9 min (823) on
+# 2026-11-21 and was killed at 600 s three times the same evening (825: 17:25, 17:52, 18:14) — BLOCKED(environment).
+BUILD_GATE_TIMEOUT_KEY = "build_timeout_s"
 SIT_TIMEOUT = 600  # S6S47: 300 was too tight for full smoke suite w/ 4 workers
 # S7-CORE-10 SIT-RATE-1: the SIT gate runs in BATCHES of files with a pause between, so one
 # batch completes inside the upstream rate-limit window. Measured 2026-09-15 on clinical-mp
@@ -2280,7 +2284,7 @@ def run_build_gate(repo_path: Path) -> BuildGateOutcome:
         r, clock = _run_leg(
             "build", SIT_ARCHIVE_DIR,
             _gate_shell_cmd(gate_cmd, repo_path), shell=True, capture_output=True, text=True,
-            cwd=str(repo_path), timeout=BUILD_GATE_TIMEOUT
+            cwd=str(repo_path), timeout=_unit_repo_timeout(BUILD_GATE_TIMEOUT_KEY, BUILD_GATE_TIMEOUT)
         )
         duration = time.time() - started
         passed = r.returncode == 0
@@ -5953,7 +5957,8 @@ def run_pre_merge_gates(repo_path: Path, branch_name: Optional[str] = None) -> G
                     sit_enum.discard("the build is red")   # the build verdict decides first
                 if bg.error == "timeout":   # [ORCH-LEAN-GATE-1] a leg timeout is BLOCKED(environment) (:7255), never product
                     v = GateVerdict(GateOutcome.BLOCKED_ENV, "build", "timeout",
-                                    f"the build leg was killed at its {BUILD_GATE_TIMEOUT}s budget after "
+                                    f"the build leg was killed at its "
+                                    f"{_unit_repo_timeout(BUILD_GATE_TIMEOUT_KEY, BUILD_GATE_TIMEOUT)}s budget after "
                                     f"{bg.duration_s:.0f}s — no exit observed, not a product verdict; re-gate on a "
                                     f"quiet machine")
                 else:
