@@ -1943,6 +1943,56 @@ def check(filepath: Path) -> list[str]:
     return failures
 
 
+# [PREFIRE-NPM-HOOK-NOTE-1] (Kanban 886) — the executor's npm hook (executor/hooks/npm_frozen.py, ORCH-NPM-FROZEN-1)
+# refuses `npm exec`, a bare `npx <tool>` (no `--no-install`) and every npm subcommand off its list. A brief that tells
+# the executor to run one costs a refusal at best (865r, 2026-11-22: the executor re-wrote `npx vitest` as
+# `npx --no-install vitest`) and a STOP at worst (873: its A0-3 `npm exec` was refused, nothing built, a re-fire owed).
+# prefire now names each such command with the hook's own line — a NOTE printed beside the verdict, never a failure:
+# the executor can still re-write it, and a brief already queued is never set aside for it.
+NPM_HOOK = Path(__file__).resolve().parent / "executor" / "hooks" / "npm_frozen.py"     # tests patch it
+NPM_NOTE_MAX = 5
+_NPM_CMD_SPAN = re.compile(r"`((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:timeout\s+\S+\s+)?(?:npx|npm)\s[^`\n]*)`")
+_DIFF_FENCE = re.compile(r"^```diff\b.*?^```", re.MULTILINE | re.DOTALL)
+
+
+def _npm_hook():
+    """The hook module, loaded from its file (it is a script, not a package); None when it cannot be loaded."""
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location("_prefire_npm_frozen", NPM_HOOK)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def npm_hook_notes(filepath: Path) -> list[str]:
+    """Each distinct backticked `npx …` / `npm …` command in the brief (outside a ```diff fence — patch text is data)
+    that the hook would refuse when run at the brief's repo root (`project_dir` of its `#!queue … repo=`), with the
+    hook's line, at most NPM_NOTE_MAX. [] when the repo or the hook cannot be read (nothing judged, nothing said)."""
+    entry = _repo_entry(queue_header(filepath).get("repo"))
+    project = entry.get("project_dir")
+    hook = _npm_hook() if project else None
+    if hook is None:
+        return []
+    text = _DIFF_FENCE.sub("", _read(filepath))
+    seen, notes = set(), []
+    for m in _NPM_CMD_SPAN.finditer(text):
+        cmd = m.group(1).strip()
+        if cmd in seen:
+            continue
+        seen.add(cmd)
+        try:
+            why = hook.judge_text(cmd, str(project), {}, 0)
+        except Exception:
+            continue
+        if why:
+            notes.append("NPM ⚠ `%s` — the executor's npm hook refuses it: %s"
+                         % (cmd if len(cmd) <= 90 else cmd[:89] + "…", " ".join(str(why).split())[:200]))
+    return notes[:NPM_NOTE_MAX] + (["NPM ⚠ … and %d more" % (len(notes) - NPM_NOTE_MAX)] if len(notes) > NPM_NOTE_MAX else [])
+
+
 def _timeout_detail(filepath: Path, timeout: Optional[tuple[int, str, int]]) -> str:
     """[ORCH-PREFIRE-RUNTIME-1] D2: the pass line's timeout. `timeout` is what the fire resolved —
     orchestrator.prefire_timeout: (minutes, source, minutes asked before the hard cap). Without it (this
@@ -1997,6 +2047,8 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
             print("  %s" % line)
         if apply_line(filepath) is not None:                            # [ORCH-APPLY-PATCH-1]
             print("  APPLY ✅ %s" % apply_patch_summary(filepath))
+        for note in npm_hook_notes(filepath):                           # [PREFIRE-NPM-HOOK-NOTE-1] a note only
+            print("  %s" % note)
         if dryrun_on():                                                 # [ORCH-PREFIRE-DRYRUN-GATE-1]
             print("  DRY ✅ %s" % dry_run_summary(filepath))
             reports, _ = verify_reports(filepath)
@@ -2012,6 +2064,8 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
         print("  • %s" % f)
     for line in opex:
         print("  %s" % line)
+    for note in npm_hook_notes(filepath):                               # [PREFIRE-NPM-HOOK-NOTE-1] a note only
+        print("  %s" % note)
     print("\n  Fix the brief and re-fire. --force bypasses ALL safety checks.")
     print("%s\n" % bar)
     return False

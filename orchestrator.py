@@ -7550,6 +7550,19 @@ def route_handback_path(proj: Path, stem: str) -> Path:
     return exact
 
 
+def route_commit_message(stem: str, n_briefs: int, hb_status: Optional[HandbackStatus]) -> str:
+    """[ORCH-STOP-COMMIT-SUBJECT-1] (Kanban 885) — the subject of the orchestrator's own route commit. A route whose
+    handback's first status line is a STOP or PARTIAL lands as `stop: …` / `partial: …` naming the handback's label, so
+    `git log` on the merge target never reads a stopped route as a fix (route 873, 2026-11-22: `fix: 000000873-build-
+    tsc-heap-1 — 1 briefs` landed only the brief and a `## STATUS: STOP (guard)` handback, and a watcher keyed on the
+    subject re-fired a route on it). Any other route — no handback, DONE, unreadable — keeps today's subject byte for
+    byte. What merges, the verdict and the git note are unchanged."""
+    if hb_status is not None and hb_status.is_stop:
+        kind = "partial" if hb_status.verdict == "PARTIAL" else "stop"
+        return f"{kind}: {stem} — {n_briefs} briefs — handback {hb_status.label}"
+    return f"fix: {stem} — {n_briefs} briefs"
+
+
 def _log_handback_status(path: Path) -> Optional[HandbackStatus]:
     """Read the route's handback once and say what its status line was — one `🛑 handback-status:` line."""
     hs, why = _read_handback_status(path)
@@ -8302,10 +8315,12 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
 
                 if has_changes:
                     if has_staged_changes:
-                        commit_msg = f"fix: {batch_file.stem} — {len(briefs)} briefs"
+                        # [ORCH-STOP-COMMIT-SUBJECT-1] (885): the subject names a STOP / PARTIAL handback; the message
+                        # is passed as one argument (a handback's STOP letter is the executor's text, never a shell word).
+                        commit_msg = route_commit_message(batch_file.stem, len(briefs), hb_status)
                         r = subprocess.run(
-                            f'git commit -m "{commit_msg}"',
-                            shell=True, capture_output=True, text=True, cwd=str(proj)
+                            ["git", "commit", "-m", commit_msg],
+                            capture_output=True, text=True, cwd=str(proj)
                         )
                         if r.returncode == 0:
                             log.info(f"📦 Committed: {commit_msg}")
