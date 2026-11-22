@@ -363,6 +363,16 @@ UNIT_CONFIRM_REF_PREFIX = "confirm"  # the ref prefix that identifies the confir
 # (L-150). The number is still ours, measured on a commit with that exact tree. v1 entries are migrated on
 # first load (_unit_cache_load); one whose commit is unreachable is dropped, and said.
 UNIT_BASELINE_CACHE_FILE = "unit-baseline-cache.json"   # in the sit-archive dir, gitignored
+# [ORCH-REPEAT-FLAKE-1] Kanban 836 (SESSION-BOOT rule #17 "same flaky test seen twice → bug row + fix row now", in
+# code): every file a route's unit gate confirmed FLAKY is noted, by route, in this ledger (sit-archive dir, gitignored,
+# beside the baseline cache). The lean gate's known-red baseline never reaches _unit_cache_record_flakes, so no
+# cross-route count existed: sign-creates-final.test.ts passed alone in 10 route gates of 11-19…11-21 and nobody was
+# told. A file noted by FLAKE_REPEAT_AT different routes within FLAKE_REPEAT_WINDOW_DAYS is a REPEAT FLAKE: the PASS
+# line and one warning line name it, with its count and first date. Words only — the verdict is unchanged.
+FLAKE_LEDGER_FILE = "flake-ledger.json"
+FLAKE_LEDGER_VERSION = 1
+FLAKE_REPEAT_AT = 2
+FLAKE_REPEAT_WINDOW_DAYS = 14
 UNIT_BASELINE_CACHE_VERSION = 2
 # §2.2: the baseline is MEASURED on the MERGE BASE — never stored, never read off main's
 # current tip. A stored number goes stale and becomes a lie; the `test_cmd` key in
@@ -3372,6 +3382,9 @@ class UnitGateOutcome:
     # [ORCH-FULLGATE-WT-FSDENY-1] G-B1: {newly-failing file: its first ≤5 error lines from the whole-suite run that
     # named it} — written to the unit-log entry as `confirm_errors`. None ⇒ no file was newly failing.
     confirm_errors: Optional[dict] = None
+    # [ORCH-REPEAT-FLAKE-1] ((file, routes in the window, first seen), …) for each flaky file the ledger has seen from
+    # FLAKE_REPEAT_AT or more routes in FLAKE_REPEAT_WINDOW_DAYS, this one included. () when none; no verdict reads it.
+    repeat_flakes: tuple = ()
 
     @property
     def clock(self) -> Optional[ClockViolation]:
@@ -4231,6 +4244,57 @@ def _unit_cache_judged(e: dict) -> bool:
     """[CONFIG-TRUTH-1] was this entry's clock judged? Only the store writes `clock`, and only after
     GATE-CLOCK-1; an entry without it is a miss, superseded one key at a time as it is needed."""
     return e.get("clock") == "plausible"
+
+
+def _flake_ledger_note(archive: Path, repo_name: str, route: str, flakes: tuple,
+                       now: Optional[datetime] = None) -> tuple:
+    """[ORCH-REPEAT-FLAKE-1] Note `flakes` (files a unit gate confirmed flaky) for `route` in the flake ledger and
+    return ((file, count, first_seen), …) for those seen by >= FLAKE_REPEAT_AT different routes within
+    FLAKE_REPEAT_WINDOW_DAYS (this route included), sorted by file. A route noted twice (a re-gate) counts once;
+    sightings older than the window are dropped. An unreadable ledger is never overwritten: one warning, () back.
+    Never raises — a ledger problem must not change a gate."""
+    if not flakes:
+        return ()
+    now = now or datetime.now()
+    path = archive / FLAKE_LEDGER_FILE
+    try:
+        data = json.loads(path.read_text()) if path.exists() else {"version": FLAKE_LEDGER_VERSION, "repos": {}}
+        if not isinstance(data, dict) or not isinstance(data.get("repos"), dict):
+            raise ValueError("not a flake ledger")
+    except (OSError, ValueError) as e:
+        log.warning(f"⚠️  Unit gate: {path.name} is unreadable ({type(e).__name__}) — left as it is; "
+                    f"repeat flakes are not counted this run")
+        return ()
+    cutoff = now.timestamp() - FLAKE_REPEAT_WINDOW_DAYS * 86400
+    files = data["repos"].setdefault(repo_name or "(repo)", {})
+    repeats = []
+    for f in sorted(set(flakes)):
+        seen = []
+        for s_ in files.get(f) or ():
+            try:
+                if datetime.fromisoformat(str(s_.get("at"))).timestamp() >= cutoff:
+                    seen.append({"at": str(s_["at"]), "route": str(s_.get("route", ""))})
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if not any(s_["route"] == route for s_ in seen):
+            seen.append({"at": now.isoformat(timespec="seconds"), "route": route})
+        files[f] = seen
+        if len({s_["route"] for s_ in seen}) >= FLAKE_REPEAT_AT:
+            repeats.append((f, len({s_["route"] for s_ in seen}), min(s_["at"] for s_ in seen)))
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+        tmp.replace(path)
+    except OSError as e:
+        log.warning(f"⚠️  Unit gate: {path.name} could not be written ({type(e).__name__}) — repeat flakes this run "
+                    f"are still named")
+    return tuple(repeats)
+
+
+def _repeat_flake_words(repeats: tuple) -> str:
+    """[ORCH-REPEAT-FLAKE-1] One phrase per repeat flake: `<file> flaky in N routes since <first day>`."""
+    return "; ".join(f"{f} flaky in {n} routes since {str(first)[:10]}" for f, n, first in repeats)
 
 
 def _unit_cache_record_flakes(archive: Path, repo_name: str, sha: str, cmd: str, flakes: tuple,
@@ -5561,10 +5625,16 @@ def run_unit_gate(repo_path: Path, branch_name: Optional[str] = None,
         # flaky TESTS in files that fail at the base too: named in the verdict, not in flaky_files (which are files)
         detail = (f"{rose} — the {len(flaky_t)} extra failing test(s) passed alone (flaky, not blocking): "
                   f"{'; '.join(flaky_t)} (baseline {baseline_source})")
+    repeats = _flake_ledger_note(archive_path or SIT_ARCHIVE_DIR, ACTIVE_REPO_NAME, branch_name or "(direct run)",
+                                 flakes) if flakes else ()
+    if repeats:   # [ORCH-REPEAT-FLAKE-1] rule #17 in code: named, never blocking
+        detail += f" — REPEAT FLAKE (rule #17: a Bug Registry row and a fix row are owed): {_repeat_flake_words(repeats)}"
+        log.warning(f"🔁 REPEAT FLAKE — {_repeat_flake_words(repeats)} — rule #17: a Bug Registry row and a fix row "
+                    f"are owed")
     log.info(f"✅ UNIT BASELINE GATE PASSED — {detail}; baseline {baseline_note}")
     return _finish(UnitGateOutcome(passed=True, ran=True, branch=branch_run, baseline=baseline_run,
                                    baseline_note=baseline_note, baseline_source=baseline_source,
-                                   detail=detail, flaky_files=flakes, confirm=confirm_run))
+                                   detail=detail, flaky_files=flakes, confirm=confirm_run, repeat_flakes=repeats))
 
 
 def _unit_done(o: UnitGateOutcome, started: float, repo_path: Path,
