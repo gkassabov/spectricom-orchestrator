@@ -2239,6 +2239,63 @@ def _judge_leg(kind: str, clocks: Optional[tuple], archive: Path, *, red: bool,
     return None
 
 
+# [ORCH-GATE-LEG-TREE-KILL-1] (Kanban 880; SCA-ORCH-GATE-TIMEOUT-ORPHANS-1): subprocess.run's timeout kills only the shell
+# it started; the shell's children (npm exec -> node tsc, vitest and its workers) are reparented and keep running — route
+# 853's build leg (2026-11-22 07:12:06, its 1200 s budget) left `tsc --noEmit` and the SIT listing running at ~220 % CPU
+# into its own recheck, in the daemon's process group. A gate command now runs in its own session (its own process
+# group); on its timeout — or any other error while it runs — the whole group gets SIGTERM, then SIGKILL after
+# GATE_TREE_KILL_GRACE_S, and the same TimeoutExpired is raised as before (callers unchanged). A subprocess.run that a
+# test has replaced stands for the whole call and is called exactly as before.
+GATE_TREE_KILL_GRACE_S = 3
+_STDLIB_RUN = subprocess.run
+
+
+def _kill_tree(proc: "subprocess.Popen") -> None:
+    """SIGTERM, then SIGKILL, to the process group `proc` leads (start_new_session: its pgid is its pid)."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        if sig == signal.SIGTERM:
+            try:
+                proc.wait(timeout=GATE_TREE_KILL_GRACE_S)
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(0.2)  # members other than the leader: the SIGKILL below reaches any still alive
+
+
+def _run_tree(cmd, **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run(cmd, **kwargs) for a gate command, its timeout ending the command's whole process tree."""
+    if subprocess.run is not _STDLIB_RUN:
+        return subprocess.run(cmd, **kwargs)
+    timeout = kwargs.pop("timeout", None)
+    given = kwargs.pop("input", None)
+    check = kwargs.pop("check", False)
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if given is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    with subprocess.Popen(cmd, start_new_session=True, **kwargs) as proc:
+        try:
+            out, err = proc.communicate(given, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _kill_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=GATE_TREE_KILL_GRACE_S)
+            except subprocess.TimeoutExpired:
+                out, err = exc.output, exc.stderr  # a process that left the group still holds a pipe
+            raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err) from None
+        except BaseException:
+            _kill_tree(proc)
+            raise
+    done = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+    if check:
+        done.check_returncode()
+    return done
+
+
 def _run_leg(kind: str, archive: Path, cmd: str, *, files: Optional[int] = None, **kwargs) -> tuple:
     """[GATE-CLOCK-1] subprocess.run(cmd, **kwargs) as one timed leg of `kind`: returns
     (CompletedProcess, ClockViolation | None). A leg that raises — its timeout included — is judged
@@ -2246,7 +2303,7 @@ def _run_leg(kind: str, archive: Path, cmd: str, *, files: Optional[int] = None,
     exception propagates to the caller's own handler. `files`: _judge_leg's (ORCH-CLOCKGUARD-1 K3)."""
     c0 = _leg_clocks()
     try:
-        r = subprocess.run(cmd, **kwargs)
+        r = _run_tree(cmd, **kwargs)  # [ORCH-GATE-LEG-TREE-KILL-1]: a timeout ends the leg's whole process tree
     except Exception as e:
         e.gate_clock = _judge_leg(kind, (c0, _leg_clocks()), archive, red=True, completed=False, files=files)
         raise
@@ -2594,8 +2651,8 @@ def _sit_plan(repo_path: Path, files_only: bool = False) -> Optional[SitPlan]:
     except (TypeError, ValueError):
         log.warning(f"⚠️  SIT gate: repos.yaml {SIT_BATCH_PAUSE_KEY}={raw_pause!r} is not an integer — using {SIT_BATCH_PAUSE_S}s")
     try:
-        r = subprocess.run(_gate_shell_cmd(list_cmd, repo_path), shell=True, capture_output=True,
-                           text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+        r = _run_tree(_gate_shell_cmd(list_cmd, repo_path), shell=True, capture_output=True,
+                      text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError) as e:
         plan.error, plan.detail = "sit-list-failed", f"{list_cmd!r}: {type(e).__name__}"
         return plan
@@ -2945,8 +3002,8 @@ def _sit_isolate(sit_cmd: str, repo_path: Path, plan: SitPlan, files: list,
         cmd = f"{sit_cmd} -- {shlex.quote(f)}"
         why = None
         try:
-            r = subprocess.run(_gate_shell_cmd(cmd, repo_path), shell=True, capture_output=True,
-                               text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+            r = _run_tree(_gate_shell_cmd(cmd, repo_path), shell=True, capture_output=True,
+                          text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
         except (subprocess.TimeoutExpired, OSError) as e:
             r, why = None, (f"timeout — exceeded its {SIT_TIMEOUT}s budget"
                             if isinstance(e, subprocess.TimeoutExpired) else type(e).__name__)
@@ -3784,8 +3841,8 @@ def _install_unit_deps(src: Path, dst: Path) -> tuple[list, Optional[str]]:
         else:
             return built, f"{rel}: no requirements.txt in {dst} to build it from"
         try:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(cwd),
-                               timeout=ISOLATED_DEPS_INSTALL_TIMEOUT_S)
+            r = _run_tree(cmd, shell=True, capture_output=True, text=True, cwd=str(cwd),
+                          timeout=ISOLATED_DEPS_INSTALL_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return built, f"{rel}: `{cmd}` timed out after {ISOLATED_DEPS_INSTALL_TIMEOUT_S}s"
         if r.returncode != 0:
@@ -3851,8 +3908,8 @@ def _run_unit_suite(cmd: str, cwd: Path, ref: str, timeout: Optional[int] = None
         # files back to back: sourced ⇒ 29 failed | 93 passed (122); not sourced ⇒ 3 failed |
         # 119 passed (122). 26 failures, on 6 files, that belonged to the gate and not to the
         # code. The gate must measure the suite the repo runs, not a different one.
-        r = subprocess.run(cmd, shell=True, capture_output=True,
-                           text=True, cwd=str(cwd), timeout=budget)
+        r = _run_tree(cmd, shell=True, capture_output=True,
+                      text=True, cwd=str(cwd), timeout=budget)
         raw = (r.stdout or "") + "\n" + (r.stderr or "")
         parsed = _parse_unit_summary(raw)
         # [ORCH-FULLGATE-WT-FSDENY-1] G-B1: the evidence comes from the WHOLE output, before the cap below
@@ -5005,7 +5062,7 @@ def _unit_list_cmd(repo_path: Path, test_cmd: str) -> tuple:
 def _unit_listing(repo_path: Path, cmd: str) -> tuple:
     """([file, ...], None) from a vitest `list --filesOnly` run, or (None, why)."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
+        r = _run_tree(cmd, shell=True, capture_output=True, text=True, cwd=str(repo_path), timeout=SIT_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError) as e:
         return None, f"{cmd!r}: {type(e).__name__}"
     said = _ANSI_RE.sub("", (r.stdout or "") + "\n" + (r.stderr or ""))
@@ -5953,8 +6010,8 @@ def _lint_changed(repo_path: Path, diff: "BranchDiff") -> Optional[GateVerdict]:
     full = f"{cmd} {' '.join(shlex.quote(f) for f in files)}"
     started = time.time()
     try:
-        r = subprocess.run(full, shell=True, capture_output=True, text=True, cwd=str(repo_path),
-                           timeout=BUILD_GATE_TIMEOUT)
+        r = _run_tree(full, shell=True, capture_output=True, text=True, cwd=str(repo_path),
+                      timeout=BUILD_GATE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return GateVerdict(GateOutcome.BLOCKED_ENV, "lint", "timeout", f"lint exceeded {BUILD_GATE_TIMEOUT}s")
     took = time.time() - started

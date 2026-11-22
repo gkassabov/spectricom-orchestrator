@@ -281,17 +281,19 @@ def _dotted(f: ast.AST) -> str:
 
 
 _OTHER_SPAWNERS = re.compile(r"^(os\.system|os\.exec\w*|os\.spawn\w*|os\.posix_spawn\w*|pty\.spawn|"
-                             r"subprocess\.(call|check_call|check_output|run))$")
+                             r"subprocess\.(call|check_call|check_output|run)|_run_tree)$")
 
 
 def test_G5_source_guard_one_executor_spawn_site():
     tree = ast.parse(ORCH_SRC.read_text())
     fire_toni = _function(tree, "fire_toni")
 
-    # (a) exactly one Popen, inside fire_toni
+    # (a) exactly two Popen calls: fire_toni's (the executor) and _run_tree's (ORCH-GATE-LEG-TREE-KILL-1, Kanban 880: a
+    # gate command in its own process group) — _run_tree is in _OTHER_SPAWNERS, so (c) refuses it a `claude` literal
     popens = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _is_popen(n)]
-    assert len(popens) == 1, f"{len(popens)} Popen calls at lines {[p.lineno for p in popens]}"
-    assert _inside(popens[0], fire_toni)
+    assert len(popens) == 2, f"{len(popens)} Popen calls at lines {[p.lineno for p in popens]}"
+    run_tree = _function(tree, "_run_tree")
+    assert sorted((_inside(p, fire_toni), _inside(p, run_tree)) for p in popens) == [(False, True), (True, False)]
 
     # (b) every `claude --` literal (docstrings excluded) lies inside fire_toni
     docs = _docstring_nodes(tree)
