@@ -1588,21 +1588,31 @@ class TestPytestPathWasAlreadyCorrect:
         assert c["failures"] == 0 and c["tests_skipped"] is None
 
 
+# ORCH-O8-GUARD-SCOPE (950r, S7-CORE-62): [ORCH-8] is a historical claim about its own two commits, so
+# its no-scheduling-knob guard is pinned to them, as [ORCH-9]'s was. `9890a33` stages ORCH-8; `564d3b5`
+# is its fix. Reading `main...HEAD` made it an assertion about whatever branch is checked out: it failed
+# route 950 (ORCH-SIT-LIST-PARALLEL-1, 2026-11-24 08:34), whose legitimate `--maxWorkers=6` on the SIT
+# LIST command is not an ORCH-8 change.
+ORCH8_BASE = "9890a33"
+ORCH8_TIP = "564d3b5"
+
+
 class TestOrch8ChangedNoVerdictSemantics:
     """AC-O8-09 / AC-O8-10 — the correction moves numbers, not policy."""
 
     def test_ac_o8_10_no_timeout_pool_or_parallelism_knob_moved_on_this_branch(self):
-        """§4 is report-only: nothing about how the suite is SCHEDULED changed here. Scoped
-        to this branch's diff, in the shape AC-O8-10 asks for, not to the file forever."""
+        """§4 is report-only: nothing about how the suite is SCHEDULED changed in the [ORCH-8]
+        commits. Pinned to them (ORCH8_BASE..ORCH8_TIP), not to whatever branch is checked out."""
         assert orchestrator.UNIT_GATE_TIMEOUT == 900
         assert orchestrator.UNIT_BASELINE_TIMEOUT == 1800
         assert orchestrator.UNIT_CONFIRM_TIMEOUT == 300
         # Scoped to the CODE: the brief itself quotes `testTimeout: 15000` while naming §4
         # as report-only, and a guard that trips on its own brief guards nothing.
-        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", "main...HEAD", "--unified=0",
-                            "--", "orchestrator.py", "config/"], capture_output=True, text=True)
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "diff", f"{ORCH8_BASE}..{ORCH8_TIP}",
+                            "--unified=0", "--", "orchestrator.py", "config/"],
+                           capture_output=True, text=True)
         if r.returncode != 0:
-            pytest.skip("no `main` ref to diff against")
+            pytest.skip("the [ORCH-8] commits are not present in this clone")
         touched = [l for l in r.stdout.splitlines() if l.startswith(("+", "-"))
                    and not l.startswith(("+++", "---"))]
         for knob in ("--pool", "maxWorkers", "poolOptions", "testTimeout", "availableParallelism",

@@ -87,7 +87,12 @@ repos:
     # both the batch source and the whole-suite count the batches must sum to (AC-SR-05).
     # Absent ⇒ one unbatched run. Batch size / pause default to SIT_BATCH_FILES /
     # SIT_BATCH_PAUSE_S in orchestrator.py; each SIT_TIMEOUT is the budget of one batch.
-    sit_list_cmd: "npx vitest list --config vitest.sit.config.ts"
+    # SIT-LIST-PARALLEL-1 (Kanban 950, S7-CORE-61): vitest.sit.config.ts sets fileParallelism: false (the RUN stays
+    # serial) and `vitest list` inherited it: ~3.4 s/file x 235 files ~ 800 s > SIT_TIMEOUT 600 -> sit-list-failed
+    # (route 906, 11-23 20:43 + 21:06). Listing collects only, no test body runs. On clinical-mp e4c54cb8 with
+    # --maxWorkers=6 --fileParallelism: exit 0 in 131 s, 235 files / 830 tests (= the 10:18 full gate); a 40-file
+    # chunk 137 s serial vs 37 s parallel, identical output. The SIT run command is unchanged.
+    sit_list_cmd: "npx vitest list --config vitest.sit.config.ts --maxWorkers=6 --fileParallelism"
     sit_batch_files: 10
     # D-S7CORE31-03 (S7-CORE-31, George 2026-10-17 12:48 "do 2"): no pause between batches on this LOCAL dev stack —
     # both Medplum limiters are off here (MEDPLUM_DEFAULT_RATE_LIMIT -1, MEDPLUM_DEFAULT_FHIR_QUOTA 1000000) and no
