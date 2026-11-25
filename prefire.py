@@ -1024,6 +1024,34 @@ def dependency_trays(queue_dir: Path, stem: str) -> tuple:
     return tuple(found)
 
 
+_DEP_ROW = re.compile(r'^(?P<row>\d+)(?=[-_])')
+
+
+def successor_stems(repo: QueueRepo, stem: str) -> list[str]:
+    """[ORCH-DEPENDS-SUCCESSOR-1] (Kanban 956, L-538, D-S7CORE62-14) The r-successors of `stem` on `repo`: route
+    branches `<prefix>-<row>r[<n>]-…` of the same row number (`000000906-x` → `000000906r-…`, `000000906r-3-recheck`,
+    `0000000950r3-…`), as stems, oldest name first. A re-cut route lands under its successor's name, so a brief that
+    depends on the original must not wait for a branch that will never merge. [] when the stem has no leading row
+    number or git cannot list the branches. Never a different row: `906` never matches `9060r-…`."""
+    m = _DEP_ROW.match(stem)
+    if not m:
+        return []
+    row, pre = m.group("row"), f"{repo.branch_prefix}-"
+    out = canon_assert.git(repo.path, "for-each-ref", "--format=%(refname:short)", f"refs/heads/{pre}{row}r*") or ""
+    succ = re.compile(rf'^{re.escape(row)}r\d*[-_]')
+    return sorted({b[len(pre):] for b in out.splitlines()
+                   if b.startswith(pre) and succ.match(b[len(pre):]) and b[len(pre):] != stem})
+
+
+def successor_queued(queue_dir: Path, stem: str) -> list[str]:
+    """[ORCH-DEPENDS-SUCCESSOR-1] The r-successors of `stem` whose brief sits in queue/ itself (not a tray)."""
+    m = _DEP_ROW.match(stem)
+    if not m:
+        return []
+    succ = re.compile(rf'^{re.escape(m.group("row"))}r\d*[-_]')
+    return sorted(p.stem for p in Path(queue_dir).glob("*.md") if succ.match(p.stem))
+
+
 def dependency_status(filepath: Path, queue_dir: Path,
                       resolve: Callable[[str], Optional[QueueRepo]]) -> tuple[list[Dependency], Optional[str]]:
     """D3 / D4. Every dependency the brief declares, judged — or ([], why its line cannot be read). `resolve` maps a
@@ -1041,15 +1069,37 @@ def dependency_status(filepath: Path, queue_dir: Path,
         if repo is None:
             return [], "'%s' is looked for on repo '%s', which config/repos.yaml does not name" % (stem, named or own)
         why: list = []
+        repos = _config_value("repos")
+        cfg = repos.get(repo.name) if isinstance(repos, dict) and isinstance(repos.get(repo.name), dict) else {}
         if os.environ.get(DEPENDS_PRODUCT_ENV, "").strip().lower() == "off":
             landed = canon_assert.route_merged(repo, stem)
         else:   # [ORCH-RELIABILITY-1] F3.2: merged = merged product files, judged in canon_assert (A13)
-            repos = _config_value("repos")
-            cfg = repos.get(repo.name) if isinstance(repos, dict) and isinstance(repos.get(repo.name), dict) else {}
             landed = canon_assert.route_landed_product(repo, stem, cfg.get("briefs_subdir") or "briefs", why)
+        if not landed:
+            # [ORCH-DEPENDS-SUCCESSOR-1] the route did not land under its own name: an r-successor that landed its
+            # product meets it (a successor that landed handback-only does not; its why is not kept).
+            for succ in successor_stems(repo, stem):
+                if os.environ.get(DEPENDS_PRODUCT_ENV, "").strip().lower() == "off":
+                    s_landed = canon_assert.route_merged(repo, succ)
+                else:
+                    s_landed = canon_assert.route_landed_product(repo, succ, cfg.get("briefs_subdir") or "briefs", [])
+                if s_landed:
+                    judged.append(Dependency(stem, f"{repo.name}/{repo.merge_target}",
+                                             f"{s_landed[0][:8]} [{s_landed[2]}; as successor {succ}]"))
+                    break
+            else:
+                s_landed = None
+            if s_landed:
+                continue
+        where = () if landed else dependency_trays(queue_dir, stem)
+        if not landed and QUEUED not in where:
+            # [ORCH-DEPENDS-SUCCESSOR-1] a successor still in queue/ may yet land: wait for it, do not park.
+            queued = [s for s in successor_queued(queue_dir, stem) if s != stem]
+            if queued:
+                where, why = where + (QUEUED, f"(successor {queued[0]} queued)"), []
         judged.append(Dependency(stem, f"{repo.name}/{repo.merge_target}",
                                  f"{landed[0][:8]} [{landed[2]}]" if landed else None,
-                                 () if landed else dependency_trays(queue_dir, stem), why[0] if why else None))
+                                 where, why[0] if why else None))
     return judged, None
 
 
