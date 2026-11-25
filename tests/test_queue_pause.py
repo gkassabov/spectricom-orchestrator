@@ -169,7 +169,8 @@ class TestPausePersisted:
         daemon.d.run_loop()
         before = daemon.state()
         other = tmp_path / "extra.md"
-        other.write_text("# extra\n")
+        # QUEUE-GUARDS-1 (Kanban 954): enqueue refuses a brief with no `#!queue … repo=` header on line 1 — this one carries it.
+        other.write_text("#!queue model=m effort=e repo=r\n# extra\n")
         cli = queue_daemon.QueueDaemon()          # what `python3 queue_daemon.py enqueue` builds
         assert cli.enqueue(str(other))["ok"]
         after = daemon.state()

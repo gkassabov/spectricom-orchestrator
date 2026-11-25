@@ -1802,10 +1802,64 @@ def named_inputs_summary(filepath: Path) -> str:
     return "%d ~/_eos path(s) exist · %d sha256, each 64 hex and matching" % (paths, shas)
 
 
+# ── QHDR / HBN · QUEUE-GUARDS-1 (Kanban 954 + 952; D-S7CORE62-04 / -03; L-535, L-536) ─────────────────────────────
+# 950r2 was copied into the queue with a provenance comment on line 1 and the daemon refused it at fire time (L-535);
+# 950 and 950r3 merged green but read `handback-status: none` because their briefs named a handback the orchestrator
+# cannot find (`000000950-…` for stem `0000000950-…`; a stale `…r2` name on the r3 re-cut) (L-536). Both are refused at
+# enqueue now, before the queue spends a fire on them. Always on — a brief's shape, not a policy switch.
+_HANDBACK_HEADING = re.compile(r'^## HANDBACK\b')
+_ANY_HEADING = re.compile(r'^## ')
+_HANDBACK_REF = re.compile(r'briefs/([A-Za-z0-9._-]+?)\.handback\.md')
+
+
+def queue_header_problems(filepath: Path) -> list[str]:
+    """QHDR. One refusal when line 1 is not `#!queue …` naming `repo=` (the daemon's own NO_REPO_REFUSAL at fire)."""
+    first = _read(filepath).split("\n", 1)[0]
+    if not first.startswith("#!queue"):
+        return ["QHDR ❌ line 1 is not the `#!queue … repo=` header (a comment or blank line above it hides it from the "
+                "daemon, which refuses the brief at fire: 950r2, L-535)"]
+    if not queue_header(filepath).get("repo"):
+        return ["QHDR ❌ the `#!queue` header on line 1 names no `repo=`"]
+    return []
+
+
+def handback_names_ok(stem: str) -> tuple[str, ...]:
+    """The handback file names the orchestrator finds for a route (orchestrator.route_handback_path): the stem's own,
+    and, for a zero-prefixed stem, its zero-less form."""
+    exact = f"{stem}.handback.md"
+    lean = re.sub(r'^0+(?=\d)', '', stem)
+    return (exact,) if lean == stem else (exact, f"{lean}.handback.md")
+
+
+def handback_name_problems(filepath: Path) -> list[str]:
+    """HBN. One refusal per handback path named in the brief's `## HANDBACK…` section(s), outside code fences, that the
+    route cannot find (handback_names_ok). A brief that names none there is not judged."""
+    ok = handback_names_ok(Path(filepath).name[:-3] if Path(filepath).name.endswith(".md") else Path(filepath).stem)
+    out: list[str] = []
+    inside = False
+    for _, raw in _unfenced(_read(filepath)):
+        if _HANDBACK_HEADING.match(raw):
+            inside = True
+        elif _ANY_HEADING.match(raw):
+            inside = False
+        if not inside:
+            continue
+        for m in _HANDBACK_REF.finditer(raw):
+            name = f"{m.group(1)}.handback.md"
+            if name not in ok:
+                line = f"HBN ❌ the HANDBACK section names `briefs/{name}` — the route reads only " + " or ".join(
+                    f"`briefs/{o}`" for o in ok) + " (950 / 950r3 merged green with `handback-status: none`, L-536)"
+                if line not in out:
+                    out.append(line)
+    return out
+
+
 def enqueue_problems(filepath: Path, config: Optional[Path] = None) -> list[str]:
-    """What `queue_daemon.py enqueue` refuses a brief for: DRY alone (SD-6(a): "or that is being enqueued"), switched
-    by `config` (the daemon's config/repos.yaml). [] when DRY is not on (dryrun_on)."""
-    return dry_run_problems(filepath) if dryrun_on(config) else []
+    """What `queue_daemon.py enqueue` refuses a brief for: QHDR and HBN always (QUEUE-GUARDS-1), then DRY (SD-6(a):
+    "or that is being enqueued"), switched by `config` (the daemon's config/repos.yaml) — [] from DRY when it is not on
+    (dryrun_on)."""
+    shape = queue_header_problems(filepath) + handback_name_problems(filepath)
+    return shape + (dry_run_problems(filepath) if dryrun_on(config) else [])
 
 
 # ── HDR: a header line its reader cannot see (ORCH-PREFIRE-PARSE-HAZARDS-1 (iv)) ──────────────────────────────────
