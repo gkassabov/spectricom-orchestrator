@@ -35,6 +35,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "admission: the test sets up admission's meminfo and markers itself")
     config.addinivalue_line("markers", "guards: the test fires with ORCH-TONI-GUARDS-1's guards as configured")
     config.addinivalue_line("markers", "executor_auth: the test runs executor_auth.probe itself (subprocess stubbed)")
+    config.addinivalue_line("markers", "self_merge: the test runs the daemon's DEMOTION-SELF-MERGE check (937)")
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +64,17 @@ def _executor_auth_ok(request, monkeypatch):
         return
     monkeypatch.setattr(executor_auth, "probe", lambda *a, **k: executor_auth.AuthProbe(
         True, "ok", "logged in (tests: stubbed by conftest)", None))
+
+
+@pytest.fixture(autouse=True)
+def _self_merge_off(request, monkeypatch):
+    """DEMOTION-SELF-MERGE-DETECT-1 (S7-CORE-62, route 937): before each fire the daemon reads the brief's repo's
+    merge target and live checkout. A fire-loop test names a real repo from config/repos.yaml and must not judge
+    the live checkout it happens to run beside: off unless the test is marked @pytest.mark.self_merge."""
+    if request.node.get_closest_marker("self_merge"):
+        monkeypatch.delenv("ORCH_SELF_MERGE", raising=False)
+        return
+    monkeypatch.setenv("ORCH_SELF_MERGE", "off")
 
 
 @pytest.fixture(autouse=True)

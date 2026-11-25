@@ -655,6 +655,151 @@ def check_queue_trunk_invariants(queue_dir: Path, repo: QueueRepo) -> list[Viola
     return out
 
 
+# ── DEMOTION-SELF-MERGE-DETECT-1 · Kanban 937 · AP-GEMMA demotion trigger PDT-57-1 (S7-CORE-62) ─────────────────
+# The trigger (Agent Inventory v0-15, D-S7CORE61-04): an agent merges or commits to a repo's merge target itself,
+# outside the queue. Until 937 only a human reading `git log` saw it. The orchestrator is the only merge principal and
+# every merge it makes logs one line, `🔀 Merged <branch> → <target> (<before> → <after>)` (the orchestrator's merge step),
+# so the question is decidable from disk: every commit on the target's FIRST-PARENT line after a known-good baseline
+# must lie inside one logged range, (before, after]. A commit outside every range is a hit, named with its subject.
+# Measured 2026-11-25 on clinical-mp: the last 80 first-parent commits on main (fix:, stop:, regate:, Merge commit)
+# are all inside a logged range — the routes, the STOP commits and the gates-only re-gates are the orchestrator's.
+# A stray landed BEFORE a route was cut sits between one merge's `after` and the next merge's `before`, so it is
+# outside every range even though a later merge fast-forwards over it.
+#
+# The second half: between routes the live checkout is the route's base. Anything uncommitted or untracked in it
+# outside the briefs folder (git-ignored paths excepted) was written outside a route fire. Measured: 0 of the last
+# 150 clinical-mp route logs saw such a path before the unit gate (the unit gate's tree_why), so a clean tree is
+# the normal state and a hit is real.
+MERGED_LOG_RE = re.compile(r"🔀 Merged \S+ → (?P<target>\S+) \((?P<before>[0-9a-f]{7,40}) → (?P<after>[0-9a-f]{7,40})\)")
+
+
+@dataclass(frozen=True)
+class SelfMergeHit:
+    """One commit on a merge target's first-parent line that no orchestrator merge put there, or one path written
+    into the live checkout outside a route fire."""
+    repo: str
+    kind: str        # "commit" | "baseline" | "live-write"
+    ref: str         # the commit sha, or the path
+    detail: str      # the commit's subject, or the porcelain status
+
+    def __str__(self) -> str:
+        if self.kind == "commit":
+            return f"{self.repo}: {self.ref[:8]} {self.detail} — on the merge target's first-parent line, in no logged orchestrator merge"
+        if self.kind == "baseline":
+            return f"{self.repo}: {self.detail}"
+        return f"{self.repo}: {self.ref} ({self.detail}) — written in the live checkout outside a route fire"
+
+
+def logged_merge_ranges(log_dir: Path, target: str, newer_than: Optional[float] = None) -> list[tuple[str, str]]:
+    """Every `(before, after)` pair the orchestrator logged for `target` in log_dir's `orch-*.log` files. newer_than:
+    a POSIX time — older files are not read (a merge is logged by the route that made it, so a file last written
+    before the baseline commit cannot hold a range past it)."""
+    out: list[tuple[str, str]] = []
+    try:
+        files = sorted(Path(log_dir).glob("orch-*.log"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            if newer_than is not None and f.stat().st_mtime < newer_than:
+                continue
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if "🔀 Merged" not in line:
+                        continue
+                    m = MERGED_LOG_RE.search(line)
+                    if m and m.group("target") == target:
+                        out.append((m.group("before"), m.group("after")))
+        except OSError:
+            continue
+    return out
+
+
+def ledger_merge_tips(ledger_file: Path, repo: str, target: str) -> list[tuple[Optional[str], str]]:
+    """`(None, target_tip)` for every `merge` entry of `repo` into `target` in logs/ledger.jsonl (ORCH-LEDGER-CHAIN-1).
+    The ledger records the tip a merge left, not the tip before it; it is what the meta lane (the orchestrator's own
+    repo), which logs no `🔀 Merged (a → b)` line, has."""
+    out: list[tuple[Optional[str], str]] = []
+    try:
+        with open(ledger_file, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"merge"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                tip = d.get("target_tip")
+                if (d.get("kind") == "merge" and d.get("repo") == repo and (d.get("target") or target) == target
+                        and isinstance(tip, str) and re.fullmatch(r"[0-9a-f]{7,40}", tip)):
+                    out.append((None, tip))
+    except OSError:
+        pass
+    return out
+
+
+def unrecorded_merges(repo: QueueRepo, baseline: str,
+                      ranges: Sequence[tuple[Optional[str], str]]) -> Optional[list[SelfMergeHit]]:
+    """The first-parent commits of `repo`'s merge target after `baseline` that no recorded merge put there. `ranges`:
+    `(before, after)` from the orchestrator's log lines, and `(None, after)` from the ledger. [] = clean.
+    None = git could not say (no repo, an unknown sha): the caller says so and does not stop on it."""
+    tip = git(repo.path, "rev-parse", repo.merge_target)
+    if tip is None or git(repo.path, "cat-file", "-e", f"{baseline}^{{commit}}") is None:
+        return None
+    if _git_rc(repo.path, "merge-base", "--is-ancestor", baseline, tip) != 0:
+        return [SelfMergeHit(repo.name, "baseline", baseline,
+                             f"the recorded baseline {baseline[:8]} is no longer an ancestor of {repo.merge_target} "
+                             f"{tip[:8]} — the target was rewritten outside the queue")]
+    listed = git(repo.path, "rev-list", "--first-parent", f"{baseline}..{tip}")
+    if listed is None:
+        return None
+    line = listed.split()
+    if not line:
+        return []
+    order = list(reversed(line))          # oldest first
+    pos = {c: i for i, c in enumerate(order)}
+    befores: dict[int, list[str]] = {}    # boundary index → the logged `before`s of the merges that made it
+    for before, after in ranges:
+        i = next((pos[c] for c in pos if c.startswith(after)), None)
+        if i is not None:
+            befores.setdefault(i, []).append(before or "")
+    covered: set[str] = set()
+    prev = baseline
+    for i in sorted(befores):
+        full = order[i]
+        logged = [b for b in befores[i] if b]
+        # A merge logged with its `before` covers (before, after] — a stray landed before the route was cut is
+        # outside it. A merge known only by its tip (the ledger's meta lane logs no range) covers the segment from
+        # the previous known merge, or the baseline, to its tip.
+        for start in (logged or [prev]):
+            seg = git(repo.path, "rev-list", "--first-parent", f"{start}..{full}")
+            if seg:
+                covered.update(seg.split())
+        prev = full
+    return [SelfMergeHit(repo.name, "commit", c, _subject(repo.path, c)) for c in order if c not in covered]
+
+
+def live_checkout_writes(repo: QueueRepo, briefs_subdir: str = "briefs") -> Optional[list[SelfMergeHit]]:
+    """Paths uncommitted or untracked in `repo`'s live checkout outside `briefs_subdir` (git-ignored paths are not
+    listed by git). Call it only between routes. [] = clean; None = git could not say."""
+    if not (repo.path / ".git").exists():
+        return None
+    r = subprocess.run(["git", "-C", str(repo.path), "--no-optional-locks", "status", "--porcelain",
+                        "--untracked-files=all", "-z"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    out: list[SelfMergeHit] = []
+    it = iter(r.stdout.split("\0"))
+    for f in it:   # `XY path`, and a rename's or copy's source as the next field
+        if not f:
+            continue
+        paths = [f[3:]] + ([next(it, "")] if f[:1] in ("R", "C") else [])
+        for p in paths:
+            if p and not under_subdir(p, briefs_subdir):
+                out.append(SelfMergeHit(repo.name, "live-write", p, f[:2].strip() or "?"))
+    return out
+
+
 # ── ORCH-STALEBASE-1 · the branch-side invariant (S7-CORE-15 · BUG-S7CORE14-ORCH-STALEBASE-01) ──
 # The trunk invariant above asks "has this route already landed?". This one asks the question
 # before the route runs at all:

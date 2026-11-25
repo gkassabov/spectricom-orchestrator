@@ -50,6 +50,9 @@ import ledger_chain      # [ORCH-LEDGER-CHAIN-1] (623): kill, unkill, override a
 from canon_assert import (DEFAULT_EXECUTOR_EFFORT, DEFAULT_EXECUTOR_MODEL, EXECUTOR_ENV,
                           GateLogViolation, QueueRepo, Violation, check_gate_log_invariants,
                           check_queue_trunk_invariants, executor_default, queue_header)
+# [DEMOTION-SELF-MERGE-DETECT-1] (937): the two predicates of AP-GEMMA's demotion trigger PDT-57-1, and git.
+from canon_assert import (git as _ca_git, ledger_merge_tips, live_checkout_writes,  # noqa: E402
+                          logged_merge_ranges, unrecorded_merges)
 
 ORCH_DIR = Path.home() / "spectricom-orchestrator"
 QUEUE_DIR = ORCH_DIR / "queue"
@@ -92,7 +95,7 @@ USAGE = ("Usage: python3 queue_daemon.py [--start-running] | enqueue <file> | st
          "resume [--reset-consecutive] [--reason <paused_reason>] | config <key> <value> | check | check-logs "
          "| clear | kill [--reason \"<text>\"] | unkill --reason \"<text>\" | override <repo> <route branch> "
          "--verdict <V> --by <approver> --reason \"<text>\" | release-hold <repo> <route branch> --by <approver> "
-         "--reason \"<text>\"\n  With no command it runs the daemon "
+         "--reason \"<text>\" | accept-main <repo> --reason \"<text>\"\n  With no command it runs the daemon "
          "loop: paused at start when work is queued; --start-running fires the queue at once.")
 
 # [ORCH-TONI-GUARDS-1] (S7-CORE-33) The kill switch.
@@ -131,6 +134,55 @@ def control_file() -> Path:
 def pause_notice_file() -> Path:
     """[ORCH-LANE-1] O2: state/queue-paused.json, resolved per call like control_file()."""
     return ORCH_DIR / "state" / PAUSE_NOTICE_NAME
+
+
+# [DEMOTION-SELF-MERGE-DETECT-1] Kanban 937 · AP-GEMMA demotion trigger PDT-57-1 (D-S7CORE61-04, D-S7CORE62-08).
+# Before each fire, for the repo the brief names: (1) every commit on its merge target's first-parent line after the
+# recorded baseline lies in a range an orchestrator merge logged; (2) its live checkout has nothing uncommitted or
+# untracked outside the briefs folder. A hit pauses the queue `safety-red:demotion-self-merge:<repo>:<ref>` — George
+# lifts it, after Gemma takes the trigger's action (stop the agent, route its work through the queue, LESSONS +
+# Inventory). A commit George rules legitimate is accepted with `accept-main <repo> --reason`, which moves the
+# baseline to the target's tip; the next resume then fires. First sight of a repo records its tip as the baseline and
+# judges nothing before it. Git that cannot answer is said and does not stop the queue (fail-open: the trigger is a
+# detector, not the merge lane's lock). `ORCH_SELF_MERGE=off` ⇒ not checked (the test suite's default, conftest).
+SELF_MERGE_VAR = "ORCH_SELF_MERGE"
+SELF_MERGE_PREFIX = "safety-red:demotion-self-merge:"
+SELF_MERGE_LOG_NAME = "self-merge.log"
+SELF_MERGE_NAMED = 5
+
+
+def self_merge_file(repo_name: str) -> Path:
+    """[DEMOTION-SELF-MERGE-DETECT-1] state/self-merge-<repo>.json — {baseline, set_at, by}; resolved per call."""
+    return ORCH_DIR / "state" / f"self-merge-{repo_name}.json"
+
+
+def _self_merge_record(repo_name: str, baseline: str, by: str) -> None:
+    rec = {"baseline": baseline, "set_at": datetime.now().isoformat(timespec="seconds"), "by": by}
+    p = self_merge_file(repo_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(p, rec)
+
+
+def accept_main(repo_name: str, reason: str) -> tuple[int, str]:
+    """[DEMOTION-SELF-MERGE-DETECT-1] George's ruling that what is on <repo>'s merge target now is legitimate: the
+    baseline moves to its tip, one line appended to logs/self-merge.log. The pause itself is lifted by `resume`."""
+    repo = repo_route(repo_name)
+    if repo is None:
+        return 2, f"no repo {repo_name!r} in {REPOS_CONFIG}"
+    tip = _ca_git(repo.path, "rev-parse", repo.merge_target)
+    if not tip:
+        return 1, f"git cannot read {repo_name} {repo.merge_target} at {repo.path}"
+    old = _read_json(self_merge_file(repo_name)).get("baseline")
+    _self_merge_record(repo_name, tip, f"accept-main: {reason}")
+    line = (f"{datetime.now().isoformat(timespec='seconds')} accept-main {repo_name} {repo.merge_target} "
+            f"{(old or '-')[:8]} → {tip[:8]} — {reason}")
+    try:
+        (LOG_DIR / SELF_MERGE_LOG_NAME).parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / SELF_MERGE_LOG_NAME, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"[QUEUE] could not append {LOG_DIR / SELF_MERGE_LOG_NAME}: {e}")
+    return 0, line
 
 
 def resume_command(reason: str) -> str:
@@ -2062,6 +2114,11 @@ class QueueDaemon:
                 continue
             self._kill_said = None
 
+            # [DEMOTION-SELF-MERGE-DETECT-1] (937) after KILL, before admission claims a slot: a commit on the
+            # target no orchestrator merge made, or a write in the live checkout, holds the queue (safety-red).
+            if not self._self_merge_step(batch_name, b_repo):
+                continue
+
             # [ORCH-CAPACITY-1] C1 · L-70: one Toni route at a time across every repo, and only with memory to
             # spare. A refusal is a wait, never a failure: nothing fires and the brief stays first in queue/. The
             # yes claims the slot (state/admitted-<pid>.json); the route adopts the claim (ORCH_ADMISSION_CLAIM)
@@ -2331,6 +2388,69 @@ class QueueDaemon:
               f"Then: {resume_command(reason)}")
         return False, None
 
+    def _self_merge_step(self, batch_name: str, b_repo: str) -> bool:
+        """[DEMOTION-SELF-MERGE-DETECT-1] (937) before each fire: True ⇒ fire; False ⇒ paused safety-red, nothing
+        fired, the brief stays first in queue/. One `🛡 self-merge:` line either way."""
+        if os.environ.get(SELF_MERGE_VAR, "").strip().lower() == "off":
+            return True
+        repo = repo_route(b_repo)
+        if repo is None:
+            return True
+        tip = _ca_git(repo.path, "rev-parse", repo.merge_target)
+        if not tip:
+            print(f"[QUEUE] 🛡 self-merge: UNKNOWN — git cannot read {b_repo} {repo.merge_target}; not judged")
+            return True
+        base = _read_json(self_merge_file(b_repo)).get("baseline")
+        hits: list = []
+        if not base:
+            _self_merge_record(b_repo, tip, "first sight")
+            print(f"[QUEUE] 🛡 self-merge: BASELINE — {b_repo} {repo.merge_target} {tip[:8]} recorded; "
+                  f"commits after it are judged from the next fire")
+            base = tip
+        elif base != tip:
+            when = _ca_git(repo.path, "log", "-1", "--format=%ct", base)
+            newer = float(when) - 86400 if when and when.isdigit() else None
+            ranges = logged_merge_ranges(LOG_DIR / _log_subdir(b_repo), repo.merge_target, newer_than=newer)
+            ranges += ledger_merge_tips(ledger_chain.ledger_path(ledger_chain.ledger_dir(LOG_DIR)), b_repo,
+                                        repo.merge_target)
+            found = unrecorded_merges(repo, base, ranges)
+            if found is None:
+                print(f"[QUEUE] 🛡 self-merge: UNKNOWN — git cannot judge {b_repo} {base[:8]}..{tip[:8]}; not judged")
+            else:
+                hits.extend(found)
+        # The daemon's own checkout (the orchestrator repo, meta lane) holds its runtime files — state, logs, the
+        # session log, killed markers — untracked by design: its live half is not judged. Measured 2026-11-25: three
+        # such files there, none in clinical-mp's live checkout.
+        if repo.path.resolve() == ORCH_DIR.resolve():
+            live = []
+        else:
+            live = live_checkout_writes(repo, _repo_config(b_repo).get("briefs_subdir", "briefs"))
+        if live is None:
+            print(f"[QUEUE] 🛡 self-merge: UNKNOWN — git cannot read {b_repo}'s live checkout status; not judged")
+        else:
+            hits.extend(live)
+        if not hits:
+            if base != tip:
+                _self_merge_record(b_repo, tip, "clean")
+            print(f"[QUEUE] 🛡 self-merge: CLEAN — {b_repo} {repo.merge_target} {tip[:8]}: every commit since the "
+                  f"baseline is an orchestrator merge; the live checkout holds nothing outside a route")
+            return True
+        named = "; ".join(str(h) for h in hits[:SELF_MERGE_NAMED]) + (
+            f"; … +{len(hits) - SELF_MERGE_NAMED} more" if len(hits) > SELF_MERGE_NAMED else "")
+        first = hits[0]
+        reason = f"{SELF_MERGE_PREFIX}{b_repo}:{first.ref[:12] if first.kind != 'live-write' else first.ref}"
+        fix = (f"AP-GEMMA demotion trigger PDT-57-1: stop the agent that did it, route its work through the queue, "
+               f"LESSONS + Agent Inventory. If George rules it legitimate: "
+               f"`cd {shlex.quote(str(ORCH_DIR))} && python3 queue_daemon.py accept-main {shlex.quote(b_repo)} "
+               f"--reason \"<ruling>\"`, then resume")
+        with self.lock:
+            self.current_batch = None
+            self._mark_paused(reason, say=False, detail=f"{named}. {fix}")
+            self._save_state()
+        print(f"[QUEUE] 🛡 self-merge: HOLD — DEMOTION-SELF-MERGE — {named} — {batch_name} not fired. {fix}. "
+              f"Then: {resume_command(reason)}")
+        return False
+
     def _wait_for_unkill(self, batch_name: str, killed: dict):
         """[ORCH-TONI-GUARDS-1] KILL exists: nothing fired, the brief stays in queue/, and the loop looks again after
         PAUSED_POLL_S. One log line per KILL (per what it says); `status` line 1 shows it as `waiting: …`."""
@@ -2481,6 +2601,14 @@ def main(argv: list) -> int:
             return 2
         rc, msg = append_override(*opts)
         print(("✅ override appended — " if rc == 0 else "⛔ override refused — ") + msg)
+        return rc
+    if cmd == "accept-main":                  # [DEMOTION-SELF-MERGE-DETECT-1] (937) George's ruling
+        rest = argv[1:]
+        if len(rest) != 3 or rest[1] != "--reason" or not rest[2].strip():
+            print("Usage: python3 queue_daemon.py accept-main <repo> --reason \"<text>\"", file=sys.stderr)
+            return 2
+        rc, msg = accept_main(rest[0], rest[2].strip())
+        print(("✅ baseline moved — " if rc == 0 else "⛔ accept-main refused — ") + msg)
         return rc
     if cmd == "release-hold":                 # [ORCH-MERGE-HOLD-1] appended, then a gates-only re-gate queued
         opts = _release_args(argv[1:])
