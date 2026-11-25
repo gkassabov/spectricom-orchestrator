@@ -7639,6 +7639,71 @@ def _worktree_main_hold(proj: Path) -> Optional[HandbackHold]:
                         f"{GateOutcome.BLOCKED_ENV.value} — {reason}", source="DEMOTION TRIGGER")
 
 
+# [DEMOTION-STRAY-IN-LIVE-DETECT-1] (Kanban 939; AP-GEMMA demotion trigger (761) PDT-57-3, D-S7CORE61-04; George go by
+# name 2026-11-24 12:56 ET, D-S7CORE62-08): an agent's copy or worktree left inside the live checkout is swept into the
+# route by `git add -A` and gated as the route's own (761 2026-11-21: a stray `c1a435c7/` copy turned its unit gate red).
+# Named BEFORE the sweep: a path the merge target's tree has no top-level entry for, that the brief's ALLOWED FILES do not
+# name, untracked in the live checkout — or a linked worktree under it. Measured 2026-11-25: of 210 merged clinical-mp
+# routes, 2 added a new top-level entry (`.github`/`.npmrc` in 631, `config` in 718), both named in their ALLOWED FILES.
+DEMOTION_STRAY_IN_LIVE = "DEMOTION-STRAY-IN-LIVE"
+STRAY_NAMED = 5
+
+
+def _stray_in_live_hold(proj: Path, batch_file: Path) -> Optional[HandbackHold]:
+    """None — nothing stray in `proj` (or it cannot be judged); else a BLOCKED(environment) hold naming the stray paths.
+    Read-only (`git ls-tree`, `git status`, `git worktree list`). A declared control (C `stray-in-live`,
+    tests/test_control_verdict_lines.py): one `🛡 stray-in-live:` line every main-checkout fire (P-SAY)."""
+    briefs = _active_briefs_subdir()
+    roots = set((_git_read(f"git ls-tree --name-only {MERGE_TARGET}", proj) or "").split())
+    try:
+        st = subprocess.run(["git", "-C", str(proj), "--no-optional-locks", "status", "--porcelain",
+                             "--untracked-files=normal", "-z"], capture_output=True, text=True, timeout=120)
+        fields = st.stdout.split("\0") if st.returncode == 0 and isinstance(st.stdout, str) else None
+    except (OSError, subprocess.TimeoutExpired):
+        fields = None
+    if fields is None or not roots:
+        log.warning(f"🛡 stray-in-live: UNKNOWN — not judged: `git status` or {MERGE_TARGET}'s tree could not be read")
+        return None
+    try:
+        text = batch_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    allowed = ""
+    for m in _ALLOWED_HEAD_RE.finditer(text):
+        end = _SECTION_END_RE.search(text, m.end() + 1)
+        allowed += text[m.end(): end.start() if end else len(text)]
+    named = {t.strip().removeprefix("./").split("/")[0] for t in re.findall(r"`([^`\n]+)`", allowed)}
+    strays = []
+    for f in fields:
+        # an untracked DIRECTORY at the top level (`?? c1a435c7/`, git's `normal` mode collapses it): a copy's shape.
+        # A new root FILE is the route's own work, swept as before.
+        if f[:2] != "??" or not f.endswith("/"):
+            continue
+        p = f[3:]
+        top = p.rstrip("/")
+        if not top or "/" in top or _under_subdir(p, briefs) or top in roots or top in named:
+            continue
+        strays.append(p)
+    me = Path(proj).resolve()
+    for line in (_git_read("git worktree list --porcelain", proj) or "").splitlines():
+        if line.startswith("worktree "):
+            wt = Path(line[len("worktree "):]).resolve()
+            if wt != me and me in wt.parents:
+                rel = f"{wt.relative_to(me)}/"
+                strays = [s for s in strays if s != rel] + [f"{rel} (a linked worktree)"]
+    if not strays:
+        log.info(f"🛡 stray-in-live: CLEAN — nothing outside {MERGE_TARGET}'s tree and the brief's ALLOWED FILES "
+                 f"in the live checkout")
+        return None
+    shown = ", ".join(strays[:STRAY_NAMED]) + (f", … +{len(strays) - STRAY_NAMED} more" if len(strays) > STRAY_NAMED else "")
+    reason = (f"{DEMOTION_STRAY_IN_LIVE}: {shown} in the live checkout {proj} — not in {MERGE_TARGET}'s tree and not "
+              f"named in the brief's ALLOWED FILES (AP-GEMMA demotion trigger 761); move it out of the live checkout, "
+              f"then re-fire")
+    log.error(f"🛡 stray-in-live: HOLD — {GateOutcome.BLOCKED_ENV.value} — {reason}")
+    return HandbackHold(Status.BLOCKED, GateOutcome.BLOCKED_ENV.value, reason,
+                        f"{GateOutcome.BLOCKED_ENV.value} — {reason}", source="DEMOTION TRIGGER")
+
+
 def _executor_exit_hold(ec: int, branch: str, out_log: Optional[str] = None) -> Optional[HandbackHold]:
     """[ORCH-TIMEOUT-HOLD-1] P-MERGE: merged(r) ⇒ ec(r) == 0 ∧ handback(r) CLEAN ∧ gates(r) PASS. None
     ⇒ exit 0, and the handback guard judges next. An executor that did not exit 0 but left work on
@@ -8310,6 +8375,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
     elif branch_name and worktree is None:
         try:
             if status == Status.PASSED:
+                # [DEMOTION-STRAY-IN-LIVE-DETECT-1] (939): a stray copy or worktree in the live checkout is named
+                # BEFORE the sweep below would commit it as the route's (main-checkout lane only).
+                if hold is None and route_wt is None:
+                    hold = _stray_in_live_hold(proj, batch_file)
                 # Commit all changes on feature branch — not on an applied route: its one commit is made
                 if applied is None:   # [ORCH-APPLY-PATCH-1] r2 (m-5): nothing beyond the patch is swept in
                     subprocess.run("git add -A", shell=True, cwd=str(proj), capture_output=True)

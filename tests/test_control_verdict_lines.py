@@ -54,6 +54,8 @@ C = {
     "executor-auth": "_executor_auth_check",
     # DEMOTION-WORKTREE-MAIN-DETECT-1r (938r, D-S7CORE62-10): a tenth, one line per main-checkout fire: CLEAN or HOLD
     "worktree-main": "_worktree_main_hold",
+    # DEMOTION-STRAY-IN-LIVE-DETECT-1 (939, D-S7CORE62-08): an eleventh, one line per main-checkout fire
+    "stray-in-live": "_stray_in_live_hold",
 }
 # the canon_assert predicates behind C: every call site must sit in a function that speaks
 C_PREDICATES = {"check_handback_invariants", "check_bg_ceiling_invariants", "check_clock_plausibility",
