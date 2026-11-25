@@ -7617,6 +7617,28 @@ def _handback_hold(out_log: str) -> Optional[HandbackHold]:
                         f"{GateOutcome.BLOCKED_ENV.value} — handback guard: {reason}")
 
 
+# [DEMOTION-WORKTREE-MAIN-DETECT-1] (Kanban 938; AP-GEMMA demotion trigger (628), D-S7CORE61-04; George go by name
+# 2026-11-24 12:56 ET, D-S7CORE62-08): an agent worktree that checks out MERGE_TARGET while a route is live makes the
+# route's merge impossible (route 628, 2026-11-19). ORCH-MERGE-CHECKOUT-SILENT-1 (802) refuses that merge AFTER the gates;
+# this names the holder BEFORE them, so the gates are not spent and the trigger is reported with its cause.
+DEMOTION_WORKTREE_MAIN = "DEMOTION-WORKTREE-MAIN"
+
+
+def _worktree_main_hold(proj: Path) -> Optional[HandbackHold]:
+    """None — no checkout but `proj` holds MERGE_TARGET (or none does); else a BLOCKED(environment) hold naming the
+    checkout that holds it. Read-only (`git worktree list --porcelain`). [938r] A declared control (C `worktree-main`,
+    tests/test_control_verdict_lines.py): one `🛡 worktree-main:` line either way (P-SAY)."""
+    holder = _checkout_holding(MERGE_TARGET, proj)
+    if holder is None or holder.resolve() == Path(proj).resolve():
+        log.info(f"🛡 worktree-main: CLEAN — no other checkout holds {MERGE_TARGET}")
+        return None
+    reason = (f"{DEMOTION_WORKTREE_MAIN}: {MERGE_TARGET} is checked out at {holder} — an agent worktree holds the merge "
+              f"target (AP-GEMMA demotion trigger 628); move it off {MERGE_TARGET} or remove it, then re-fire")
+    log.error(f"🛡 worktree-main: HOLD — {GateOutcome.BLOCKED_ENV.value} — {reason}")
+    return HandbackHold(Status.BLOCKED, GateOutcome.BLOCKED_ENV.value, reason,
+                        f"{GateOutcome.BLOCKED_ENV.value} — {reason}", source="DEMOTION TRIGGER")
+
+
 def _executor_exit_hold(ec: int, branch: str, out_log: Optional[str] = None) -> Optional[HandbackHold]:
     """[ORCH-TIMEOUT-HOLD-1] P-MERGE: merged(r) ⇒ ec(r) == 0 ∧ handback(r) CLEAN ∧ gates(r) PASS. None
     ⇒ exit 0, and the handback guard judges next. An executor that did not exit 0 but left work on
@@ -8338,6 +8360,10 @@ def _run_batch_inner(batch_file: Path, proj: Path, started: datetime, worktree=N
                     # branch below would check out MERGE_TARGET WITHOUT committing, dragging the work
                     # into the target's checkout), then gets no gate and no merge. Its status is set
                     # after the lanes, from the hold.
+                    # [DEMOTION-WORKTREE-MAIN-DETECT-1] (938): the main-checkout lane merges in `proj`; another checkout
+                    # holding MERGE_TARGET is named now, before the gates (a route worktree merges by update-ref: not judged).
+                    if hold is None and route_wt is None:
+                        hold = _worktree_main_hold(proj)
                     verdict = None
                     if hold is None:
                         verdict = run_pre_merge_gates(proj, branch_name)
