@@ -105,6 +105,11 @@ repos:
     # BUILD-GATE-BUDGET-1 (S7-CORE-59): the build leg's budget (default BUILD_GATE_TIMEOUT 600). `tsc --noEmit && npm run
     # build` took 6.7 and 7.9 min on 2026-11-21 and was killed at 600 s three times that evening (825), each a re-gate.
     build_timeout_s: 1200
+    # BUILD-GATE-SERVER-TSC-1 (Kanban 983; SCA-TSC-SERVER-RED-ON-MAIN-1; George's named go, OPX-3 config/**): the build
+    # leg also runs the member BFF's own typecheck (`tsc --noEmit -p server`: Node types, no DOM) — the server half of
+    # `npm run typecheck`. Only root tsc ran before, and the server half reached 32 errors on main unseen until 981
+    # (TSC-SERVER-GREEN-1) made it 0. ~20 s on top of the leg's root tsc + build. Loaded at daemon start (rule #12).
+    build_gate_cmd: "npx tsc --noEmit && npx tsc --noEmit -p server && npm run build"
     # ORCH-GATE-COST-1 (S7-CORE-30, D-S7CORE29-02): per merge, SIT runs the files RELATED to the branch's diff —
     # the installed vitest's own `list --changed <merge base>` (files only, nothing run), plus the SIT files the
     # branch changes, plus an optional core set:
