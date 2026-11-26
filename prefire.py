@@ -1103,6 +1103,35 @@ def dependency_status(filepath: Path, queue_dir: Path,
     return judged, None
 
 
+def other_repo_hints(filepath: Path, unmet: list[Dependency]) -> dict[str, str]:
+    """[PREFIRE-TRAPS-1] (c) stem → what to write, for each unmet dependency the brief names WITHOUT `@<repo>` (so it
+    was looked for on the brief's own repo) whose route IS merged on another configured repo: "`<stem>` IS merged on
+    <repo>/<target> (<sha8>) — a route on another repo is named `<stem>@<repo>`". A hint only: the dependency stays
+    unmet until the line names the repo (one owner of where a route lives: the author's line, A13). {} when nothing
+    applies; a repo that cannot be read gives no hint, never an error."""
+    declared, why = parse_depends_on(filepath)
+    if why or not unmet:
+        return {}
+    own = queue_header(filepath).get("repo")
+    repos = _config_value("repos")
+    names = [n for n in repos if n != own] if isinstance(repos, dict) else []
+    out: dict[str, str] = {}
+    for d in unmet:
+        if d.landed_unmet or (d.stem, None) not in declared:
+            continue
+        for name in names:
+            try:
+                repo = queue_repo(name)
+                landed = canon_assert.route_merged(repo, d.stem) if repo is not None else None
+            except Exception:
+                landed = None
+            if landed:
+                out[d.stem] = ("`%s` IS merged on %s/%s (%s) — a route on another repo is named `%s@%s`"
+                               % (d.stem, repo.name, repo.merge_target, landed[0][:8], d.stem, repo.name))
+                break
+    return out
+
+
 # ── OPX-1/-2/-3: the OpEx pre-checks ─────────────────────────────────────────
 # [ORCH-OPEX-PREFIRE-1] D-S7CORE33-20 (Codex v2-57, George go 10-23 18:15): SCP adopts five OpEx controls as
 # MANDATORY — absence must block something. OPX-1: the brief says how its change is seen, degrades, is turned
@@ -1116,6 +1145,12 @@ OPEX_LABELS = ("Telemetry", "Failure mode", "Rollback", "Agent permissions", "PH
 AGENT_INVENTORY = "SCP_Agent_Inventory"   # <canon>/SCP_Agent_Inventory_v*.md, the newest
 _OPEX_HEADING = re.compile(r'^##\s*Operability\s*(?:&|and)\s*safety\b', re.IGNORECASE)
 _ALLOWED_HEADING = re.compile(r'^#{2,6}\s.*\bALLOWED\s+FILES\b', re.IGNORECASE)   # any depth ## … ######
+# [PREFIRE-TRAPS-1] (a) a `## Key: value` header line whose value says "ALLOWED FILES" — "## Agent policy: none — no
+# agent-runtime path in ALLOWED FILES", "## Predecessor: … 702's ALLOWED FILES" (280 such lines in 1,570 briefs) — is a
+# header, never the section: it opened one, and whatever stood under it up to the next heading (a `> note` naming
+# `.env`, say) was judged as the brief's ALLOWED paths by OPX-2/-3. The key is the text before the first `: `, and it
+# never itself holds "ALLOWED FILES" ("## A2 · ALLOWED FILES (src/x.ts:12)" stays a section).
+_HEADER_KEY_LINE = re.compile(r'^#{2,6}[ \t]+(?:(?!ALLOWED[ \t]+FILES)[^\n:]){1,60}:[ \t]', re.IGNORECASE)
 _HEADING = re.compile(r'^(#{1,6})(?:\s|$)')
 _SECTION_END = re.compile(r'^#{1,2}(?:\s|$)')
 _FENCE = re.compile(r'^\s*(?:```|~~~)')
@@ -1193,7 +1228,7 @@ def _allowed_section(text: str) -> Optional[list[str]]:
             if depth and d <= depth:
                 depth = 0
             if not depth:
-                if _ALLOWED_HEADING.match(raw):
+                if _ALLOWED_HEADING.match(raw) and not _HEADER_KEY_LINE.match(raw):
                     depth = d
                     out = out if out is not None else []
                 continue
@@ -1691,13 +1726,47 @@ def dry_run_blocks(text: str) -> list[list[tuple[int, str]]]:
     return blocks
 
 
+def _dry_fenced(text: str) -> tuple[list[int], list[int]]:
+    """[PREFIRE-TRAPS-1] (b) What a fence hides from DRY: (line numbers of a '## DRY RUN (pasted)' heading inside a
+    ``` / ~~~ fence, line numbers of run-result lines inside a fence within a DRY RUN block that is outside one). Fenced
+    text stays data — it is never read as the pasted run; these numbers only say where it is."""
+    headings: list[int] = []
+    results: list[int] = []
+    inside = fenced = False
+    for n, raw in enumerate(text.splitlines(), 1):
+        if _FENCE.match(raw):
+            fenced = not fenced
+            continue
+        if fenced:
+            if _DRY_HEADING.match(raw):
+                headings.append(n)
+            elif inside and _RESULT.search(raw) and not _PLACEHOLDER.search(raw):
+                results.append(n)
+            continue
+        if _DRY_HEADING.match(raw):
+            inside = True
+        elif inside and _SECTION_END.match(raw):
+            inside = False
+    return headings, results
+
+
+def _lines_said(numbers: list[int]) -> str:
+    return ", ".join(map(str, numbers[:5])) + (" (+%d more)" % (len(numbers) - 5) if len(numbers) > 5 else "")
+
+
 def dry_run_problems(filepath: Path) -> list[str]:
     """DRY. [] when the brief has a '## DRY RUN (pasted)' block that holds a run result, no unfilled v1-5 placeholder
-    and no unconditional NOT READY; else one 'DRY ❌ …' refusal per fault."""
-    blocks = dry_run_blocks(_read(filepath))
+    and no unconditional NOT READY; else one 'DRY ❌ …' refusal per fault. A refusal says where a fence hid the
+    heading or the results ([PREFIRE-TRAPS-1] (b)); fenced lines are still never read as the run."""
+    text = _read(filepath)
+    blocks = dry_run_blocks(text)
+    fenced_headings, fenced_results = _dry_fenced(text)
     if not blocks:
+        where = ("; line %s holds the heading inside a ``` / ~~~ code fence (the template shows the block in one) — "
+                 "remove the fence lines around the block: prefire reads only lines outside a fence"
+                 % _lines_said(fenced_headings)) if fenced_headings else ""
         return ["DRY ❌ DRY RUN — no '## DRY RUN (pasted)' block outside a code fence: a brief is not READY, and is not "
-                "enqueued, without the author's pasted run (%s)" % DRYRUN_RULING]
+                "enqueued, without the author's pasted run (%s)%s" % (DRYRUN_RULING, where)]
     lines = [l for b in blocks for l in b]
     out: list[str] = []
     holes = ["line %d: %s" % (n, l.strip()[:100]) for n, l in lines if _PLACEHOLDER.search(l)]
@@ -1705,8 +1774,10 @@ def dry_run_problems(filepath: Path) -> list[str]:
         out.append("DRY ❌ DRY RUN — template placeholder(s) left unfilled: %s" % " | ".join(holes[:3]))
     results = [n for n, l in lines if _RESULT.search(l) and not _PLACEHOLDER.search(l)]
     if not results:
+        where = ("; line(s) %s give results inside a ``` / ~~~ code fence, which prefire does not read — paste them "
+                 "as plain lines, outside any fence" % _lines_said(fenced_results)) if fenced_results else ""
         out.append("DRY ❌ DRY RUN — the block holds no run result: no line gives an exit code or a count "
-                   "(a reading of the code is not a result — %s)" % DRYRUN_RULING)
+                   "(a reading of the code is not a result — %s)%s" % (DRYRUN_RULING, where))
     stop = ["line %d: %s" % (n, l.strip()[:100]) for n, l in lines
             if _NOT_READY.search(l) and not _CONDITIONAL.search(l)]   # "without G-1 → NOT READY" is a condition
     if stop:
@@ -2034,8 +2105,11 @@ def check(filepath: Path) -> list[str]:
         if d.landed_unmet:
             print("⛔ Depends-on %s: %s — not met" % (d.stem, d.landed_unmet))
     if unmet:
+        hints = other_repo_hints(filepath, unmet)
         failures.append("A11 DEPENDS-ON — not merged, so not fired: %s. A brief fires only once every route it "
-                        "depends on is on its repo's merge target (F-289)" % "; ".join(map(str, unmet)))
+                        "depends on is on its repo's merge target (F-289)%s"
+                        % ("; ".join(map(str, unmet)), "".join("; %s" % hints[d.stem] for d in unmet
+                                                                 if d.stem in hints)))
 
     failures += [v.line for v in check_opex(filepath) if not v.ok]     # OPX-1/-2/-3 [ORCH-OPEX-PREFIRE-1]
     failures += dependency_changes(filepath)[1]                         # DEPCHANGE [ORCH-NPM-FROZEN-1]
