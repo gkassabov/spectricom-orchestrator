@@ -485,12 +485,22 @@ def judge_npx(cmd: str, args: list, d, env) -> object:
     return None
 
 
-def _cd(d, args: list):
+def _cd(d, args: list, env=None):
     args = [a for a in args if a not in ("-L", "-P", "-e", "-@", "--")]
     if not args:
         return None
     p = args[0]
-    if p == "-" or "$" in p or "`" in p or p.startswith("~"):
+    if p == "-" or "$" in p or "`" in p:
+        return None
+    if p == "~" or p.startswith("~/"):
+        # ORCH-NPM-GUARD-TILDE-CD-1 (Kanban 979; 669-585r handback): the shell expands a bare leading `~` to $HOME, so
+        # the hook follows it to its own env's HOME when that is absolute; `~user`, an unset or a relative HOME stay
+        # unknown (refused at a later npx), as before.
+        home = (env or {}).get("HOME", "")
+        if not os.path.isabs(home):
+            return None
+        return os.path.normpath(os.path.join(home, p[2:]))
+    if p.startswith("~"):
         return None
     if os.path.isabs(p):
         return os.path.normpath(p)
@@ -518,7 +528,7 @@ def judge_simple(words: list, d, env, depth: int) -> tuple:
         return None, d
     name, args, cmd = os.path.basename(words[k]), words[k + 1:], _short(words)
     if name in ("cd", "pushd"):
-        return None, _cd(d, args)
+        return None, _cd(d, args, env)
     if name == "popd":
         return None, None
     if name == "npm":
