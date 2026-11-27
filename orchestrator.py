@@ -4764,7 +4764,39 @@ def verify_route(stem: str, commit: Optional[str] = None) -> int:
         print("\n".join(hout.splitlines()[:VERIFY_HANDBACK_LINES]))
     else:
         print(f"== handback: no {handback} at {sha}")
+    for miss in handback_format_misses(stem, sha, handback, hout if hcode == 0 else None):
+        print(f"FORMAT MISS (rule #15 (k), L-557): {miss}")
+        _record_format_miss(stem, name, sha, miss)
     return max(rc, 1 if code or hcode else 0)
+
+
+# [HANDBACK-FORMAT-MISS-1] (L-557, rule #15 (k) D-S7CORE63-18): a handback with no `## STATUS`, or one not committed under
+# briefs/ (988's STATUS was read from /tmp/orch-fire-…), is a format miss to record, never a silent pass. `verify` is the
+# repo's rule #15 reader: it says each miss in one line and appends it to logs/opx/format-misses.ndjson (best effort).
+FORMAT_MISS_LOG = "format-misses.ndjson"
+
+
+def handback_format_misses(stem: str, sha: str, handback: str, text: Optional[str]) -> list[str]:
+    """The format misses of a route's handback as committed at `sha` (`text` None ⇒ not committed there). Pure."""
+    if text is None:
+        return [f"{handback} is not committed at {sha} — a handback read from anywhere else (the fire's /tmp copy) "
+                f"is gone with that copy; commit it under briefs/ before the row closes"]
+    lines = text.splitlines()[:HANDBACK_STATUS_LINES]
+    if not any(_HB_STATUS_LABEL_RE.match(re.sub(r"[*`]+", "", raw).strip().strip("#_ \t")) for raw in lines):
+        return [f"{handback} @ {sha} has no `## STATUS` line in its first {HANDBACK_STATUS_LINES} lines"]
+    return []
+
+
+def _record_format_miss(stem: str, repo: str, sha: str, miss: str) -> None:
+    """One NDJSON line in logs/opx/format-misses.ndjson; a log that cannot be written changes nothing."""
+    try:
+        d = LOG_DIR / "opx"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / FORMAT_MISS_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": datetime.now().astimezone().isoformat(timespec="seconds"), "source": "verify",
+                                "stem": stem, "repo": repo, "sha": sha, "miss": miss}, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"⚠️ format-miss log not written ({type(e).__name__})")
 
 
 def _unit_run_from_cache(e: dict, ref: str) -> UnitSuiteRun:

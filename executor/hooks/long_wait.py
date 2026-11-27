@@ -18,6 +18,10 @@ Exit 2 + one `🛡 long wait:` stderr line = the CLI blocks the call and shows t
 no objection. Fails closed: unreadable input, a missing parser or any crash denies. TONI_LONG_WAIT=off (any case) in
 the hook's environment allows everything.
 
+[PATTERN-KILL-DENY-1] (L-563, rule #27) The same walk refuses a pattern kill: `pkill` / `killall`, or one call that both
+finds PIDs by name (`pgrep` / `pidof`) and runs `kill` — one `🛡 pattern kill:` line. `kill <pid>` stays allowed.
+TONI_PATTERN_KILL=off turns that half off; TONI_LONG_WAIT=off turns the whole hook off, as before.
+
 Reads only stdin, its env and a script file passed to a shell (npm_frozen's reader). Writes nothing. Standard library
 only. Residual (said in the brief): a loop of short literal sleeps, or a sleep inside another interpreter
 (`python3 -c "time.sleep(…)"`), is not caught.
@@ -37,6 +41,16 @@ MSG_INPUT = ("🛡 long wait: the hook could not read its input — the Bash cal
              "so in the handback.")
 MSG_CRASH = ("🛡 long wait: the hook failed (%s) — the Bash call is denied (fails closed). Stop and say so in the "
              "handback.")
+# [PATTERN-KILL-DENY-1] (L-563, rule #27): a process is stopped by the PID / PGID recorded when it started, never by a
+# name or pattern match — `pkill -f` / `pgrep -f … | xargs kill` matched a lane's own shell and took its runner with it.
+# Refused: `pkill` / `killall` at a command position, and one Bash call that both finds PIDs by name (`pgrep` / `pidof`)
+# and runs `kill` (a pipe into `xargs kill`, `kill $(pgrep …)`, a loop). `kill <pid>` / `kill -- -<pgid>` stay allowed;
+# `pgrep` alone (to look) stays allowed. TONI_PATTERN_KILL=off (any case) turns this half off.
+KILL_OFF_VAR = "TONI_PATTERN_KILL"
+PATTERN_KILLERS = ("pkill", "killall")
+PID_FINDERS = ("pgrep", "pidof")
+MSG_KILL = ("🛡 pattern kill: %s — stop a process by the PID / PGID you recorded when it started (rule #27, L-563), "
+            "never by a name or pattern; run `pgrep` alone to look, then `kill <pid>` in its own call")
 _DURATION = re.compile(r"(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?([smhd]?)")
 _UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _SLEEP_OPTS = ("--help", "--version")
@@ -113,6 +127,53 @@ def judge_words(nf, words: list, d, depth: int):
     return None, d
 
 
+_KILL_ON = [True]
+
+
+def _command_words(nf, items: list, depth: int) -> list:
+    """Every simple command's words from its command word on, through Sub groups and Text the shell runs."""
+    out = []
+    for it in items:
+        if isinstance(it, nf.Sub):
+            out += _command_words(nf, it, depth)
+        elif isinstance(it, nf.Text):
+            if depth < nf.MAX_DEPTH:
+                try:
+                    out += _command_words(nf, nf.split_commands(str(it)), depth + 1)
+                except nf.Unreadable:
+                    out += [w for w in _fallback_words(nf, str(it))]
+        else:
+            k, words = nf.command_index(list(it))
+            if k is not None:
+                out.append(words[k:])
+    return out
+
+
+def _fallback_words(nf, text: str) -> list:
+    out = []
+    for seg in nf._CMD_POS.split(nf._drop_bodies_roughly(text)):
+        words = [w.strip("\"'\\") for w in seg.split()]
+        k, words = nf.command_index(words)
+        if k is not None:
+            out.append(words[k:])
+    return out
+
+
+def pattern_kill(cmds: list):
+    """[PATTERN-KILL-DENY-1] The refusal line for a pattern kill among these simple commands, else None."""
+    if not _KILL_ON[0]:
+        return None
+    named = [(os.path.basename(w[0]), w) for w in cmds if w]
+    for name, w in named:
+        if name in PATTERN_KILLERS:
+            return MSG_KILL % _short(w)
+    finders = [w for name, w in named if name in PID_FINDERS]
+    kills = [w for name, w in named if name == "kill"]
+    if finders and kills:
+        return MSG_KILL % _short(finders[0] + ["…"] + kills[0])
+    return None
+
+
 def judge(nf, items: list, d, depth: int):
     for it in items:
         if isinstance(it, nf.Sub):
@@ -127,7 +188,11 @@ def judge(nf, items: list, d, depth: int):
 
 
 def fallback(nf, text: str):
-    """Text the parser cannot read: `sleep` at a command position (npm_frozen's positions) is judged on its words."""
+    """Text the parser cannot read: `sleep` at a command position (npm_frozen's positions) is judged on its words;
+    so is a pattern kill (PATTERN-KILL-DENY-1)."""
+    m = pattern_kill(_fallback_words(nf, text))
+    if m:
+        return m
     for seg in nf._CMD_POS.split(nf._drop_bodies_roughly(text)):
         words = [w.strip("\"'\\") for w in seg.split()]
         k, words = nf.command_index(words)
@@ -145,7 +210,7 @@ def judge_text(nf, text: str, d, depth: int):
         items = nf.split_commands(text)
     except nf.Unreadable:
         return fallback(nf, text)
-    return judge(nf, items, d, depth)
+    return pattern_kill(_command_words(nf, items, depth)) or judge(nf, items, d, depth)
 
 
 def _deny(err, msg: str) -> int:
@@ -164,6 +229,7 @@ def main(stdin=None, env=None, err=None) -> int:
     try:
         if "".join(env.get(OFF_VAR, "").split()).lower() == "off":
             return 0
+        _KILL_ON[0] = "".join(env.get(KILL_OFF_VAR, "").split()).lower() != "off"
         raw = stdin.read() if stdin is not None else sys.stdin.buffer.read().decode("utf-8", "replace")
         try:
             data = json.loads(raw)
