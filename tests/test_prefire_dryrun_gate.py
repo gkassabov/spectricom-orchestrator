@@ -137,7 +137,7 @@ class TestD1DryRun:
         assert prefire.report(brief(tmp_path, DRY_OK)) is True
         out = capsys.readouterr().out
         assert "DRY ✅ '## DRY RUN (pasted)' at line" in out and "run-result line(s)" in out, out
-        assert "VERIFY ✅ no '## Verify report:' line" in out and "INPUTS ✅" in out
+        assert "VERIFY — none: no '## Verify report:' line" in out and "INPUTS ✅" in out   # L-561 (LANE-HEAVY-LEG-GUARD-1)
 
 
 # ── D-2 · enqueue refuses the same brief ────────────────────────────────────────────────────────────────────────

@@ -1857,6 +1857,21 @@ def brief_verify_problems(filepath: Path) -> list[str]:
     return out
 
 
+VERIFY_NONE = "VERIFY — none"
+
+
+def verify_line(filepath: Path) -> str:
+    """[LANE-HEAVY-LEG-GUARD-1] (L-561) the pass report's VERIFY line. With a '## Verify report:' line: ✅ and the
+    reports judged. Without one: `VERIFY — none …`, never a ✅ — no independent verifier ran (legal on E1,
+    D-S7CORE57-02), so this exit 0 says nothing about verification. A line only: check() is unchanged, E1 is not
+    blocked."""
+    reports, _ = verify_reports(filepath)
+    if reports:
+        return "VERIFY ✅ %s — every claim has a run beside it" % ", ".join(r.name for r in reports)
+    return ("%s: no '## Verify report:' line — no independent verifier report, so this exit 0 is not verification "
+            "(L-561; allowed on E1, D-S7CORE57-02). Name what ran (dry run, gate), never \"verified\"" % VERIFY_NONE)
+
+
 def _uncommented(text: str):
     """(line number, line) outside code fences and outside <!-- … --> author notes (fold and provenance comments)."""
     in_note = False
@@ -2229,9 +2244,7 @@ def report(filepath: Path, timeout: Optional[tuple[int, str, int]] = None) -> bo
             print("  %s" % note)
         if dryrun_on():                                                 # [ORCH-PREFIRE-DRYRUN-GATE-1]
             print("  DRY ✅ %s" % dry_run_summary(filepath))
-            reports, _ = verify_reports(filepath)
-            print("  VERIFY ✅ %s" % (", ".join(r.name for r in reports) + " — every claim has a run beside it"
-                                     if reports else "no '## Verify report:' line — no report judged"))
+            print("  %s" % verify_line(filepath))                    # [LANE-HEAVY-LEG-GUARD-1] L-561
             print("  INPUTS ✅ %s" % named_inputs_summary(filepath))
         return True
 
